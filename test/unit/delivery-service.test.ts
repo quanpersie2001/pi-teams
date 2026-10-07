@@ -1,0 +1,311 @@
+// DeliveryService unit tests: lifecycle routing, owner rules, guard refusal
+// recoverability, session-switch invalidation, stale-context swallow and the
+// decision audit trail. Manager driven by FakeBackend — no model calls, no Pi.
+
+import { describe, expect, it } from "vitest";
+import { AgentManager } from "../../extension-src/pi-subagents/app/agent-manager.js";
+import { AgentRegistry } from "../../extension-src/pi-subagents/app/agent-registry.js";
+import type {
+	CompletionNotification,
+	DeliveryHost,
+	SessionSnapshot,
+} from "../../extension-src/pi-subagents/app/delivery-service.js";
+import { DeliveryService } from "../../extension-src/pi-subagents/app/delivery-service.js";
+import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
+import type { AgentLifecycleEvent } from "../../extension-src/pi-subagents/domain/integration-protocol.js";
+import { isStaleExtensionCtxError } from "../../extension-src/pi-subagents/shared/stale-context.js";
+import { FakeBackend } from "../helpers/fake-backend.js";
+
+interface Fixture {
+	manager: AgentManager;
+	backend: FakeBackend;
+	service: DeliveryService;
+	notifications: CompletionNotification[];
+	session: SessionSnapshot & { setSessionId?(id: string): void };
+	sendError?: Error;
+}
+
+async function makeFixture(
+	options: {
+		initialSession?: SessionSnapshot;
+		/** Throw from sendNotification (e.g. stale ctx). */
+		sendError?: Error;
+	} = {},
+): Fixture {
+	const backend = new FakeBackend();
+	let nextId = 0;
+	const registry = new AgentRegistry({
+		sources: [],
+		loader: async () => [],
+		settings: sanitizeSettings({ backgroundByDefault: true }),
+	});
+	const manager = new AgentManager({
+		registry,
+		settings: sanitizeSettings({ backgroundByDefault: true }),
+		backends: [backend],
+		cwd: "/tmp/project",
+		configCwd: "/tmp/project",
+		getSessionId: () => "session-a",
+		idFactory: () => {
+			nextId += 1;
+			return `run-${nextId}`;
+		},
+	});
+	const notifications: CompletionNotification[] = [];
+	const sessionState: SessionSnapshot = { ...(options.initialSession ?? { sessionId: "session-a" }) };
+	const host: DeliveryHost = {
+		sendNotification(notification) {
+			if (options.sendError) throw options.sendError;
+			notifications.push(notification);
+		},
+		currentSession() {
+			return sessionState;
+		},
+	};
+	const service = new DeliveryService(manager, host);
+	await registry.load();
+	return {
+		manager,
+		backend,
+		service,
+		notifications,
+		session: sessionState as SessionSnapshot & { setSessionId?(id: string): void },
+	};
+}
+
+async function settle(flushTurns = 32): Promise<void> {
+	for (let turn = 0; turn < flushTurns; turn += 1) await Promise.resolve();
+}
+
+async function spawnBackground(manager: AgentManager, request: Record<string, unknown> = {}): Promise<string> {
+	const record = await manager.spawn({
+		type: "general-purpose",
+		prompt: "work",
+		run_in_background: true,
+		...request,
+	});
+	return record.id;
+}
+
+describe("DeliveryService", () => {
+	it("delivers a completion notification for conversation-owned background runs", async () => {
+		const fixture = await makeFixture();
+		const id = await spawnBackground(fixture.manager);
+		await settle(20);
+
+		fixture.backend.complete(id, "found 8 auth files");
+		await settle();
+
+		expect(fixture.notifications).toHaveLength(1);
+		const notification = fixture.notifications[0];
+		expect(notification.agentId).toBe(id);
+		expect(notification.outcome).toBe("completed");
+		expect(notification.preview).toContain("8 auth files");
+
+		const log = fixture.service.getDecisionLog();
+		expect(log).toHaveLength(1);
+		expect(log[0]).toMatchObject({ agentId: id, event: "completed", delivered: true, reason: "delivered" });
+	});
+
+	it("routes failed and stopped settlements too", async () => {
+		const fixture = await makeFixture();
+		const failedId = await spawnBackground(fixture.manager);
+		const stoppedId = await spawnBackground(fixture.manager);
+		await settle(20);
+
+		fixture.backend.fail(failedId, "boom");
+		await fixture.manager.stop(stoppedId);
+		fixture.backend.settleStopped(stoppedId);
+		await fixture.manager.whenSettled(stoppedId);
+
+		const outcomes = fixture.notifications.map((notification) => notification.outcome).sort();
+		expect(outcomes).toEqual(["failed", "stopped"]);
+		const failure = fixture.notifications.find((notification) => notification.outcome === "failed");
+		expect(failure?.preview).toBe("boom");
+	});
+
+	it("never notifies the conversation for extension-owned runs even when policy says conversation (owner rules win)", async () => {
+		const fixture = await makeFixture();
+		const id = await spawnBackground(fixture.manager, {
+			owner: { kind: "extension", id: "pi-tasks", ref: "task-123" },
+			delivery: "conversation",
+		});
+		await settle(20);
+		fixture.backend.complete(id, "task work done");
+		await settle();
+
+		expect(fixture.notifications).toHaveLength(0);
+		expect(fixture.service.getDecisionLog()[0]?.reason).toMatch(/^policy-blocked:/);
+		// The lifecycle event still carried everything an extension consumer needs.
+	});
+
+	it("honors delivery none (caller polls status/getResult)", async () => {
+		const fixture = await makeFixture();
+		const id = await spawnBackground(fixture.manager, {
+			owner: { kind: "conversation", sessionId: "session-a" },
+			delivery: "none",
+		});
+		await settle(20);
+		fixture.backend.complete(id, "polled later");
+		await settle();
+
+		expect(fixture.notifications).toHaveLength(0);
+		expect(fixture.manager.get(id)?.result).toBe("polled later");
+	});
+
+	it("refuses delivery after a session switch but keeps the result recoverable", async () => {
+		const fixture = await makeFixture({ initialSession: { sessionId: "session-a" } });
+		const id = await spawnBackground(fixture.manager);
+		await settle(20);
+
+		// /new or /resume happened while the run was in flight.
+		fixture.session.sessionId = "session-b";
+		fixture.service.handleSessionSwitch();
+
+		fixture.backend.complete(id, "result of the old conversation");
+		await settle();
+
+		expect(fixture.notifications).toHaveLength(0);
+		const log = fixture.service.getDecisionLog()[0];
+		expect(log?.delivered).toBe(false);
+		expect(log?.reason).toBe("guard-refused:session-switched");
+		expect(fixture.service.getSessionSwitchCount()).toBe(1);
+		// Recoverability: nothing was deleted — result still on the run record.
+		expect(fixture.manager.get(id)?.result).toBe("result of the old conversation");
+		expect(fixture.manager.get(id)?.status).toBe("completed");
+	});
+
+	it("re-evaluates the guard at delivery time, not at spawn time", async () => {
+		const fixture = await makeFixture({ initialSession: { sessionId: "session-a", leafId: "leaf-1" } });
+		const id = await spawnBackground(fixture.manager, {
+			parentSession: { sessionId: "session-a", leafId: "leaf-1" },
+		});
+		await settle(20);
+
+		// User continues the conversation; parent leaf stays on the branch path.
+		fixture.session.leafId = "leaf-2";
+		fixture.session.branchIds = ["root", "leaf-1", "leaf-2"];
+		fixture.backend.complete(id, "still deliverable");
+		await settle();
+
+		expect(fixture.notifications).toHaveLength(1);
+	});
+
+	it("skips foreground runs whose result was already consumed inline", async () => {
+		const backend = new FakeBackend();
+		let nextId = 0;
+		const registry = new AgentRegistry({
+			sources: [],
+			loader: async () => [],
+			settings: sanitizeSettings({}),
+		});
+		const manager = new AgentManager({
+			registry,
+			settings: sanitizeSettings({ backgroundByDefault: false }),
+			backends: [backend],
+			cwd: "/tmp/project",
+			configCwd: "/tmp/project",
+			getSessionId: () => "session-a",
+			idFactory: () => {
+				nextId += 1;
+				return `run-${nextId}`;
+			},
+		});
+		const notifications: CompletionNotification[] = [];
+		const service = new DeliveryService(manager, {
+			sendNotification: (notification) => notifications.push(notification),
+			currentSession: () => ({ sessionId: "session-a" }),
+		});
+		await registry.load();
+
+		const pending = manager.spawnAndWait({ type: "general-purpose", prompt: "inline please" });
+		await settle(20);
+		backend.complete("run-1", "inline answer");
+		await pending;
+		manager.markResultConsumed("run-1");
+		await settle();
+
+		expect(notifications).toHaveLength(0);
+		expect(service.getDecisionLog()[0]?.reason).toBe("result-consumed-inline");
+		service.dispose();
+	});
+
+	it("swallows stale-context errors from the transport without breaking settlement", async () => {
+		const staleError = new Error("this extension ctx is stale after session replacement");
+		expect(isStaleExtensionCtxError(staleError)).toBe(true);
+		const fixture = await makeFixture({ sendError: staleError });
+		const id = await spawnBackground(fixture.manager);
+		await settle(20);
+
+		fixture.backend.complete(id, "survives a stale ctx");
+		await settle();
+
+		expect(fixture.notifications).toHaveLength(0);
+		expect(fixture.service.getDecisionLog()[0]?.reason).toBe("stale-ctx-swallowed");
+		expect(fixture.manager.get(id)?.status).toBe("completed");
+	});
+
+	it("degrades to permissive when the host cannot read a session at all (headless)", async () => {
+		const backend = new FakeBackend();
+		let nextId = 0;
+		const registry = new AgentRegistry({ sources: [], loader: async () => [], settings: sanitizeSettings({}) });
+		const manager = new AgentManager({
+			registry,
+			settings: sanitizeSettings({ backgroundByDefault: true }),
+			backends: [backend],
+			cwd: "/tmp/project",
+			configCwd: "/tmp/project",
+			getSessionId: () => "unknown-session",
+			idFactory: () => {
+				nextId += 1;
+				return `run-${nextId}`;
+			},
+		});
+		const notifications: CompletionNotification[] = [];
+		const service = new DeliveryService(manager, {
+			sendNotification: (notification) => notifications.push(notification),
+			currentSession: () => undefined,
+		});
+		await registry.load();
+
+		const id = await spawnBackground(manager, { parentSession: { sessionId: "unknown-session" } });
+		await settle(20);
+		backend.complete(id, "headless completion");
+		await settle();
+
+		expect(notifications).toHaveLength(1);
+		service.dispose();
+	});
+
+	it("dispose detaches from the lifecycle stream", async () => {
+		const fixture = await makeFixture();
+		fixture.service.dispose();
+		const id = await spawnBackground(fixture.manager);
+		await settle(20);
+		fixture.backend.complete(id, "after dispose");
+		await settle();
+
+		expect(fixture.notifications).toHaveLength(0);
+		expect(fixture.service.getDecisionLog()).toHaveLength(0);
+	});
+
+	it("lifecycle events carry owner-aware payloads for extension consumers", async () => {
+		const fixture = await makeFixture();
+		const events: AgentLifecycleEvent[] = [];
+		fixture.manager.subscribe((event) => events.push(event));
+		const id = await spawnBackground(fixture.manager, {
+			owner: { kind: "extension", id: "pi-tasks", ref: "task-9" },
+			delivery: "event",
+		});
+		await settle(20);
+		fixture.backend.complete(id, "event payload check");
+		await settle();
+
+		const terminal = events.filter((event) => event.event === "completed");
+		expect(terminal).toHaveLength(1);
+		expect(terminal[0].owner).toEqual({ kind: "extension", id: "pi-tasks", ref: "task-9" });
+		expect(terminal[0].delivery).toBe("event");
+		expect(terminal[0].result).toBe("event payload check");
+		expect(terminal[0].protocolVersion).toBeTypeOf("number");
+	});
+});

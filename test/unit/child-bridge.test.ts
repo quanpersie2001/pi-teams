@@ -1,0 +1,345 @@
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import type { TranscriptItem } from "../../extension-src/pi-subagents/domain/transcript.js";
+import {
+	type ChildBridgeHandle,
+	type ChildBridgeHost,
+	type ChildBridgeNativeEvent,
+	installChildBridgeExtension,
+	parseChildBootstrap,
+	startChildBridge,
+} from "../../extension-src/pi-subagents/pi/child-bridge.js";
+import { ChildRpcClient } from "../../extension-src/pi-subagents/pi/child-rpc-client.js";
+
+const TOKEN = "bridge-test-secret-token";
+let tempDir: string | undefined;
+let bridge: ChildBridgeHandle | undefined;
+const clients: ChildRpcClient[] = [];
+let previousChildEnv: { child: string | undefined; bootstrap: string | undefined } | undefined;
+let closeInstalledBridge: (() => Promise<void>) | undefined;
+
+afterEach(async () => {
+	for (const client of clients.splice(0)) client.disconnect();
+	await closeInstalledBridge?.();
+	closeInstalledBridge = undefined;
+	await bridge?.close();
+	bridge = undefined;
+	if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+	if (previousChildEnv) {
+		if (previousChildEnv.child === undefined) delete process.env.PI_SUBAGENTS_CHILD;
+		else process.env.PI_SUBAGENTS_CHILD = previousChildEnv.child;
+		if (previousChildEnv.bootstrap === undefined) delete process.env.PI_SUBAGENTS_BOOTSTRAP;
+		else process.env.PI_SUBAGENTS_BOOTSTRAP = previousChildEnv.bootstrap;
+		previousChildEnv = undefined;
+	}
+	tempDir = undefined;
+});
+
+function createDeferred() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
+describe("child bridge over an owner-only Unix socket", () => {
+	it("deduplicates reconnect retries and preserves run, transcript, and shutdown state", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "subagents-bridge-"));
+		tempDir = dir;
+		const sessionFile = join(dir, "sessions", "child.jsonl");
+		const bootstrap = {
+			childId: "child-a",
+			token: TOKEN,
+			socketPath: join(dir, "child.sock"),
+			sessionDir: join(dir, "sessions"),
+			sessionFile,
+			cwd: dir,
+			configCwd: dir,
+			systemPrompt: "child prompt",
+			promptMode: "append" as const,
+		};
+		expect(parseChildBootstrap({ ...bootstrap, thinking: "high" }).thinking).toBe("high");
+		expect(() => parseChildBootstrap({ ...bootstrap, thinking: "instant" })).toThrow(
+			"thinking must be a supported Pi thinking level",
+		);
+		const history: TranscriptItem[] = Array.from({ length: 300 }, (_, index) => ({
+			kind: "assistant",
+			timestamp: index,
+			text: "h".repeat(8_192),
+		}));
+		const promptGate = createDeferred();
+		const promptStarted = createDeferred();
+		const shutdownCalled = createDeferred();
+		let promptCalls = 0;
+		let shouldFailPrompt = false;
+		let steerCalls = 0;
+		let abortCalls = 0;
+		let shutdownCalls = 0;
+		const host: ChildBridgeHost = {
+			getSessionFile: () => sessionFile,
+			getTranscript: () => history,
+			getFocus: () => ({
+				cwd: dir,
+				thinking: "high",
+				capabilities: { models: [], thinking: ["high"], commands: ["model", "thinking", "compact"] },
+			}),
+			async controlFocus() {},
+			async sendInbox() {},
+			async prompt() {
+				promptCalls++;
+				promptStarted.resolve();
+				if (shouldFailPrompt) throw new Error(`provider failed with ${TOKEN}`);
+				await promptGate.promise;
+			},
+			async steer() {
+				steerCalls++;
+			},
+			async abort() {
+				abortCalls++;
+			},
+			async shutdown() {
+				shutdownCalls++;
+				shutdownCalled.resolve();
+			},
+		};
+
+		const first = new ChildRpcClient({ socketPath: bootstrap.socketPath, childId: bootstrap.childId, token: TOKEN });
+		const second = new ChildRpcClient({ socketPath: bootstrap.socketPath, childId: bootstrap.childId, token: TOKEN });
+		const intruder = new ChildRpcClient({
+			socketPath: bootstrap.socketPath,
+			childId: bootstrap.childId,
+			token: "wrong-secret-token",
+		});
+		const connectionTransitions: boolean[] = [];
+		first.subscribeConnection((connected) => connectionTransitions.push(connected));
+		clients.push(first, second, intruder);
+		const initialConnection = first.connect();
+		void initialConnection.catch(() => undefined); // Awaited below after the server starts.
+		const childBridge = await startChildBridge(bootstrap, host);
+		bridge = childBridge;
+		expect(statSync(bootstrap.socketPath).mode & 0o777).toBe(0o600);
+		await expect(intruder.connect()).rejects.toMatchObject({ code: "unauthorized" });
+		const initial = await initialConnection;
+		await second.connect();
+		expect(initial.transcript.cursor).toBe(history.length);
+		expect(initial.transcript.offset).toBeGreaterThan(0);
+		expect(initial.transcript.offset + initial.transcript.items.length).toBe(initial.transcript.cursor);
+		expect(initial.transcript.truncated).toBe(true);
+		childBridge.publishNativeEvent({ type: "message_start", message: { role: "assistant" } });
+		childBridge.publishNativeEvent({
+			type: "message_update",
+			message: { role: "assistant", timestamp: 10, content: "partial" },
+		});
+		const partial = await first.state();
+		const partialItem = partial.transcript.items.find((item) => item.partial);
+		expect(partialItem).toMatchObject({ kind: "assistant", text: "partial", revision: 1 });
+		childBridge.publishNativeEvent({
+			type: "message_end",
+			message: { role: "assistant", timestamp: 10, content: "complete" },
+		});
+		const completedMessage = await first.state();
+		expect(
+			completedMessage.transcript.items.some((item) => item.id === partialItem?.id && item.partial === false),
+		).toBe(true);
+		expect(completedMessage.focus?.cwd).toBe(dir);
+
+		const firstPrompt = first.prompt("run-a", "start work");
+		await promptStarted.promise;
+		const retryPrompt = second.prompt("run-a", "start work");
+		await second.state();
+		promptGate.resolve();
+		await expect(Promise.all([firstPrompt, retryPrompt])).resolves.toEqual([undefined, undefined]);
+		expect(promptCalls).toBe(1);
+		first.disconnect();
+		const reconnected = await first.connect();
+		expect(reconnected.execution).toBe("running");
+		expect(reconnected.currentRunId).toBe("run-a");
+
+		const active = await first.state();
+		expect(active.execution).toBe("running");
+		expect(active.currentRunId).toBe("run-a");
+		await expect(first.abort("stale-run")).rejects.toMatchObject({ code: "stale_run" });
+		await expect(first.steer("stale-run", "late steer")).rejects.toMatchObject({ code: "stale_run" });
+		await first.steer("run-a", "focus on the edge cases");
+		expect(steerCalls).toBe(1);
+
+		const longAnswer = "a".repeat(9_000);
+		childBridge.publishNativeEvent({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				timestamp: Date.now(),
+				content: [{ type: "text", text: longAnswer }],
+				usage: { input: 11, output: 17, cacheRead: 3, cacheWrite: 5 },
+				stopReason: "stop",
+			},
+		} satisfies ChildBridgeNativeEvent);
+		childBridge.publishNativeEvent({ type: "agent_settled" });
+		const completed = await first.state();
+		expect(completed.execution).toBe("idle");
+		expect(completed.lastOutcome).toMatchObject({
+			runId: "run-a",
+			status: "completed",
+			resultTruncated: true,
+			resultOriginalLength: longAnswer.length,
+		});
+		expect(completed.transcript.items.at(-1)?.metadata).toMatchObject({
+			truncated: true,
+			originalLength: longAnswer.length,
+		});
+		expect(completed.usage).toMatchObject({
+			inputTokens: 11,
+			outputTokens: 17,
+			cacheReadTokens: 3,
+			cacheWriteTokens: 5,
+			totalTokens: 33,
+		});
+
+		await expect(first.abort("run-a")).rejects.toMatchObject({ code: "stale_run" });
+		const nextPrompt = first.prompt("run-b", "stop this run");
+		await expect(nextPrompt).resolves.toBeUndefined();
+		await first.abort("run-b");
+		expect(abortCalls).toBe(1);
+		childBridge.publishNativeEvent({
+			type: "message_end",
+			message: { role: "assistant", content: [], stopReason: "aborted" },
+		});
+		childBridge.publishNativeEvent({ type: "agent_settled" });
+		expect((await first.state()).lastOutcome).toMatchObject({ runId: "run-b", status: "stopped" });
+
+		await expect(first.prompt("run-c", "late native failure")).resolves.toBeUndefined();
+		childBridge.failActiveRun(new Error(`native execution failed with ${TOKEN}`));
+		const nativeFailed = await first.state();
+		expect(nativeFailed.lastOutcome?.status).toBe("failed");
+		expect(nativeFailed.lastOutcome?.error).not.toContain(TOKEN);
+		shouldFailPrompt = true;
+		await expect(first.prompt("run-d", "fail before acceptance")).rejects.toMatchObject({ code: "prompt_failed" });
+		const requestFailed = await first.state();
+		expect(requestFailed.lastOutcome?.status).toBe("failed");
+		expect(requestFailed.lastOutcome?.error).not.toContain(TOKEN);
+
+		await first.shutdown();
+		await shutdownCalled.promise;
+		expect(shutdownCalls).toBe(1);
+		first.disconnect();
+		expect(connectionTransitions).toEqual([true, false, true, false]);
+	});
+
+	it("settles native prompt preflight authentication failures for RPC consumers", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "subagents-auth-preflight-"));
+		const bootstrap = {
+			childId: "child-auth",
+			token: TOKEN,
+			socketPath: join(tempDir, "child.sock"),
+			sessionDir: join(tempDir, "sessions"),
+			sessionFile: join(tempDir, "sessions", "child.jsonl"),
+			cwd: tempDir,
+			configCwd: tempDir,
+			systemPrompt: "child prompt",
+			promptMode: "append",
+		};
+		const bootstrapPath = join(tempDir, "bootstrap.json");
+		writeFileSync(bootstrapPath, JSON.stringify(bootstrap), { mode: 0o600 });
+		previousChildEnv = {
+			child: process.env.PI_SUBAGENTS_CHILD,
+			bootstrap: process.env.PI_SUBAGENTS_BOOTSTRAP,
+		};
+		process.env.PI_SUBAGENTS_CHILD = "1";
+		process.env.PI_SUBAGENTS_BOOTSTRAP = bootstrapPath;
+
+		let hasConfiguredAuth = false;
+		let providerAuth: object | undefined;
+		let dispatched = 0;
+		const model = { provider: "anthropic", id: "claude-test", name: "claude-test" };
+		const context = {
+			model,
+			cwd: tempDir,
+			thinkingLevel: "off",
+			getContextUsage: () => undefined,
+			modelRegistry: {
+				hasConfiguredAuth: () => hasConfiguredAuth,
+				getProviderAuth: async () => providerAuth,
+				isUsingOAuth: () => false,
+				getAvailable: () => [model],
+			},
+			sessionManager: {
+				getSessionFile: () => bootstrap.sessionFile,
+				buildContextEntries: () => [],
+			},
+			abort: () => {},
+			shutdown: () => {},
+		};
+		const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
+		const pi = {
+			on: (event: string, handler: (event: never, context: never) => unknown) => {
+				handlers.set(event, handler as unknown as (event: unknown, context: unknown) => unknown);
+			},
+			sendUserMessage: () => {
+				dispatched++;
+			},
+		};
+		installChildBridgeExtension(pi as never);
+		closeInstalledBridge = async () => {
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context);
+		};
+		await handlers.get("session_start")?.({ type: "session_start" }, context);
+
+		const client = new ChildRpcClient({
+			socketPath: bootstrap.socketPath,
+			childId: bootstrap.childId,
+			token: TOKEN,
+		});
+		clients.push(client);
+		await client.connect();
+		await expect(client.prompt("missing-auth", "start work")).rejects.toMatchObject({ code: "prompt_failed" });
+		const failed = await client.state();
+		expect(failed.execution).toBe("idle");
+		expect(failed.lastOutcome).toMatchObject({
+			runId: "missing-auth",
+			status: "failed",
+		});
+		expect(dispatched).toBe(0);
+
+		providerAuth = { headers: { Authorization: "Bearer header-only" } };
+		await client.prompt("header-auth", "start work");
+		expect((await client.state()).currentRunId).toBe("header-auth");
+		await handlers.get("agent_settled")?.({ type: "agent_settled" }, context);
+		providerAuth = undefined;
+
+		hasConfiguredAuth = true;
+		await expect(client.prompt("configured-auth", "start work")).resolves.toBeUndefined();
+		expect(dispatched).toBe(2);
+		expect((await client.state()).execution).toBe("running");
+		await handlers.get("agent_settled")?.({ type: "agent_settled" }, context);
+		expect((await client.state()).execution).toBe("idle");
+	});
+
+	it("fails at the readiness deadline when no child opens its socket", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "subagents-deadline-"));
+		const client = new ChildRpcClient({
+			socketPath: join(tempDir, "missing.sock"),
+			childId: "missing",
+			token: TOKEN,
+			connectTimeoutMs: 100,
+		});
+		clients.push(client);
+		await expect(client.connect()).rejects.toMatchObject({ code: "connect_timeout" });
+	});
+
+	it("cancels an in-flight startup connection without waiting for its deadline", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "subagents-cancel-"));
+		const client = new ChildRpcClient({
+			socketPath: join(tempDir, "missing.sock"),
+			childId: "cancelled",
+			token: TOKEN,
+			connectTimeoutMs: 30_000,
+		});
+		clients.push(client);
+		const pending = client.connect();
+		client.disconnect();
+		await expect(pending).rejects.toMatchObject({ code: "disconnected" });
+	});
+});
