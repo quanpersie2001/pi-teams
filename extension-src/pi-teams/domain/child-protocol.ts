@@ -15,7 +15,7 @@ export type ChildEventName =
 	| "activity"
 	| "usage"
 	| "focus"
-	| "message_request";
+	| "mailbox_assignment";
 export type ChildRpcMethod =
 	| "hello"
 	| "state"
@@ -23,10 +23,8 @@ export type ChildRpcMethod =
 	| "steer"
 	| "abort"
 	| "control"
-	| "send_inbox"
-	| "send_message"
-	| "message_reply"
-	| "shutdown";
+	| "shutdown"
+	| "admit_assignment";
 
 export interface ChildBootstrap {
 	childId: string;
@@ -44,6 +42,12 @@ export interface ChildBootstrap {
 	tools?: string[];
 	maxTurns?: number;
 	graceTurns?: number;
+	/** Team directory `.pi/teams/t/<team-id>/`; present for named teammates (mailbox/board context, ADR 0007). */
+	teamDir?: string;
+	/** Per-team mailbox HMAC key; delivered only through the authenticated bootstrap file (0600). */
+	teamKey?: string;
+	/** This child's teammate name (its mailbox address). */
+	teammateName?: string;
 }
 
 export interface ChildOutcome {
@@ -191,9 +195,7 @@ export function parseChildRequest(value: unknown): ChildRequest {
 		method !== "steer" &&
 		method !== "abort" &&
 		method !== "control" &&
-		method !== "send_inbox" &&
-		method !== "send_message" &&
-		method !== "message_reply" &&
+		method !== "admit_assignment" &&
 		method !== "shutdown"
 	) {
 		throw new ChildProtocolError("invalid_request", "Unknown child RPC method");
@@ -378,8 +380,8 @@ export function isChildEvent(value: unknown, childId: string): value is ChildEve
 			value.event === "transcript" ||
 			value.event === "activity" ||
 			value.event === "usage" ||
-			value.event === "focus" ||
-			value.event === "message_request") &&
+			value.event === "mailbox_assignment" ||
+			value.event === "focus") &&
 		isRecord(value.payload) &&
 		(value.runId === undefined || typeof value.runId === "string")
 	);

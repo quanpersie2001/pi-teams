@@ -61,6 +61,8 @@ export interface SubagentsUiHandle {
 	dispose(): void;
 	/** True while a fullscreen transcript overlay owns the view. */
 	isViewOpen(): boolean;
+	/** True only when the main composer, not an overlay or completion menu, owns input. */
+	isMainEditorFocused(): boolean;
 }
 
 export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOptions): SubagentsUiHandle {
@@ -643,6 +645,17 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 
 	// -- key routing (docs/ui/AGENT-PANEL-AND-VIEW.md §5) -------------------------
 
+	function mainEditorOwnsInput(): boolean {
+		const focused: unknown = (tui as unknown as { focusedComponent?: unknown } | undefined)?.focusedComponent;
+		const editor = focused instanceof Editor ? focused : undefined;
+		return (
+			!(tui?.hasOverlay?.() ?? false) &&
+			(focused == null || editor !== undefined) &&
+			!(editor?.isShowingAutocomplete() ?? false) &&
+			!(editor === undefined && foreignEditor())
+		);
+	}
+
 	const unsubscribeInput = ctx.ui.onTerminalInput((data) => {
 		const released = isKeyRelease(data);
 		const repeated = isKeyRepeat(data);
@@ -693,11 +706,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		const focused: unknown = (tui as unknown as { focusedComponent?: unknown } | undefined)?.focusedComponent;
 		const editor = focused instanceof Editor ? focused : undefined;
 		const text = editorText();
-		const ownsMain =
-			!(tui?.hasOverlay?.() ?? false) &&
-			(focused == null || editor !== undefined) &&
-			!(editor?.isShowingAutocomplete() ?? false) &&
-			!(editor === undefined && foreignEditor());
+		const ownsMain = mainEditorOwnsInput();
 		if (!ownsMain) {
 			leftArmed = undefined;
 			stopArmedFor = null;
@@ -819,7 +828,10 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			});
 			inlineListView = {
 				...listView,
-				rows: listView.rows.filter((row) => isActiveStatus(row.status) || row.resourceState === "cleanup-unconfirmed"),
+				rows: listView.rows.filter(
+					(row) =>
+						isActiveStatus(row.status) || row.resourceState === "idle" || row.resourceState === "cleanup-unconfirmed",
+				),
 			};
 
 			updateStatusLine();
@@ -927,6 +939,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			void refresh();
 		},
 		isViewOpen: () => viewRunId !== null,
+		isMainEditorFocused: () => !hubOpen && viewRunId === null && selection === null && mainEditorOwnsInput(),
 		dispose(): void {
 			if (disposed) return;
 			disposed = true;

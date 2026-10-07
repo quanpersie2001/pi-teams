@@ -22,7 +22,7 @@ Delegate implementation, local exploration, external research, and code review w
 - **Recoverable sessions** — durable native JSONL history supports cold continuation in a new child process; settled children close after durable finalization.
 - **Session-owned runs** — a run belongs to the conversation that launched it: other sessions in the same project never see, adopt, or control it. Teammates are session-bound ([ADR 0007](docs/decisions/0007-session-bound-agent-teams.md)): session end/switch/shutdown tears every child down (abort request → bounded grace → verified force-kill), children detect a dead parent through control-socket loss and stop themselves with an annotated partial `result.md`, and startup never re-adopts leftover active rows — they archive `stopped` with an honest note and go through verified disposal. Settled or verified-dead foreign rows are archived to shared history for explicit cold `resume` by run ID.
 - **Workspace choice** — shared files by default, or opt-in Git worktrees with retained commits/checkouts and explicit cleanup.
-- **Extension integration** — scoped inbox messaging and public events RPC for consumers that own scheduling, retries, and review policy.
+- **Extension integration** — signed peer mailboxes and public events RPC for consumers that own scheduling, retries, and review policy.
 
 ---
 
@@ -120,10 +120,11 @@ HerdR/tmux keep Main on the left and stack at most three children per right-hand
 | `Agent` | Launch a specialist with an explicit assignment — optionally `name:` it a teammate of this session's team (`@name` becomes its messaging/board address; a name is refused while that teammate is still working, and a settled name means a new assignment for the same teammate) — or resume a settled run by `resume` run ID |
 | `get_subagent_result` | Inspect a run's status and read its full result — durable, re-readable from the run's `result.md` artifact on every call; `wait: true` blocks until the run settles |
 | `steer_subagent` | Send guidance to an active run |
-| `send_inbox_message`, `read_inbox`, `consume_inbox_message` | Scoped parent/child/sibling messaging |
-| `inspect_subagent_messages` | Parent-only message inspection |
+| `send_message` | Send `{ target: "teammate-name" \| "lead", message: "..." }` through a signed peer mailbox |
 
-Closed recipients queue inbox messages without revival. Inbox/history is bounded, process-local memory and does not survive reload/restart. Children receive scoped messaging tools, not parent orchestration tools.
+Named teammates stay alive while idle. A new assignment under the same name reuses its native child and specialist role; mailbox messages start an assignment when idle or steer the active turn. The bridge watches its inbox automatically—models never poll. In the main composer, `@name message` routes directly to a live teammate; unresolved mentions retain normal inline behavior.
+
+Mailboxes use one owner-only, HMAC-signed file per message under `.pi/teams/t/<team-id>/inboxes/<name>/`. Invalid entries are quarantined with a warning. Messages are untrusted content and cannot approve permissions. Files are consumed only after native injection; they survive runtime reload as artifacts, but never revive a stopped session's children.
 
 ---
 
@@ -246,7 +247,7 @@ Settled children/process panes close after durable finalization. Closed rows lea
 | [Documentation index](docs/README.md) | Runtime contracts and architecture decisions |
 | [Configuration](docs/CONFIGURATION.md) | Agent definitions, settings, precedence, time budgets, and model admission |
 | [Agents UI](docs/ui/AGENT-PANEL-AND-VIEW.md) | Navigation, child composers, transcript controls, and terminal layout |
-| [Integration](docs/INTEGRATION.md) | Public events RPC, lifecycle, delivery, and scoped inbox messaging |
+| [Integration](docs/INTEGRATION.md) | Public events RPC, lifecycle, delivery, and peer mailboxes |
 | [Architecture](docs/ARCHITECTURE.md) | Process boundaries, ownership, recovery, and layers |
 | [Changelog](CHANGELOG.md) | Product changes |
 

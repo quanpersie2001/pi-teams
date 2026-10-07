@@ -20,7 +20,6 @@ import {
 	type ChildState,
 } from "../domain/child-protocol.js";
 import type { BackendMode, BackendSelector } from "../domain/config.js";
-import type { ChildMessageReply, ChildMessageRequest, InboxMessage } from "../domain/message.js";
 import type { LauncherHandle, ProcessLauncher } from "../domain/process-launcher.js";
 import { ProcessLaunchCleanupPendingError } from "../domain/process-launcher.js";
 import type { TranscriptSnapshot } from "../domain/transcript.js";
@@ -46,8 +45,8 @@ interface ChildConnection {
 	reconnectTimer?: NodeJS.Timeout;
 	unlisten: (() => void)[];
 	focusListeners: Set<(state: ChildState) => void>;
-	messageListeners: Set<(request: ChildMessageRequest) => Promise<ChildMessageReply>>;
-	pendingMessages: { requestId: string; request: ChildMessageRequest; timer: NodeJS.Timeout }[];
+	assignmentListeners: Set<(assignment: { runId: string }) => void>;
+	pendingAssignments: { runId: string }[];
 }
 interface RunConnection {
 	runId: string;
@@ -99,17 +98,6 @@ function entryPaths(): { bridge: string; headless: string } {
 	if (!existsSync(built.bridge) || !existsSync(built.headless))
 		throw new Error("Child runtime is not built. Run npm run build before launching subagents.");
 	return built;
-}
-function isChildMessageRequest(value: unknown): value is ChildMessageRequest {
-	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-	const request = value as Record<string, unknown>;
-	if (request.action === "list") return true;
-	if (request.action === "consume") return typeof request.messageId === "string" && request.messageId.length > 0;
-	if (request.action !== "send" || typeof request.text !== "string") return false;
-	const target = request.target;
-	if (target === null || typeof target !== "object" || Array.isArray(target)) return false;
-	const endpoint = target as Record<string, unknown>;
-	return endpoint.kind === "parent" || (endpoint.kind === "agent" && typeof endpoint.agentId === "string");
 }
 export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	readonly kind = "process" as const;
@@ -197,9 +185,21 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			...(input.instructions !== undefined ? { instructions: input.instructions } : {}),
 			...(input.model !== undefined ? { model: input.model } : {}),
 			...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
-			...(input.tools !== undefined ? { tools: [...input.tools] } : {}),
+			...(input.tools !== undefined
+				? {
+						tools:
+							input.team && !input.tools.includes("send_message") ? [...input.tools, "send_message"] : [...input.tools],
+					}
+				: {}),
 			...(input.maxTurns !== undefined ? { maxTurns: input.maxTurns } : {}),
 			...(input.graceTurns !== undefined ? { graceTurns: input.graceTurns } : {}),
+			...(input.team !== undefined
+				? {
+						teamDir: input.team.teamDir,
+						teamKey: input.team.teamKey,
+						teammateName: input.team.teammateName,
+					}
+				: {}),
 		};
 		const configFile = join(runDir, "bootstrap.json");
 		writeFileSync(configFile, JSON.stringify(bootstrap), { mode: 0o600 });
@@ -251,8 +251,8 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				refreshAgain: false,
 				unlisten: [],
 				focusListeners: new Set(),
-				messageListeners: new Set(),
-				pendingMessages: [],
+				assignmentListeners: new Set(),
+				pendingAssignments: [],
 			};
 			this.verifyChildPid(handle, snapshot);
 			this.children.set(childId, child);
@@ -367,22 +367,15 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	private watchChild(child: ChildConnection): void {
 		child.unlisten.push(
 			child.client.subscribe((event: ChildEvent) => {
-				if (event.event === "message_request" && typeof event.payload.requestId === "string") {
-					const request = event.payload.request;
-					if (isChildMessageRequest(request)) {
-						const requestId = event.payload.requestId;
-						const listener = [...child.messageListeners].at(-1);
-						if (listener) this.deliverChildMessage(child, requestId, request, listener);
-						else if (child.pendingMessages.length < 64) {
-							const timer = setTimeout(() => {
-								const index = child.pendingMessages.findIndex((entry) => entry.requestId === requestId);
-								if (index >= 0) child.pendingMessages.splice(index, 1);
-								void child.client.rejectMessageRequest(requestId, "Message service is not attached");
-							}, 30_000);
-							timer.unref();
-							child.pendingMessages.push({ requestId, request, timer });
-						} else void child.client.rejectMessageRequest(requestId, "Message request queue is full");
-					}
+				if (
+					event.event === "mailbox_assignment" &&
+					typeof event.payload.runId === "string" &&
+					event.payload.runId.length > 0
+				) {
+					const assignment = { runId: event.payload.runId };
+					if (!this.runs.has(assignment.runId)) this.createRun(assignment.runId, child);
+					if (child.assignmentListeners.size === 0) child.pendingAssignments.push(assignment);
+					else for (const listener of [...child.assignmentListeners]) listener(assignment);
 				}
 				void this.refreshChild(child);
 			}),
@@ -403,8 +396,6 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	}
 	private releaseChild(child: ChildConnection): void {
 		this.unwatch(child);
-		for (const pending of child.pendingMessages) clearTimeout(pending.timer);
-		child.pendingMessages.length = 0;
 		child.client.disconnect();
 		rmSync(dirname(child.bootstrap.socketPath), { recursive: true, force: true });
 		child.closed = true;
@@ -599,37 +590,34 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		return () => child.focusListeners.delete(listener);
 	}
 
-	async sendInbox(handle: AgentBackendHandle, message: InboxMessage): Promise<boolean> {
+	subscribeAssignments(handle: AgentBackendHandle, listener: (assignment: { runId: string }) => void): () => void {
 		const child = this.requireRun(handle).child;
-		if (child.closed || !child.connected || child.identityFailure) return false;
-		await child.client.sendInbox(message);
-		return true;
-	}
-	subscribeMessages(
-		handle: AgentBackendHandle,
-		listener: (request: ChildMessageRequest) => Promise<ChildMessageReply>,
-	): () => void {
-		const child = this.requireRun(handle).child;
-		child.messageListeners.add(listener);
-		for (const pending of child.pendingMessages.splice(0)) {
-			clearTimeout(pending.timer);
-			this.deliverChildMessage(child, pending.requestId, pending.request, listener);
-		}
-		return () => child.messageListeners.delete(listener);
+		child.assignmentListeners.add(listener);
+		for (const assignment of child.pendingAssignments.splice(0)) listener(assignment);
+		return () => child.assignmentListeners.delete(listener);
 	}
 
-	private deliverChildMessage(
-		child: ChildConnection,
-		requestId: string,
-		request: ChildMessageRequest,
-		listener: (request: ChildMessageRequest) => Promise<ChildMessageReply>,
-	): void {
-		void listener(request)
-			.then((reply) => child.client.replyMessageRequest(requestId, reply))
-			.catch((error: unknown) =>
-				child.client.rejectMessageRequest(requestId, error instanceof Error ? error.message : String(error)),
-			);
+	async admitAssignment(handle: AgentBackendHandle): Promise<void> {
+		const run = this.requireRun(handle);
+		this.requireControl(run.child);
+		await run.child.client.admitAssignment(run.runId);
 	}
+
+	async assign(
+		handle: AgentBackendHandle,
+		input: { runId: string; prompt: string; maxTurns?: number; graceTurns?: number },
+	): Promise<AgentBackendHandle> {
+		const child = this.requireRun(handle).child;
+		this.requireControl(child);
+		this.createRun(input.runId, child);
+		await child.client.prompt(input.runId, input.prompt, {
+			...(input.maxTurns !== undefined ? { maxTurns: input.maxTurns } : {}),
+			...(input.graceTurns !== undefined ? { graceTurns: input.graceTurns } : {}),
+		});
+		await this.refreshChild(child);
+		return { kind: "process", handle: input.runId };
+	}
+
 	private requireControl(child: ChildConnection): void {
 		if (child.identityFailure) throw child.identityFailure;
 		if (!child.connected)
@@ -850,8 +838,8 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				refreshAgain: false,
 				unlisten: [],
 				focusListeners: new Set(),
-				messageListeners: new Set(),
-				pendingMessages: [],
+				assignmentListeners: new Set(),
+				pendingAssignments: [],
 			};
 			this.children.set(serialized.childId, child);
 			this.watchChild(child);

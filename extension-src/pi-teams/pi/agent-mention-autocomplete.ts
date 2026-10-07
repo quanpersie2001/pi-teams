@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
+import { isKeyRelease, isKeyRepeat, matchesKey } from "@earendil-works/pi-tui";
 import type { AgentRegistry } from "../app/agent-registry.js";
 
 const MENTION_PREFIX = "\u0000pi-teams-agent-mention\u0000";
@@ -10,6 +11,12 @@ type CompletionOrigin =
 	| { kind: "native"; provider: AutocompleteProvider; prefix: string };
 type AgentMention = { query: string; start: number };
 
+export interface TeammateMentionRouting {
+	names(): readonly string[];
+	isMainEditorFocused?(): boolean;
+	send(target: string, text: string): { delivered: true; id: string } | { delivered: false; error: string };
+}
+
 /** Match only a standalone @ token on the cursor line, never an email or path component. */
 function findMention(line: string, cursorCol: number): AgentMention | undefined {
 	const beforeCursor = line.slice(0, cursorCol);
@@ -19,7 +26,11 @@ function findMention(line: string, cursorCol: number): AgentMention | undefined 
 	return { query, start: beforeCursor.length - query.length - 1 };
 }
 
-function createAgentMentionProvider(current: AutocompleteProvider, registry: AgentRegistry): AutocompleteProvider {
+function createAgentMentionProvider(
+	current: AutocompleteProvider,
+	registry: AgentRegistry,
+	routing?: TeammateMentionRouting,
+): AutocompleteProvider {
 	const origins = new WeakMap<AutocompleteItem, CompletionOrigin>();
 
 	return {
@@ -32,6 +43,16 @@ function createAgentMentionProvider(current: AutocompleteProvider, registry: Age
 			const native = await current.getSuggestions(lines, cursorLine, cursorCol, options);
 			if (options.signal.aborted) return native;
 
+			const teammateItems = (routing?.names() ?? []).flatMap((name): AutocompleteItem[] => {
+				if (!name.toLowerCase().includes(mention.query.toLowerCase())) return [];
+				const item: AutocompleteItem = {
+					value: name,
+					label: `@${name}`,
+					description: "Send message to teammate",
+				};
+				origins.set(item, { kind: "agent", type: name });
+				return [item];
+			});
 			const agentItems = registry.availableTypes.flatMap((type): AutocompleteItem[] => {
 				const definition = registry.get(type);
 				if (
@@ -48,14 +69,18 @@ function createAgentMentionProvider(current: AutocompleteProvider, registry: Age
 				origins.set(item, { kind: "agent", type });
 				return [item];
 			});
-			if (agentItems.length === 0) return native;
+			if (agentItems.length === 0 && teammateItems.length === 0) return native;
 
 			if (native) {
 				for (const item of native.items)
 					origins.set(item, { kind: "native", provider: current, prefix: native.prefix });
 			}
 			return {
-				items: [...agentItems, ...(native?.items ?? [])],
+				items: [
+					...teammateItems,
+					...agentItems.filter((item) => !teammateItems.some((peer) => peer.value === item.value)),
+					...(native?.items ?? []),
+				],
 				prefix: MENTION_PREFIX,
 			};
 		},
@@ -90,8 +115,35 @@ function createAgentMentionProvider(current: AutocompleteProvider, registry: Age
  * from session_start; Pi 1.0.4 resets autocomplete wrappers between sessions and
  * extension reloads, so retain no wrapper/disposer across those boundaries.
  */
-export function installAgentMentionAutocomplete(ctx: Pick<ExtensionContext, "ui">, registry: AgentRegistry): void {
+export function installAgentMentionAutocomplete(
+	ctx: Pick<ExtensionContext, "ui">,
+	registry: AgentRegistry,
+	routing?: TeammateMentionRouting,
+): void {
 	if (installedContexts.has(ctx)) return;
 	installedContexts.add(ctx);
-	ctx.ui.addAutocompleteProvider((current) => createAgentMentionProvider(current, registry));
+	ctx.ui.addAutocompleteProvider((current) => createAgentMentionProvider(current, registry, routing));
+}
+
+/** Route a main-editor submission before Pi appends it to the lead conversation. */
+export function installTeammateMentionRouting(
+	ctx: Pick<ExtensionContext, "ui">,
+	routing: TeammateMentionRouting,
+): () => void {
+	return ctx.ui.onTerminalInput((data) => {
+		if (isKeyRelease(data) || isKeyRepeat(data) || !matchesKey(data, "return")) return;
+		if (routing.isMainEditorFocused?.() === false) return;
+		const match = /^@([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})\s+([\s\S]+)$/.exec(ctx.ui.getEditorText());
+		const target = match?.[1];
+		const text = match?.[2];
+		if (!target || !text || !routing.names().includes(target)) return;
+		const result = routing.send(target, text);
+		if (result.delivered) {
+			ctx.ui.setEditorText("");
+			ctx.ui.notify(`Message queued for @${target}`, "info");
+		} else {
+			ctx.ui.notify(result.error, "error");
+		}
+		return { consume: true };
+	});
 }

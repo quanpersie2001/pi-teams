@@ -6,7 +6,6 @@
 import type { IsolationPolicy, PromptMode, ThinkingLevel } from "./agent-definition.js";
 import type { UsageSummary } from "./agent-run.js";
 import type { ChildControlCommand, ChildState } from "./child-protocol.js";
-import type { ChildMessageReply, ChildMessageRequest, InboxMessage } from "./message.js";
 import type { TranscriptSnapshot } from "./transcript.js";
 import type { WorktreeInfo } from "./worktree.js";
 
@@ -34,6 +33,8 @@ export interface AgentLaunchInput {
 	/** Requested isolation policy, with an optional prepared checkout. */
 	isolation?: IsolationPolicy;
 	worktree?: WorktreeInfo;
+	/** Authenticated team bootstrap context for named teammates only. */
+	team?: { teamDir: string; teamKey: string; teammateName: string };
 }
 
 /** Opaque process-backend handle. */
@@ -103,11 +104,12 @@ export interface AgentExecutionBackend {
 	readFocusState?(handle: AgentBackendHandle): Promise<ChildState | undefined>;
 	controlFocus?(handle: AgentBackendHandle, command: ChildControlCommand): Promise<ChildState>;
 	subscribeFocus?(handle: AgentBackendHandle, listener: (state: ChildState) => void): () => void;
-	sendInbox?(handle: AgentBackendHandle, message: InboxMessage): Promise<boolean>;
-	subscribeMessages?(
+	subscribeAssignments?(handle: AgentBackendHandle, listener: (assignment: { runId: string }) => void): () => void;
+	admitAssignment?(handle: AgentBackendHandle): Promise<void>;
+	assign?(
 		handle: AgentBackendHandle,
-		listener: (request: ChildMessageRequest) => Promise<ChildMessageReply>,
-	): () => void;
+		input: { runId: string; prompt: string; maxTurns?: number; graceTurns?: number },
+	): Promise<AgentBackendHandle>;
 	attach?(handle: AgentBackendHandle): Promise<boolean>;
 	dispose(handle: AgentBackendHandle): Promise<void>;
 	detach(handle: AgentBackendHandle): void;

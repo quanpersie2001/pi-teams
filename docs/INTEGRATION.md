@@ -138,20 +138,19 @@ The parent restores registry records before installing the initial UI projection
 
 `pi-tasks` restores its own tasks/mappings, probes `ping`, calls `status`, subscribes to lifecycle and decides assignment/retry/review. Assignment prompts must be self-contained: goal, parent context, exact scope/non-goals, edit policy, acceptance and verification. The runtime does not validate task-specific acceptance criteria.
 
-## Scoped inbox messaging
+## Peer mailboxes
 
-Messaging is separate from public v3 task orchestration, composer steering and completion notification:
+Messaging is independent of public integration v3 orchestration and runtime-authored completion notifications.
 
-| Tool | Parameters / visibility |
-|---|---|
-| `send_inbox_message` | `{ target: "parent" \| { agent_id: string }, text: string }`; parent sends only to children |
-| `read_inbox` | `{}`; unread messages addressed to the calling parent/child |
-| `consume_inbox_message` | `{ message_id: string }`; only the addressed recipient may consume |
-| `inspect_subagent_messages` | `{}`; parent-only retained session thread, including sibling traffic and consumed receipts |
+`send_message` accepts `{ target: "teammate-name" | "lead", message: string }`. The lead and named teammates receive the tool; children do not receive `Agent`, result retrieval or parent orchestration tools. Targets must resolve to the current team's roster. There is no broadcast primitive.
 
-Sender and owning parent session come from trusted runtime context/authenticated child transport, never tool parameters. Parent-session scope is captured for conversation- and extension-owned runs. Cross-session or unscoped legacy targets are rejected. Children get builtin tools plus the three messaging tools, not `Agent`, result/steer orchestration or the inspector.
+Each participant has `.pi/teams/t/<team-id>/inboxes/<name>/`. A message is a single JSON file written with an exclusive temporary file and atomic rename (0700 directories, 0600 files). A per-team HMAC key is generated with the roster and distributed through the authenticated, owner-only bootstrap. Verification rejects malformed, tampered or wrong-recipient entries; quarantine preserves invalid entries and logs the reason.
 
-Receipts distinguish queued, delivered and consumed. Sending to a closed child does not launch it; pending messages transfer to a cold continuation with stable message IDs. Parent delivery injects `subagent-inbox` as steer with `triggerTurn: false` and strips terminal control characters from display. A failed parent delivery stays honestly queued, not marked delivered.
+Bridges watch their own mailbox and inject automatically: an idle teammate starts a new native assignment, while a busy teammate receives steering. Assignment metadata—not peer content—crosses the parent control socket to obtain the same `maxConcurrent` capacity as an `Agent` invocation. Native `agent_settled` remains the settlement authority. An `Agent` assignment under a settled name reuses its live native child; specialist roles remain fixed for that teammate.
 
-The queue and consumed history are process-local and bounded to 1,000 pending plus 1,000 consumed messages; text is limited to 32,000 characters. Reload/restart loses this state; messaging is not durable storage and does not automatically retry or revive a child.
+The lead receives runtime-authored `teammate-message` custom messages (`deliverAs: "steer"`, `triggerTurn: true`, provenance in `details`). Its mailbox file is consumed only after the matching native `message_end` event proves conversation injection. Child files are consumed after native prompt/steer admission. Queued/delivered/consumed receipts remain internal; model output reports only queuing, not an approval or execution guarantee.
+
+The main TUI composer offers live teammates in `@` completion. `@name message` is intercepted before normal submission and written directly to that mailbox; unresolved names retain inline-mention behavior. Routing never takes input from an overlay, panel navigation or autocomplete menu. Failed writes preserve the editor text without forwarding it to the lead.
+
+Messages carry no permission authority. The shared team key authenticates team-originated content, not a permission grant or isolation between mutually untrusted native processes. Each child's native permission surface remains authoritative. Session teardown stops peers; persisted mailboxes never restart them.
 

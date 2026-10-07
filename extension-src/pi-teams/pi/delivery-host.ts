@@ -15,11 +15,12 @@
 // shared/stale-context.ts) and the delivery guard refuses stale contexts on
 // positive evidence anyway (refuse-over-deliver).
 
-import { stripVTControlCharacters } from "node:util";
+import { chmodSync, type FSWatcher, mkdirSync, watch } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CompletionNotification, DeliveryHost, SessionSnapshot } from "../app/delivery-service.js";
+import type { MailboxService } from "../app/mailbox-service.js";
 import { TEAMMATE_NOTIFICATION_TYPE } from "../domain/delivery.js";
-import type { InboxMessage } from "../domain/message.js";
+import { formatMailboxMessageForInjection, type MailboxMessage } from "../domain/mailbox.js";
 import { ignoreStaleExtensionCtx } from "../shared/stale-context.js";
 
 interface SessionManagerView {
@@ -118,26 +119,76 @@ export function createPiDeliveryHost(pi: ExtensionAPI, getContext: () => Extensi
 	return { sendNotification, currentSession };
 }
 
-/** Inbox delivery is a custom message, never a completion or an automatic wake-up. */
-export function createPiInboxDelivery(
-	pi: ExtensionAPI,
-	getContext: () => ExtensionContext | undefined,
-): (message: InboxMessage) => Promise<boolean> {
-	return async (message) => {
-		const ctx = getContext();
-		if (!ctx || ctx.sessionManager.getSessionId() !== message.ownerSessionId) return false;
-		const sender = message.from.kind === "agent" ? `agent:${message.from.agentId}` : "parent";
-		// biome-ignore lint/suspicious/noControlCharactersInRegex: Untrusted inbox text must not emit terminal control bytes.
-		const text = stripVTControlCharacters(message.text).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
-		pi.sendMessage(
-			{
-				customType: "subagent-inbox",
-				content: `Inbox ${message.id} from ${sender}\n\n${text}`,
-				display: true,
-				details: { messageId: message.id, from: message.from },
-			},
-			{ deliverAs: "steer", triggerTurn: false },
+/** Watch and inject lead mailbox messages as inert, provenance-labelled runtime messages. */
+export function installLeadMailbox(pi: ExtensionAPI, service: MailboxService): () => void {
+	mkdirSync(service.inboxDir, { recursive: true, mode: 0o700 });
+	chmodSync(service.inboxDir, 0o700);
+	let closed = false;
+	let draining: Promise<void> | undefined;
+	let drainAgain = false;
+	const pending = new Map<string, MailboxMessage>();
+	// sendMessage returns before native delivery. A custom message_end event
+	// proves the message entered the conversation; only then remove its file.
+	const unsubscribe = pi.on("message_end", (event) => {
+		const message = event.message;
+		if (message.role !== "custom" || message.customType !== "teammate-message") return;
+		const details = message.details as { messageId?: unknown } | undefined;
+		if (typeof details?.messageId !== "string") return;
+		const entry = pending.get(details.messageId);
+		if (!entry) return;
+		service.consume(entry);
+		pending.delete(entry.id);
+		drain();
+	});
+	const drain = (): void => {
+		if (draining) {
+			drainAgain = true;
+			return;
+		}
+		draining = (async () => {
+			do {
+				drainAgain = false;
+				const messages = service.receive(16).filter((message) => !pending.has(message.id));
+				if (messages.length > 0) drainAgain = true;
+				for (const message of messages) {
+					try {
+						pending.set(message.id, message);
+						pi.sendMessage(
+							{
+								customType: "teammate-message",
+								content: formatMailboxMessageForInjection(message),
+								display: true,
+								details: { messageId: message.id, from: message.from, untrusted: true },
+							},
+							{ deliverAs: "steer", triggerTurn: true },
+						);
+					} catch (error) {
+						pending.delete(message.id);
+						console.warn(
+							`[pi-teams] lead mailbox injection failed: ${error instanceof Error ? error.message : String(error)}`,
+						);
+						return;
+					}
+				}
+			} while (!closed && drainAgain);
+		})().finally(() => {
+			draining = undefined;
+		});
+	};
+	let watcher: FSWatcher | undefined;
+	try {
+		watcher = watch(service.inboxDir, drain);
+		watcher.on("error", (error) => console.warn(`[pi-teams] lead mailbox watch failed: ${error.message}`));
+	} catch (error) {
+		console.warn(
+			`[pi-teams] lead mailbox watch unavailable: ${error instanceof Error ? error.message : String(error)}`,
 		);
-		return true;
+	}
+	drain();
+	return () => {
+		closed = true;
+		unsubscribe();
+		pending.clear();
+		watcher?.close();
 	};
 }

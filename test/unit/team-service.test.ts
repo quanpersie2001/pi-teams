@@ -82,7 +82,14 @@ describe("createPiTeamStore", () => {
 		const store = createPiTeamStore(tempDir, "sess-x");
 		expect(store.teamDir).toBe(join(teamsArtifactDir(tempDir), "t", "sess-x"));
 
-		store.writeRoster({ version: 1, teamId: "sess-x", sessionId: "sess-x", createdAt: 1, members: [] });
+		store.writeRoster({
+			version: 1,
+			teamId: "sess-x",
+			sessionId: "sess-x",
+			createdAt: 1,
+			teamKey: "key1",
+			members: [],
+		});
 		const configPath = join(store.teamDir, "config.json");
 		expect(statSync(configPath).mode & 0o777 & 0o700).toBe(0o600 & 0o700);
 		expect(statSync(store.teamDir).mode & 0o777).toBe(0o700);

@@ -147,7 +147,9 @@ export function createAgentViewOverlay(options: {
 				? " · Pi process closed (history only)"
 				: view.resourceState === "cleanup-unconfirmed"
 					? " · Pi process close unconfirmed"
-					: "";
+					: view.resourceState === "idle"
+						? " · Pi process idle (retained teammate)"
+						: "";
 		const usage = `${view.usage.inputTokens} in / ${view.usage.outputTokens} out`;
 		const title = ` ${color(badge.color, badge.icon)} ${view.type} · ${usage} — ${view.description} · ${stats.join(" · ")}${state}`;
 		const truncation = focus?.truncatedHead || view.truncatedHead ? " · transcript is a bounded tail" : "";

@@ -202,7 +202,7 @@ Preservation failure retains the checkout with `recoveryError`. Release is non-f
 
 The parent renderer owns the inline panel, Agents Hub and remote-focus overlay, not child InteractiveMode. UI disposal/hiding is not runtime dismissal, history deletion or child termination. See the [UI contract](./ui/AGENT-PANEL-AND-VIEW.md) for keyboard, mouse, native editor ownership and terminal-column behavior.
 
-`app/message-service.ts` owns scoped bounded process-local inbox receipts with distinct delivered/consumed timestamps. Messages are separate from composer steer and completion delivery. Closed recipients wait for cold continuation with stable message IDs; reload/restart clears memory. See [Integration messaging](./INTEGRATION.md#scoped-inbox-messaging) for tools, limits and trusted sender/session rules.
+`app/mailbox-service.ts` stores signed peer messages as atomic owner-only files. `pi/child-mailbox.ts` and the lead delivery adapter watch, verify and inject their participant's inbox; malformed entries are quarantined. Models never poll. Native prompt/steer admission (children) or a matching custom-message `message_end` event (lead) precedes consumption. Mailbox assignment metadata passes through the parent's normal capacity queue; peer content is never relayed through a messaging hub. Named idle children remain alive until teardown, and subsequent assignments reuse their native process. Each assignment retains an immutable full-result file; follow-on results live under `sessions/<child-id>/runs/<sha256(run-id)>/result.md`. See [Peer mailboxes](./INTEGRATION.md#peer-mailboxes).
 
 ## 18. Team roster (ADR 0007 §2)
 

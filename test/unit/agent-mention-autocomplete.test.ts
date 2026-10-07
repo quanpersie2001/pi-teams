@@ -1,12 +1,21 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AutocompleteProvider, AutocompleteProviderFactory } from "@earendil-works/pi-coding-agent";
+import type {
+	AutocompleteProvider,
+	AutocompleteProviderFactory,
+	ExtensionContext,
+	TerminalInputHandler,
+} from "@earendil-works/pi-coding-agent";
 import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
+import { MailboxService } from "../../extension-src/pi-teams/app/mailbox-service.js";
 import { DEFAULT_SUBAGENTS_SETTINGS } from "../../extension-src/pi-teams/domain/config.js";
-import { installAgentMentionAutocomplete } from "../../extension-src/pi-teams/pi/agent-mention-autocomplete.js";
+import {
+	installAgentMentionAutocomplete,
+	installTeammateMentionRouting,
+} from "../../extension-src/pi-teams/pi/agent-mention-autocomplete.js";
 
 let root: string;
 
@@ -116,5 +125,66 @@ describe("agent mention autocomplete", () => {
 		expect((email?.items ?? []).some((item) => item.label === "@Review")).toBe(false);
 		const path = await provider.getSuggestions(["src/@Review"], 0, 11, options);
 		expect((path?.items ?? []).some((item) => item.label === "@Review")).toBe(false);
+	});
+});
+
+describe("teammate composer routing", () => {
+	function editor(text: string) {
+		let handler: TerminalInputHandler | undefined;
+		const ctx = {
+			ui: {
+				onTerminalInput(callback: TerminalInputHandler) {
+					handler = callback;
+					return () => {
+						handler = undefined;
+					};
+				},
+				getEditorText: () => text,
+				setEditorText: (value: string) => {
+					text = value;
+				},
+				notify: () => {},
+			},
+		} as unknown as Pick<ExtensionContext, "ui">;
+		return { ctx, text: () => text, input: (key: string) => handler?.(key) };
+	}
+
+	it("writes a signed peer message and consumes Enter without submitting to the lead", () => {
+		const lead = new MailboxService({ teamDir: root, teamKey: "a".repeat(64), self: "lead" });
+		const peer = new MailboxService({ teamDir: root, teamKey: "a".repeat(64), self: "scout" });
+		const surface = editor("@scout inspect this\nand report");
+		const dispose = installTeammateMentionRouting(surface.ctx, {
+			names: () => ["scout"],
+			send: (target, text) => lead.send(target, text),
+		});
+		expect(surface.input("\r")).toEqual({ consume: true });
+		expect(surface.text()).toBe("");
+		expect(peer.receive()).toMatchObject([{ from: "lead", to: "scout", text: "inspect this\nand report" }]);
+		dispose();
+		expect(surface.input("\r")).toBeUndefined();
+	});
+
+	it("leaves unresolved and inline mentions on the normal composer path", () => {
+		for (const prompt of ["@unknown inspect", "ask @scout inspect", "@scout"]) {
+			const surface = editor(prompt);
+			installTeammateMentionRouting(surface.ctx, {
+				names: () => ["scout"],
+				send: () => {
+					throw new Error("Unresolved input must not enter the mailbox");
+				},
+			});
+			expect(surface.input("\r")).toBeUndefined();
+			expect(surface.text()).toBe(prompt);
+		}
+	});
+
+	it("preserves failed submissions for retry without leaking them to the lead", () => {
+		const surface = editor("@scout inspect");
+		installTeammateMentionRouting(surface.ctx, {
+			names: () => ["scout"],
+			send: () => ({ delivered: false, error: "disk full" }),
+		});
+		expect(surface.input("\r")).toEqual({ consume: true });
+		expect(surface.text()).toBe("@scout inspect");
 	});
 });

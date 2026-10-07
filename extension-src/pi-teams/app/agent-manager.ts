@@ -32,12 +32,10 @@ import {
 	PROTOCOL_VERSION,
 	toRunSnapshot,
 } from "../domain/integration-protocol.js";
-import type { InboxMessage } from "../domain/message.js";
 import { teammateNameProblem } from "../domain/team.js";
 import type { WorktreeInfo } from "../domain/worktree.js";
 import type { AgentRegistry } from "./agent-registry.js";
 import { resolveBackend } from "./backend-selector.js";
-import type { MessageService } from "./message-service.js";
 import type {
 	AgentRegistryEntry,
 	CompletedRunHistoryEntry,
@@ -53,6 +51,7 @@ import {
 	toHistoryEntry,
 	toRegistryEntry,
 } from "./run-registry.js";
+import type { TeamService } from "./team-service.js";
 import { type BudgetExpiry, TimeBudgetWatcher } from "./time-budget-watcher.js";
 import type { WorktreeService } from "./worktree-service.js";
 
@@ -104,6 +103,7 @@ export interface AgentManagerOptions {
 	getSessionId?: () => string;
 	registryStore?: SubagentRunStore;
 	worktreeService?: WorktreeService;
+	teamService?: TeamService;
 	idFactory?: () => string;
 	now?: () => number;
 	/** Test seam for the session-teardown cooperative window; default 15s. */
@@ -112,6 +112,8 @@ export interface AgentManagerOptions {
 
 type LaunchPlan =
 	| { kind: "launch"; prompt: string }
+	| { kind: "mailbox" }
+	| { kind: "assignment"; handle: AgentBackendHandle; prompt: string }
 	| {
 			kind: "resume";
 			input: AgentResumeInput;
@@ -156,7 +158,7 @@ interface RunInternals {
 	slotAcquired: boolean;
 	launchPromise?: Promise<void>;
 	unsubscribeBackend?: () => void;
-	unsubscribeMessages?: () => void;
+	unsubscribeAssignments?: () => void;
 	worktreeInfo?: WorktreeInfo;
 	finalizePromise?: Promise<void>;
 	settlementPromise?: Promise<void>;
@@ -211,8 +213,8 @@ export class AgentManager {
 	private readonly teardownGraceMs: number;
 	private readonly registryStore: SubagentRunStore | undefined;
 	private readonly worktreeService: WorktreeService | undefined;
+	private teamService: TeamService | undefined;
 	private readonly terminalCleanupByChild = new WeakMap<AgentExecutionBackend, Map<string, Promise<void>>>();
-	private messageService: MessageService | undefined;
 	private preservedRegistryEntries: PersistedRegistryEntry[] = [];
 	/** Rows owned by other conversations/extensions; kept verbatim on every rewrite. */
 	private foreignRegistryEntries: PersistedRegistryEntry[] = [];
@@ -232,10 +234,14 @@ export class AgentManager {
 		this.teardownGraceMs = options.teardownGraceMs ?? SESSION_TEARDOWN_GRACE_MS;
 		this.registryStore = options.registryStore;
 		this.worktreeService = options.worktreeService;
+		this.teamService = options.teamService;
 		this.budgetWatcher = new TimeBudgetWatcher({
 			now: () => this.now(),
 			onExpiry: (runId, decision) => this.handleBudgetExpiry(runId, decision),
 		});
+	}
+	setTeamService(service: TeamService | undefined): void {
+		this.teamService = service;
 	}
 
 	// -- configuration ---------------------------------------------------------
@@ -262,48 +268,6 @@ export class AgentManager {
 
 	getMaxConcurrent(): number {
 		return this.maxConcurrent;
-	}
-
-	setMessageService(service: MessageService): void {
-		this.messageService = service;
-	}
-
-	/** A queued/closed recipient retains an inbox; this never starts a child. */
-	async sendInbox(agentId: string, message: InboxMessage): Promise<boolean> {
-		const internal = this.runs.get(agentId);
-		if (
-			!internal ||
-			this.disposed ||
-			this.shuttingDown ||
-			internal.stopRequested ||
-			!isActiveStatus(internal.record.status)
-		) {
-			return false;
-		}
-		const handle = internal.record.handle;
-		if (!handle || !internal.backend?.sendInbox) return false;
-		return internal.backend.sendInbox(handle, message);
-	}
-
-	private connectMessages(internal: RunInternals): void {
-		const messages = this.messageService;
-		const handle = internal.record.handle;
-		if (!messages || !handle || !internal.backend?.subscribeMessages) return;
-		internal.unsubscribeMessages?.();
-		const epoch = this.admissionEpoch;
-		internal.unsubscribeMessages = internal.backend.subscribeMessages(handle, async (request) => {
-			if (
-				this.disposed ||
-				this.shuttingDown ||
-				internal.stopRequested ||
-				epoch !== this.admissionEpoch ||
-				this.runs.get(internal.record.id) !== internal ||
-				!isActiveStatus(internal.record.status)
-			) {
-				throw new Error("The sending child no longer belongs to an active parent runtime.");
-			}
-			return messages.handleChildMessage(internal.record.id, request);
-		});
 	}
 
 	// -- events ------------------------------------------------------------------
@@ -462,6 +426,28 @@ export class AgentManager {
 		if (this.disposed || this.shuttingDown || epoch !== this.admissionEpoch)
 			throw new Error("AgentManager session changed during model admission; no run was allocated.");
 		snapshot = { ...snapshot, resolved: { ...snapshot.resolved, model: admission.model } };
+		if (request.name !== undefined) this.assertTeammateNameAvailable(request.name);
+		let retained: RunInternals | undefined;
+		if (plan.kind === "launch" && request.name !== undefined && this.teamService) {
+			for (const candidate of this.runs.values()) {
+				if (
+					candidate.record.teammateName === request.name &&
+					candidate.record.handle &&
+					isTerminalStatus(candidate.record.status)
+				) {
+					retained = candidate;
+					break;
+				}
+			}
+		}
+		if (retained?.record.handle && plan.kind === "launch") {
+			if (retained.record.type !== snapshot.resolved.type)
+				throw new Error(`Teammate "${request.name}" keeps its specialist role; use a new name for a different role.`);
+			if (retained.backend !== backend || !backend.assign)
+				throw new Error("The retained teammate backend cannot accept another assignment.");
+			plan = { kind: "assignment", handle: retained.record.handle, prompt: plan.prompt };
+			worktree = retained.worktreeInfo;
+		}
 		const id = this.idFactory();
 		this.registry.trackSnapshot(id, snapshot);
 		if (plan.kind === "resume") {
@@ -476,6 +462,7 @@ export class AgentManager {
 			status: "queued",
 			...(request.name !== undefined ? { teammateName: request.name } : {}),
 			backend: "process",
+			...(plan.kind === "assignment" ? { handle: plan.handle } : {}),
 			model: admission.model,
 			...(admission.fallback !== undefined ? { modelFallback: admission.fallback } : {}),
 			...(worktree !== undefined ? { worktree: { ...worktree } } : {}),
@@ -507,7 +494,7 @@ export class AgentManager {
 		const internal: RunInternals = {
 			record,
 			backend,
-			cwd: plan.kind === "resume" ? plan.input.cwd : this.cwd,
+			cwd: retained?.cwd ?? (plan.kind === "resume" ? plan.input.cwd : this.cwd),
 			...(worktree !== undefined ? { worktreeInfo: { ...worktree } } : {}),
 			settle,
 			resolveSettle,
@@ -517,19 +504,13 @@ export class AgentManager {
 			stopAcknowledged: false,
 			slotAcquired: false,
 		};
-		this.runs.set(id, internal);
-		if (plan.kind === "resume" && this.messageService) {
-			try {
-				await this.messageService.continueInbox(plan.sourceAgentId, id);
-				if (this.disposed || this.shuttingDown || epoch !== this.admissionEpoch) {
-					throw new Error("Parent session changed during inbox continuation; no child was started.");
-				}
-			} catch (error) {
-				this.runs.delete(id);
-				this.registry.releaseSnapshot(id);
-				throw error;
-			}
+		if (retained) {
+			retained.unsubscribeAssignments?.();
+			delete retained.unsubscribeAssignments;
+			delete retained.record.handle;
+			delete retained.backend;
 		}
+		this.runs.set(id, internal);
 
 		if (this.runningSlots < this.maxConcurrent) {
 			this.runningSlots += 1;
@@ -1136,8 +1117,6 @@ export class AgentManager {
 				this.detachBudgetWatch(internal);
 				internal.unsubscribeBackend?.();
 				delete internal.unsubscribeBackend;
-				internal.unsubscribeMessages?.();
-				delete internal.unsubscribeMessages;
 				delete internal.record.handle;
 				delete internal.backend;
 				this.notifyFocus(internal);
@@ -1204,8 +1183,6 @@ export class AgentManager {
 			this.detachBudgetWatch(internal);
 			internal.unsubscribeBackend?.();
 			delete internal.unsubscribeBackend;
-			internal.unsubscribeMessages?.();
-			delete internal.unsubscribeMessages;
 			if (internal.backend && internal.record.handle) {
 				await internal.backend.dispose(internal.record.handle);
 				delete internal.record.handle;
@@ -1303,10 +1280,8 @@ export class AgentManager {
 				this.syncRegistry();
 			});
 		});
-		this.connectMessages(internal);
 		try {
 			await this.reconcileBackendStatus(internal, await backend.status(handle));
-			await this.messageService?.deliverPending(record.id);
 		} catch {
 			// Connection failures are retained as active/unknown, never rewritten as job failures.
 		}
@@ -1377,11 +1352,18 @@ export class AgentManager {
 			[...this.runs.values()].map((internal) => internal.finalizePromise).filter((promise) => promise !== undefined),
 		);
 		for (const internal of this.runs.values()) {
+			if (internal.record.teammateName !== undefined && internal.backend && internal.record.handle) {
+				try {
+					await internal.backend.dispose(internal.record.handle);
+				} catch (error) {
+					internal.record.recoveryError = `Child cleanup failed; process receipt retained: ${errorText(error)}`;
+				}
+			}
+		}
+		for (const internal of this.runs.values()) {
 			this.detachBudgetWatch(internal);
 			internal.unsubscribeBackend?.();
 			delete internal.unsubscribeBackend;
-			internal.unsubscribeMessages?.();
-			delete internal.unsubscribeMessages;
 			if (internal.backend && internal.record.handle) internal.backend.detach(internal.record.handle);
 			this.focusObservations.get(internal.record.id)?.unsubscribe?.();
 		}
@@ -1425,8 +1407,6 @@ export class AgentManager {
 		this.detachBudgetWatch(internal);
 		internal.unsubscribeBackend?.();
 		delete internal.unsubscribeBackend;
-		internal.unsubscribeMessages?.();
-		delete internal.unsubscribeMessages;
 		this.registry.releaseSnapshot(record.id);
 		if (internal.slotAcquired) {
 			internal.slotAcquired = false;
@@ -1456,7 +1436,28 @@ export class AgentManager {
 			if (!backend) throw new Error("Admitted process execution backend is unavailable.");
 
 			let handle: AgentBackendHandle;
-			if (internal.plan.kind === "resume") {
+			if (internal.plan.kind === "mailbox") {
+				if (!internal.record.handle || !backend.admitAssignment)
+					throw new Error("Mailbox assignment admission is unavailable");
+				handle = internal.record.handle;
+				this.beginBudgetClocks(internal);
+				await backend.admitAssignment(handle);
+			} else if (internal.plan.kind === "assignment") {
+				if (!backend.assign) throw new Error("Teammate assignment is unavailable");
+				const snapshot = this.registry.getActiveSnapshot(internal.record.id);
+				if (!snapshot) throw new Error("Assignment snapshot is unavailable");
+				if (internal.record.model && backend.controlFocus)
+					await backend.controlFocus(internal.plan.handle, { type: "model", model: internal.record.model });
+				if (snapshot.resolved.thinking !== undefined && backend.controlFocus)
+					await backend.controlFocus(internal.plan.handle, { type: "thinking", thinking: snapshot.resolved.thinking });
+				this.beginBudgetClocks(internal);
+				handle = await backend.assign(internal.plan.handle, {
+					runId: internal.record.id,
+					prompt: internal.plan.prompt,
+					...(snapshot.resolved.maxTurnLimit !== undefined ? { maxTurns: snapshot.resolved.maxTurnLimit } : {}),
+					graceTurns: this.settings.graceTurns,
+				});
+			} else if (internal.plan.kind === "resume") {
 				// Clocks start here — after admission/queue prep, immediately before
 				// the resume call itself.
 				this.beginBudgetClocks(internal);
@@ -1489,16 +1490,16 @@ export class AgentManager {
 				this.beginEnforcedStop(internal);
 				this.syncRegistry();
 			}
-			this.connectMessages(internal);
 			this.notifyFocus(internal);
 			internal.unsubscribeBackend = backend.subscribe(handle, (status) => {
 				void this.reconcileBackendStatus(internal, status).catch((error: unknown) => {
 					internal.record.recoveryError = errorText(error);
 				});
 			});
+			this.observeAssignments(internal);
+
 			this.syncRegistry();
 			await this.reconcileBackendStatus(internal, await backend.status(handle));
-			await this.messageService?.deliverPending(internal.record.id);
 
 			await this.flushPendingControls(internal);
 			if (this.shuttingDown) this.syncRegistry();
@@ -1540,7 +1541,82 @@ export class AgentManager {
 		if (resolved.thinking !== undefined) input.thinking = resolved.thinking;
 		if (resolved.tools !== undefined) input.tools = [...resolved.tools];
 		if (resolved.maxTurnLimit !== undefined) input.maxTurns = resolved.maxTurnLimit;
+		const teamService = this.teamService;
+		const team = teamService?.current;
+		if (record.teammateName !== undefined && team !== undefined && teamService !== undefined) {
+			input.team = { teamDir: teamService.teamDir, teamKey: team.teamKey, teammateName: record.teammateName };
+		}
 		return input;
+	}
+
+	private observeAssignments(internal: RunInternals): void {
+		if (internal.unsubscribeAssignments || !internal.record.teammateName) return;
+		const backend = internal.backend;
+		const handle = internal.record.handle;
+		if (!backend?.subscribeAssignments || !handle) return;
+		internal.unsubscribeAssignments = backend.subscribeAssignments(handle, ({ runId }) => {
+			if (isTerminalStatus(internal.record.status)) this.adoptMailboxAssignment(internal, runId);
+			else void internal.settle.then(() => this.adoptMailboxAssignment(internal, runId));
+		});
+	}
+
+	private adoptMailboxAssignment(source: RunInternals, runId: string): void {
+		if (
+			this.shuttingDown ||
+			this.disposed ||
+			source.record.teammateName === undefined ||
+			source.record.handle === undefined ||
+			source.backend === undefined ||
+			!isTerminalStatus(source.record.status) ||
+			this.runs.has(runId)
+		)
+			return;
+		const handle: AgentBackendHandle = { kind: "process", handle: runId };
+		const teammateName = source.record.teammateName;
+		const backend = source.backend;
+		source.unsubscribeAssignments?.();
+		delete source.unsubscribeAssignments;
+		delete source.record.handle;
+		delete source.backend;
+		const previous = source.record;
+		const now = this.now();
+		const record: AgentRun = {
+			id: runId,
+			type: previous.type,
+			description: previous.description,
+			status: "queued",
+			teammateName,
+			backend: "process",
+			handle,
+			...(previous.model !== undefined ? { model: previous.model } : {}),
+			startedAt: now,
+			toolUses: 0,
+			turns: 0,
+			usage: { ...EMPTY_USAGE },
+			owner: { ...previous.owner },
+			delivery: previous.delivery,
+			isBackground: true,
+			...(previous.parentSession !== undefined ? { parentSession: { ...previous.parentSession } } : {}),
+			...(previous.budgetTimeout !== undefined ? { budgetTimeout: previous.budgetTimeout } : {}),
+			...(previous.budgetIdleTimeout !== undefined ? { budgetIdleTimeout: previous.budgetIdleTimeout } : {}),
+		};
+		const { promise: settle, resolve: resolveSettle } = Promise.withResolvers<AgentRun>();
+		const internal: RunInternals = {
+			record,
+			backend,
+			cwd: source.cwd,
+			settle,
+			resolveSettle,
+			plan: { kind: "mailbox" },
+			pendingSteers: [],
+			stopRequested: false,
+			stopAcknowledged: false,
+			slotAcquired: false,
+		};
+		this.runs.set(runId, internal);
+		this.queue.push(runId);
+		this.syncRegistry();
+		this.drainQueue();
 	}
 
 	private async reconcileBackendStatus(internal: RunInternals, status: BackendStatus): Promise<void> {
@@ -1600,8 +1676,6 @@ export class AgentManager {
 				this.detachBudgetWatch(internal);
 				internal.unsubscribeBackend?.();
 				delete internal.unsubscribeBackend;
-				internal.unsubscribeMessages?.();
-				delete internal.unsubscribeMessages;
 				this.registry.releaseSnapshot(record.id);
 				internal.finalizePromise = this.finalizeTerminalRun(internal);
 				await internal.finalizePromise;
@@ -1704,6 +1778,7 @@ export class AgentManager {
 		// been disposed. Worktree/session metadata and the native outcome are
 		// already present on the terminal run at this point.
 		this.syncRegistry();
+		if (internal.record.teammateName !== undefined && this.teamService !== undefined) return;
 		await this.disposeTerminalChild(internal);
 	}
 
@@ -1773,8 +1848,6 @@ export class AgentManager {
 			this.detachBudgetWatch(internal);
 			internal.unsubscribeBackend?.();
 			delete internal.unsubscribeBackend;
-			internal.unsubscribeMessages?.();
-			delete internal.unsubscribeMessages;
 			delete internal.record.handle;
 			delete internal.backend;
 			this.notifyFocus(internal);

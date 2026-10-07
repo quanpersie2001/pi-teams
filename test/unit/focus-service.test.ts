@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
 import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
 import { createAgentFocusPort } from "../../extension-src/pi-teams/app/focus-service.js";
-import { MessageService } from "../../extension-src/pi-teams/app/message-service.js";
 import type { AgentBackendHandle } from "../../extension-src/pi-teams/domain/backend.js";
 import type { ChildState } from "../../extension-src/pi-teams/domain/child-protocol.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
@@ -132,41 +131,6 @@ describe("remote focus freshness", () => {
 		expect(displayed.items.map((item) => item.text)).toEqual(["FINAL_HISTORY"]);
 		expect(displayed.capabilities).toEqual([]);
 		expect(manager.get(run.id)?.handle).toBeUndefined();
-		await manager.shutdownSession();
-	});
-
-	it("keeps extension-owned messages in the spawning parent while completion delivery remains event-only", async () => {
-		const { manager } = await fixture();
-		const messages = new MessageService({
-			getRun: (id) => manager.get(id),
-			sendToChild: (id, message) => manager.sendInbox(id, message),
-		});
-		manager.setMessageService(messages);
-		const owned = await manager.spawn({
-			type: "general-purpose",
-			prompt: "extension-owned task",
-			owner: { kind: "extension", id: "pi-tasks", ref: "task-1" },
-			run_in_background: true,
-		});
-		const foreign = await manager.spawn({
-			type: "general-purpose",
-			prompt: "another parent",
-			owner: { kind: "conversation", sessionId: "foreign-session" },
-			run_in_background: true,
-		});
-		await messages.sendFromAgent(owned.id, { kind: "parent" }, "EXPLICIT_INBOX_NOT_COMPLETION");
-		expect(manager.get(owned.id)?.delivery).toBe("event");
-		expect(
-			messages.listInbox({ kind: "parent", sessionId: "parent-session" }).map((message) => ({
-				text: message.text,
-				from: message.from,
-			})),
-		).toEqual([{ text: "EXPLICIT_INBOX_NOT_COMPLETION", from: { kind: "agent", agentId: owned.id } }]);
-		expect(messages.listInbox({ kind: "parent", sessionId: "foreign-session" })).toEqual([]);
-		await expect(
-			messages.sendFromAgent(owned.id, { kind: "agent", agentId: foreign.id }, "CROSS_SCOPE"),
-		).rejects.toBeInstanceOf(Error);
-		expect(messages.listInbox({ kind: "agent", agentId: foreign.id })).toEqual([]);
 		await manager.shutdownSession();
 	});
 });

@@ -8,12 +8,11 @@ import type { AgentExecutionBackend } from "../domain/backend.js";
 import type { SubagentsSettings } from "../domain/config.js";
 import { isConversationOwner } from "../domain/delivery.js";
 import type { AgentLifecycleEvent } from "../domain/integration-protocol.js";
-import type { InboxMessage } from "../domain/message.js";
 import type { AgentManagerOptions } from "./agent-manager.js";
 import { AgentManager } from "./agent-manager.js";
 import { AgentRegistry, type RawAgentLoader } from "./agent-registry.js";
 import { type DeliveryHost, DeliveryService } from "./delivery-service.js";
-import { MessageService } from "./message-service.js";
+import { MailboxService } from "./mailbox-service.js";
 import { partitionOwnedEntries, restoreRegisteredRuns } from "./restore.js";
 import type {
 	IncompatibleRegistryEntry,
@@ -55,7 +54,6 @@ export interface PiSubagentsAppOptions {
 	 * subscribers (pi.events) so extension consumers keep working.
 	 */
 	deliveryHost?: DeliveryHost;
-	sendToParent?(message: InboxMessage): Promise<boolean>;
 	/** Managed worktree service. Checkouts remain until explicit release. */
 	worktreeService?: WorktreeService;
 	/**
@@ -79,11 +77,12 @@ export interface PiSubagentsApp {
 	updateSettings(settings: SubagentsSettings): void;
 	readonly registry: AgentRegistry;
 	readonly manager: AgentManager;
-	readonly messages: MessageService;
 	/** Owner-aware conversation delivery; present only with a deliveryHost. */
 	readonly delivery?: DeliveryService;
 	/** Session's team service (roster); present only with a team store factory. */
 	readonly teams: TeamService | undefined;
+	/** Current session mailbox service, when a team is active. */
+	readonly mailbox: MailboxService | undefined;
 	/** Summary of the last session_start restore pass, when one ran. */
 	lastRestoreSummary?: Awaited<ReturnType<typeof restoreRegisteredRuns>>;
 	/**
@@ -112,17 +111,12 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 	if (options.runStore !== undefined) managerOptions.registryStore = options.runStore;
 	Object.assign(managerOptions, options.managerOverrides ?? {});
 	const manager = new AgentManager(managerOptions);
-	const messages = new MessageService({
-		getRun: (agentId) => manager.get(agentId),
-		sendToChild: (agentId, message) => manager.sendInbox(agentId, message),
-		...(options.sendToParent ? { sendToParent: options.sendToParent } : {}),
-	});
-	manager.setMessageService(messages);
 
 	// One team per session (ADR 0007 §2): the roster records every admitted
 	// assignment under a teammate name. Rebuilt at each session_start from the
 	// live session id; when no store factory is provided no roster is kept.
 	let teams: TeamService | undefined;
+	let mailbox: MailboxService | undefined;
 	manager.subscribe((event) => {
 		if (event.event !== "started" || event.teammateName === undefined) return;
 		teams?.recordAssignment({ name: event.teammateName, type: event.type, runId: event.agentId });
@@ -135,10 +129,12 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 	return {
 		registry,
 		manager,
-		messages,
 		...(delivery !== undefined ? { delivery } : {}),
 		get teams() {
 			return teams;
+		},
+		get mailbox() {
+			return mailbox;
 		},
 
 		updateSettings(settings) {
@@ -153,13 +149,18 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 			manager.beginSession();
 			await registry.load();
 			manager.updateSettings(options.settings);
-			options.worktreeService?.updateSettings(options.settings);
 			if (options.createTeamStore !== undefined) {
 				teams = new TeamService({
 					sessionId: options.getSessionId?.() ?? "unknown-session",
 					store: options.createTeamStore(options.getSessionId?.() ?? "unknown-session"),
 				});
-				teams.sessionStart();
+				const roster = teams.sessionStart();
+				manager.setTeamService(teams);
+				mailbox = new MailboxService({ teamDir: teams.teamDir, teamKey: roster.teamKey, self: "lead" });
+			} else {
+				teams = undefined;
+				mailbox = undefined;
+				manager.setTeamService(undefined);
 			}
 
 			const store = options.runStore;

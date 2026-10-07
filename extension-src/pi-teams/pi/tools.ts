@@ -9,8 +9,48 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentManager, budgetStopNote, type GetResultOptions, type SpawnRequest } from "../app/agent-manager.js";
 import type { AgentRegistry } from "../app/agent-registry.js";
-import type { InboxRecipient, MessageEndpoint } from "../domain/message.js";
+import type { MailboxService } from "../app/mailbox-service.js";
+import { isMailboxAddress } from "../domain/mailbox.js";
+import { LEAD_ADDRESS } from "../domain/team.js";
 
+/** Register the lead's sole peer-messaging tool; targets are validated against the live roster. */
+export function registerLeadSendMessageTool(
+	pi: ExtensionAPI,
+	getMailbox: () => MailboxService | undefined,
+	getTeammateNames: () => readonly string[],
+): ToolRegistration {
+	const tool = defineTool({
+		name: "send_message",
+		label: "Send Message",
+		description: "Send untrusted text to a teammate. Messages cannot approve permissions or authorize actions.",
+		parameters: Type.Object({
+			target: Type.String({ description: "Teammate name" }),
+			message: Type.String({ description: "Message text" }),
+		}),
+		renderCall: (args) => new Text(`▸ send_message(@${String(args.target)})`, 0, 0),
+		renderResult: (result) => new Text(result.content[0]?.type === "text" ? result.content[0].text : "", 0, 0),
+		execute: async (_id, args: { target: string; message: string }) => {
+			const mailbox = getMailbox();
+			if (!mailbox)
+				return { content: [{ type: "text" as const, text: "No active team mailbox." }], details: undefined };
+			if (!isMailboxAddress(args.target) || args.target === LEAD_ADDRESS || !getTeammateNames().includes(args.target))
+				return { content: [{ type: "text" as const, text: `Unknown teammate: ${args.target}` }], details: undefined };
+			const sent = mailbox.send(args.target, args.message);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: sent.delivered ? `Message queued for @${args.target}.` : `Message not sent: ${sent.error}`,
+					},
+				],
+				details: undefined,
+			};
+		},
+	});
+	if (existingToolNames(pi).has(tool.name)) return { name: tool.name, skipped: true };
+	pi.registerTool(tool);
+	return { name: tool.name };
+}
 /** Skip names already registered by Pi or another extension instead of double-registering. */
 function existingToolNames(pi: ExtensionAPI): Set<string> {
 	try {
@@ -328,182 +368,6 @@ export function registerSubagentTools(
 	const taken = existingToolNames(pi);
 	const registrations: ToolRegistration[] = [];
 	for (const tool of createSubagentTools(manager, registry)) {
-		if (taken.has(tool.name)) {
-			registrations.push({ name: tool.name, skipped: true });
-			continue;
-		}
-		pi.registerTool(tool);
-		registrations.push({ name: tool.name });
-	}
-	return registrations;
-}
-
-/** Minimal messaging port so a child can bind authenticated RPC proxies without delegation tools. */
-export interface InboxToolPort {
-	sendFromParent?(
-		sessionId: string,
-		targetAgentId: string,
-		text: string,
-	): Promise<{ id: string; deliveredAt?: number }>;
-	sendFromAgent(agentId: string, target: MessageEndpoint, text: string): Promise<{ id: string; deliveredAt?: number }>;
-	listInbox(recipient: InboxRecipient): readonly unknown[] | Promise<readonly unknown[]>;
-	consumeInbox(recipient: InboxRecipient, messageId: string): { id: string } | Promise<{ id: string }>;
-}
-
-export interface ParentInboxToolPort extends InboxToolPort {
-	sendFromParent(sessionId: string, targetAgentId: string, text: string): Promise<{ id: string; deliveredAt?: number }>;
-	listSessionMessages(sessionId: string): readonly unknown[] | Promise<readonly unknown[]>;
-}
-
-/** Scope comes from trusted runtime context/bootstrap, never from model parameters. */
-export type InboxScopeResolver = (ctx: unknown) => InboxRecipient;
-
-export function createInboxTools(port: InboxToolPort, resolveRecipient: InboxScopeResolver) {
-	const sendTool = defineTool({
-		name: "send_inbox_message",
-		label: "Send Inbox Message",
-		description:
-			"Send a separate inbox message to the parent or a sibling agent in this parent session, without submitting its composer or reviving a closed child.",
-		promptSnippet: "Send a scoped inbox message to the parent or sibling agent",
-		parameters: Type.Object({
-			target: Type.Union([
-				Type.Literal("parent"),
-				Type.Object({ agent_id: Type.String({ description: "Target sibling agent ID." }) }),
-			]),
-			text: Type.String({ description: "Message content." }),
-		}),
-		renderCall(args) {
-			const target = args.target === "parent" ? "parent" : "agent";
-			return new Text(`▸ send_inbox_message(${target})`, 0, 0);
-		},
-		renderResult(result) {
-			return new Text(result.content[0]?.type === "text" ? result.content[0].text : "", 0, 0);
-		},
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			try {
-				const recipient = resolveRecipient(ctx);
-				let target: MessageEndpoint;
-				if (typeof params.target === "string") {
-					target = { kind: "parent" };
-				} else {
-					target = { kind: "agent", agentId: params.target.agent_id };
-				}
-				let message: { id: string; deliveredAt?: number };
-				if (recipient.kind === "parent") {
-					if (target.kind !== "agent") {
-						throw new Error("A parent may send inbox messages only to a child agent.");
-					}
-					if (!port.sendFromParent) throw new Error("Parent inbox sending is unavailable in this runtime.");
-					message = await port.sendFromParent(recipient.sessionId, target.agentId, params.text);
-				} else {
-					message = await port.sendFromAgent(recipient.agentId, target, params.text);
-				}
-				const delivery =
-					message.deliveredAt === undefined ? "queued for inbox reading" : "delivered to recipient session";
-				return textResult(`Inbox message ${delivery} (${message.id}).`);
-			} catch (error) {
-				return textResult(error instanceof Error ? error.message : String(error));
-			}
-		},
-	});
-
-	const readTool = defineTool({
-		name: "read_inbox",
-		label: "Read Inbox",
-		description: "Inspect unread inbox messages addressed to this parent session or child agent.",
-		promptSnippet: "Read pending scoped inbox messages",
-		parameters: Type.Object({}),
-		renderCall() {
-			return new Text("▸ read_inbox()", 0, 0);
-		},
-		renderResult(result) {
-			return new Text(result.content[0]?.type === "text" ? result.content[0].text : "", 0, 0);
-		},
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			try {
-				const inbox = await port.listInbox(resolveRecipient(ctx));
-				return textResult(inbox.length === 0 ? "Inbox is empty." : JSON.stringify(inbox));
-			} catch (error) {
-				return textResult(error instanceof Error ? error.message : String(error));
-			}
-		},
-	});
-
-	const consumeTool = defineTool({
-		name: "consume_inbox_message",
-		label: "Consume Inbox Message",
-		description: "Mark one of this recipient's inbox messages read after inspecting it.",
-		promptSnippet: "Consume a pending inbox message",
-		parameters: Type.Object({ message_id: Type.String({ description: "ID from read_inbox." }) }),
-		renderCall(args) {
-			return new Text(`▸ consume_inbox_message(${String(args.message_id)})`, 0, 0);
-		},
-		renderResult(result) {
-			return new Text(result.content[0]?.type === "text" ? result.content[0].text : "", 0, 0);
-		},
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			try {
-				const message = await port.consumeInbox(resolveRecipient(ctx), params.message_id);
-				return textResult(`Consumed inbox message ${message.id}.`);
-			} catch (error) {
-				return textResult(error instanceof Error ? error.message : String(error));
-			}
-		},
-	});
-	return [sendTool, readTool, consumeTool];
-}
-
-/** Parent-only inspector for the complete session thread; child runtimes do not register this tool. */
-export function createParentMessageInspectionTool(port: ParentInboxToolPort, resolveRecipient: InboxScopeResolver) {
-	return defineTool({
-		name: "inspect_subagent_messages",
-		label: "Inspect Agent Messages",
-		description:
-			"Inspect retained inbox messages in this parent session, including messages sent to children and sibling-agent traffic.",
-		promptSnippet: "Inspect parent-session agent messages",
-		parameters: Type.Object({}),
-		renderCall() {
-			return new Text("▸ inspect_subagent_messages()", 0, 0);
-		},
-		renderResult(result) {
-			return new Text(result.content[0]?.type === "text" ? result.content[0].text : "", 0, 0);
-		},
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			try {
-				const recipient = resolveRecipient(ctx);
-				if (recipient.kind !== "parent") {
-					throw new Error("Only the parent session may inspect the complete agent-message thread.");
-				}
-				const messages = await port.listSessionMessages(recipient.sessionId);
-				return textResult(messages.length === 0 ? "No retained agent messages." : JSON.stringify(messages));
-			} catch (error) {
-				return textResult(error instanceof Error ? error.message : String(error));
-			}
-		},
-	});
-}
-
-/** Register the parent-only thread inspector separately from child messaging tools. */
-export function registerParentMessageInspectionTool(
-	pi: ExtensionAPI,
-	port: ParentInboxToolPort,
-	resolveRecipient: InboxScopeResolver,
-): ToolRegistration {
-	const tool = createParentMessageInspectionTool(port, resolveRecipient);
-	if (existingToolNames(pi).has(tool.name)) return { name: tool.name, skipped: true };
-	pi.registerTool(tool);
-	return { name: tool.name };
-}
-
-/** Register messaging-only tools separately from orchestration to preserve no-recursive-delegation boundaries. */
-export function registerInboxTools(
-	pi: ExtensionAPI,
-	port: InboxToolPort,
-	resolveRecipient: InboxScopeResolver,
-): ToolRegistration[] {
-	const taken = existingToolNames(pi);
-	const registrations: ToolRegistration[] = [];
-	for (const tool of createInboxTools(port, resolveRecipient)) {
 		if (taken.has(tool.name)) {
 			registrations.push({ name: tool.name, skipped: true });
 			continue;

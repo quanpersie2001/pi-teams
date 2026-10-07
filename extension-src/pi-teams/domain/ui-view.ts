@@ -27,15 +27,15 @@ export interface AgentRowCapabilities {
 	/** The persisted session can be reopened with a new prompt. */
 	resumable: boolean;
 }
-/**
- * Process-resource truth for display. A terminal run retaining its handle has
- * an unconfirmed cleanup receipt; it is not steerable, but must not be shown
- * as successfully closed.
- */
-export type AgentResourceState = "pending" | "open" | "closed" | "cleanup-unconfirmed";
+/** Named teammates retain idle native processes; anonymous terminal handles await cleanup. */
+export type AgentResourceState = "pending" | "open" | "idle" | "closed" | "cleanup-unconfirmed";
 
-export function deriveResourceState(status: AgentRunStatus, hasHandle: boolean): AgentResourceState {
-	if (isTerminalStatus(status)) return hasHandle ? "cleanup-unconfirmed" : "closed";
+export function deriveResourceState(
+	status: AgentRunStatus,
+	hasHandle: boolean,
+	isNamedTeammate: boolean,
+): AgentResourceState {
+	if (isTerminalStatus(status)) return hasHandle ? (isNamedTeammate ? "idle" : "cleanup-unconfirmed") : "closed";
 	return hasHandle ? "open" : "pending";
 }
 

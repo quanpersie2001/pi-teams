@@ -65,7 +65,9 @@ function renderRunRow(
 				? "Pi process closed"
 				: row.resourceState === "cleanup-unconfirmed"
 					? "Pi process close unconfirmed"
-					: "Pi process";
+					: row.resourceState === "idle"
+						? "Pi process idle"
+						: "Pi process";
 		tags.push(fg("dim", processLabel));
 	}
 	const tagText = tags.length > 0 ? ` ${tags.join(" ")}` : "";

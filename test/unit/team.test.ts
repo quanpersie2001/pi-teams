@@ -10,9 +10,8 @@ import {
 } from "../../extension-src/pi-teams/domain/team.js";
 
 function roster(): TeamRoster {
-	return { version: 1, teamId: "sess-a", sessionId: "sess-a", createdAt: 1, members: [] };
+	return { version: 1, teamId: "sess-a", sessionId: "sess-a", createdAt: 1, teamKey: "k", members: [] };
 }
-
 describe("teammate names", () => {
 	it("accepts plain names and rejects reserved or malformed ones", () => {
 		expect(teammateNameProblem("scout")).toBeUndefined();

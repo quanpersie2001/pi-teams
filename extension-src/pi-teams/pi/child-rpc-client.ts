@@ -13,7 +13,6 @@ import {
 	isChildEvent,
 	isRecord,
 } from "../domain/child-protocol.js";
-import type { ChildMessageReply, ChildMessageRequest, InboxMessage } from "../domain/message.js";
 
 export interface ChildRpcClientOptions {
 	socketPath: string;
@@ -32,15 +31,6 @@ interface PromptRequest {
 	promise: Promise<void>;
 }
 
-function validInboxMessage(value: unknown): value is InboxMessage {
-	if (!isRecord(value) || typeof value.id !== "string" || typeof value.ownerSessionId !== "string") return false;
-	if (typeof value.text !== "string" || typeof value.createdAt !== "number" || !Number.isFinite(value.createdAt))
-		return false;
-	const endpoint = (candidate: unknown): boolean =>
-		isRecord(candidate) &&
-		(candidate.kind === "parent" || (candidate.kind === "agent" && typeof candidate.agentId === "string"));
-	return endpoint(value.from) && endpoint(value.to);
-}
 export class ChildRpcClient {
 	private readonly socketPath: string;
 	private readonly childId: string;
@@ -90,12 +80,12 @@ export class ChildRpcClient {
 		return state;
 	}
 
-	prompt(runId: string, prompt: string): Promise<void> {
+	prompt(runId: string, prompt: string, limits?: { maxTurns?: number; graceTurns?: number }): Promise<void> {
 		if (!runId || runId.length > 121)
 			return Promise.reject(new ChildProtocolError("invalid_request", "runId must contain at most 121 characters"));
 		const requestId = `prompt:${runId}`;
 		const requestFingerprint = createHash("sha256")
-			.update(JSON.stringify([runId, prompt]))
+			.update(JSON.stringify([runId, prompt, limits]))
 			.digest("hex");
 		const existing = this.promptRequests.get(requestId);
 		if (existing) {
@@ -105,7 +95,7 @@ export class ChildRpcClient {
 				);
 			return existing.promise;
 		}
-		const promise = this.call("prompt", { runId, prompt }, requestId).then(() => undefined);
+		const promise = this.call("prompt", { runId, prompt, ...limits }, requestId).then(() => undefined);
 		const entry: PromptRequest = { fingerprint: requestFingerprint, promise };
 		this.promptRequests.set(requestId, entry);
 		while (this.promptRequests.size > 256) {
@@ -127,6 +117,10 @@ export class ChildRpcClient {
 		return promise;
 	}
 
+	admitAssignment(runId: string): Promise<void> {
+		return this.call("admit_assignment", { runId }, `admit:${runId}`).then(() => undefined);
+	}
+
 	async steer(runId: string, message: string): Promise<void> {
 		await this.call("steer", { runId, message });
 	}
@@ -138,33 +132,6 @@ export class ChildRpcClient {
 	async control(command: ChildControlCommand): Promise<ChildState> {
 		const state = await this.call("control", { command });
 		return assertChildState(state, this.childId);
-	}
-
-	async sendInbox(message: InboxMessage): Promise<void> {
-		await this.call("send_inbox", { message });
-	}
-	async messageRequest(request: ChildMessageRequest): Promise<ChildMessageReply> {
-		const result = await this.call("send_message", { request });
-		if (!isRecord(result)) throw new ChildProtocolError("invalid_reply", "Child messaging returned an invalid receipt");
-		if (result.action === "sent" || result.action === "consumed") {
-			if (!validInboxMessage(result.message))
-				throw new ChildProtocolError("invalid_reply", "Child messaging returned an invalid inbox message");
-		} else if (
-			result.action !== "listed" ||
-			!Array.isArray(result.messages) ||
-			!result.messages.every(validInboxMessage)
-		) {
-			throw new ChildProtocolError("invalid_reply", "Child messaging returned an invalid inbox listing");
-		}
-		return result as unknown as ChildMessageReply;
-	}
-
-	async replyMessageRequest(requestId: string, reply: ChildMessageReply): Promise<void> {
-		await this.call("message_reply", { requestId, reply });
-	}
-
-	async rejectMessageRequest(requestId: string, message: string): Promise<void> {
-		await this.call("message_reply", { requestId, error: message });
 	}
 
 	async shutdown(): Promise<void> {

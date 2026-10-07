@@ -23,6 +23,8 @@ function isTeamRoster(value: unknown): value is TeamRoster {
 		typeof roster.teamId === "string" &&
 		typeof roster.sessionId === "string" &&
 		typeof roster.createdAt === "number" &&
+		typeof roster.teamKey === "string" &&
+		roster.teamKey.length > 0 &&
 		Array.isArray(roster.members)
 	);
 }

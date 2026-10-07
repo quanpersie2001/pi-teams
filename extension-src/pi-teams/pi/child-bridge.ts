@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, readFile, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { MailboxService } from "../app/mailbox-service.js";
 import { decideTurnEvent, SOFT_STEER_MESSAGE } from "../app/turn-policy.js";
 import { EMPTY_USAGE, type UsageSummary } from "../domain/agent-run.js";
 import {
@@ -26,8 +27,8 @@ import {
 	parseChildRequest,
 	requireString,
 } from "../domain/child-protocol.js";
-import type { ChildMessageReply, ChildMessageRequest, InboxMessage, MessageEndpoint } from "../domain/message.js";
 import type { TranscriptItem } from "../domain/transcript.js";
+import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
 
 const MAX_TRANSCRIPT_ITEMS = 256;
 const MAX_PARTIAL_ITEMS = 16;
@@ -58,7 +59,6 @@ export interface ChildBridgeHost {
 	getTranscript(): readonly TranscriptItem[];
 	getFocus(): NonNullable<ChildState["focus"]>;
 	controlFocus(command: ChildControlCommand): Promise<void>;
-	sendInbox(message: InboxMessage): Promise<void>;
 	prompt(prompt: string): Promise<void>;
 	steer(message: string): Promise<void>;
 	abort(): Promise<void>;
@@ -100,6 +100,7 @@ export function normalizeChildNativeEvent(value: unknown): ChildBridgeNativeEven
 
 export interface ChildBridgeHandle {
 	state(): ChildState;
+	startMailboxRun(text: string): Promise<void>;
 	publishNativeEvent(event: ChildBridgeNativeEvent): void;
 	failActiveRun(error: unknown): void;
 	close(): Promise<void>;
@@ -189,6 +190,15 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 	};
 	const maxTurns = readCount("maxTurns");
 	const graceTurns = readCount("graceTurns");
+	const teamDir = parseOptionalString(value, "teamDir", 4_096);
+	const teamKey = parseOptionalString(value, "teamKey", 512);
+	const teammateName = parseOptionalString(value, "teammateName", 64);
+	if ((teamDir === undefined) !== (teamKey === undefined) || (teamDir === undefined) !== (teammateName === undefined)) {
+		throw new ChildProtocolError("invalid_bootstrap", "teamDir, teamKey, and teammateName must be provided together");
+	}
+	if (teamDir !== undefined && teamKey !== undefined && (!isAbsolute(teamDir) || !/^[a-f0-9]{64}$/i.test(teamKey))) {
+		throw new ChildProtocolError("invalid_bootstrap", "team context has an invalid directory or HMAC key");
+	}
 	return {
 		childId,
 		token,
@@ -205,6 +215,9 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 		...(tools !== undefined ? { tools } : {}),
 		...(maxTurns !== undefined ? { maxTurns } : {}),
 		...(graceTurns !== undefined ? { graceTurns } : {}),
+		...(teamDir !== undefined && teamKey !== undefined && teammateName !== undefined
+			? { teamDir, teamKey, teammateName }
+			: {}),
 	};
 }
 
@@ -464,6 +477,8 @@ interface ActiveRun {
 	runId: string;
 	abortRequested: boolean;
 	steered: boolean;
+	maxTurns?: number;
+	graceTurns?: number;
 }
 
 class ChildRuntime {
@@ -481,10 +496,8 @@ class ChildRuntime {
 	private messageStreamOrdinal = 0;
 	private messageRevision = 0;
 	private currentMessageId: string | undefined;
-	private readonly pendingMessages = new Map<
-		string,
-		{ resolve(reply: ChildMessageReply): void; reject(error: Error): void; timer: NodeJS.Timeout }
-	>();
+	private pendingMailbox: { runId: string; prompt: string; resolve(): void; reject(error: unknown): void } | undefined;
+	private firstRunId: string | undefined;
 	private shuttingDown = false;
 	private shutdownStarted = false;
 	/** Set once control loss is confirmed; annotates the preserved result. */
@@ -644,8 +657,8 @@ class ChildRuntime {
 				return;
 			const decision = decideTurnEvent({
 				turns: this.turns,
-				maxTurnLimit: this.bootstrap.maxTurns,
-				graceTurns: this.bootstrap.graceTurns,
+				maxTurnLimit: this.activeRun.maxTurns,
+				graceTurns: this.activeRun.graceTurns,
 				steered: this.activeRun.steered,
 			});
 			if (decision.action === "softSteer") {
@@ -729,31 +742,7 @@ class ChildRuntime {
 		if (method === "steer") return this.steer(params);
 		if (method === "abort") return this.abort(params);
 		if (method === "control") return this.control(params);
-		if (method === "send_inbox") {
-			if (!isRecord(params.message)) throw new ChildProtocolError("invalid_request", "Inbox message is required");
-			await this.host.sendInbox(params.message as unknown as InboxMessage);
-			return { accepted: true };
-		}
-		if (method === "send_message") {
-			if (!isRecord(params.request))
-				throw new ChildProtocolError("invalid_request", "Child message request is required");
-			return this.requestMessage(params.request);
-		}
-		if (method === "message_reply") {
-			const requestId = requireString(params.requestId, "requestId");
-			const pending = this.pendingMessages.get(requestId);
-			if (!pending) throw new ChildProtocolError("stale_message_request", "Message request is no longer pending");
-			this.pendingMessages.delete(requestId);
-			clearTimeout(pending.timer);
-			if (typeof params.error === "string") {
-				pending.reject(new ChildProtocolError("message_rejected", params.error));
-			} else if (isRecord(params.reply) && ["sent", "listed", "consumed"].includes(String(params.reply.action))) {
-				pending.resolve(params.reply as unknown as ChildMessageReply);
-			} else {
-				pending.reject(new ChildProtocolError("invalid_reply", "Parent returned an invalid message receipt"));
-			}
-			return { accepted: true };
-		}
+		if (method === "admit_assignment") return this.admitMailboxRun(requireString(params.runId, "runId"));
 		if (method === "shutdown") {
 			this.shuttingDown = true;
 			return {
@@ -796,37 +785,38 @@ class ChildRuntime {
 		this.emit("focus", this.activeRun?.runId, { focus: this.host.getFocus() });
 		return this.state();
 	}
-	private requestMessage(value: Record<string, unknown>): Promise<ChildMessageReply> {
-		let request: ChildMessageRequest;
-		if (value.action === "list") request = { action: "list" };
-		else if (value.action === "consume")
-			request = { action: "consume", messageId: requireString(value.messageId, "messageId") };
-		else if (value.action === "send") {
-			if (typeof value.text !== "string" || value.text.length === 0 || value.text.length > 32_768)
-				throw new ChildProtocolError("invalid_request", "Message text must contain 1 to 32768 characters");
-			if (!isRecord(value.target)) throw new ChildProtocolError("invalid_request", "Message target is invalid");
-			let target: MessageEndpoint;
-			if (value.target.kind === "parent") target = { kind: "parent" };
-			else if (value.target.kind === "agent")
-				target = { kind: "agent", agentId: requireString(value.target.agentId, "target.agentId") };
-			else throw new ChildProtocolError("invalid_request", "Message target is invalid");
-			request = { action: "send", target, text: value.text };
-		} else throw new ChildProtocolError("invalid_request", "Unsupported child message action");
-		if (this.pendingMessages.size >= 32)
-			throw new ChildProtocolError("too_many_requests", "Child message request capacity is full");
-		const requestId = randomUUID();
-		return new Promise<ChildMessageReply>((resolve, reject) => {
-			const timer = setTimeout(() => {
-				this.pendingMessages.delete(requestId);
-				reject(new ChildProtocolError("request_timeout", "Parent did not acknowledge the inbox request"));
-			}, 60_000);
-			timer.unref();
-			this.pendingMessages.set(requestId, { resolve, reject, timer });
-			this.emit("message_request", this.activeRun?.runId, { requestId, request });
-		});
+
+	async startMailboxRun(text: string): Promise<void> {
+		if (this.shuttingDown) throw new ChildProtocolError("shutting_down", "Child is shutting down");
+		if (this.activeRun) throw new ChildProtocolError("busy", "Child is already running");
+		if (text.length === 0 || text.length > 262_144)
+			throw new ChildProtocolError("invalid_request", "Mailbox prompt exceeds the supported length");
+		if (this.pendingMailbox) throw new ChildProtocolError("busy", "A mailbox assignment is awaiting capacity");
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const runId = randomUUID();
+		this.pendingMailbox = { runId, prompt: text, resolve, reject };
+		// Only assignment metadata crosses the control socket. Peer content stays
+		// in the child's mailbox; the lead grants the existing active-run capacity.
+		this.emit("mailbox_assignment", runId, { runId });
+		return promise;
 	}
 
-	private async startRun(params: Record<string, unknown>): Promise<unknown> {
+	private async admitMailboxRun(runId: string): Promise<unknown> {
+		const pending = this.pendingMailbox;
+		if (!pending || pending.runId !== runId)
+			throw new ChildProtocolError("stale_run", "Mailbox assignment is no longer pending");
+		this.pendingMailbox = undefined;
+		try {
+			const result = await this.startRun({ runId, prompt: pending.prompt }, "mailbox");
+			pending.resolve();
+			return result;
+		} catch (error) {
+			pending.reject(error);
+			throw error;
+		}
+	}
+
+	private async startRun(params: Record<string, unknown>, origin?: "mailbox"): Promise<unknown> {
 		const runId = requireString(params.runId, "runId");
 		if (runId.length > 121) throw new ChildProtocolError("invalid_request", "runId exceeds the supported length");
 		const prompt = requireString(params.prompt, "prompt", 262_144);
@@ -835,12 +825,25 @@ class ChildRuntime {
 			throw new ChildProtocolError("duplicate_run", "This runId has already been used by the child");
 		this.recentRunIds.add(runId);
 		if (this.recentRunIds.size > 1_024) this.recentRunIds.delete(this.recentRunIds.values().next().value as string);
-		this.activeRun = { runId, abortRequested: false, steered: false };
+		const maxTurns = params.maxTurns === undefined ? this.bootstrap.maxTurns : params.maxTurns;
+		const graceTurns = params.graceTurns === undefined ? this.bootstrap.graceTurns : params.graceTurns;
+		for (const limit of [maxTurns, graceTurns]) {
+			if (limit !== undefined && (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 0))
+				throw new ChildProtocolError("invalid_request", "Turn limits must be non-negative safe integers");
+		}
+		this.activeRun = {
+			runId,
+			abortRequested: false,
+			steered: false,
+			...(typeof maxTurns === "number" ? { maxTurns } : {}),
+			...(typeof graceTurns === "number" ? { graceTurns } : {}),
+		};
+		this.firstRunId ??= runId;
 		this.latestAssistant = undefined;
 		this.usage = { ...EMPTY_USAGE };
 		this.turns = 0;
 		this.toolUses = 0;
-		this.emit("run_started", runId, { runId });
+		this.emit("run_started", runId, { runId, ...(origin ? { origin } : {}) });
 		try {
 			await this.host.prompt(prompt);
 		} catch (error) {
@@ -931,7 +934,6 @@ class ChildRuntime {
 	 * parent's context economy; the file is the authoritative full copy the
 	 * parent re-reads at will. Write failure never blocks settlement — the
 	 * outcome degrades to the inline copy without a resultFile pointer.
-	 * Last settled run wins when a child settles multiple runs.
 	 */
 	private persistFullResult(text: string): string | undefined {
 		// Control loss annotates whatever partial answer exists so the stopped
@@ -942,9 +944,14 @@ class ChildRuntime {
 				: CONTROL_LOSS_ANNOTATION
 			: text;
 		if (body.length === 0) return undefined;
-		const file = join(this.bootstrap.sessionDir, "result.md");
+		const runId = this.activeRun?.runId;
+		const resultDir =
+			runId && runId !== this.firstRunId
+				? join(this.bootstrap.sessionDir, "runs", createHash("sha256").update(runId).digest("hex"))
+				: this.bootstrap.sessionDir;
+		const file = join(resultDir, "result.md");
 		try {
-			mkdirSync(this.bootstrap.sessionDir, { recursive: true, mode: 0o700 });
+			mkdirSync(resultDir, { recursive: true, mode: 0o700 });
 			writeFileSync(file, body, { mode: 0o600 });
 			return file;
 		} catch {
@@ -1093,6 +1100,7 @@ export async function startChildBridge(bootstrap: ChildBootstrap, host: ChildBri
 	const server = await openChildSocket(childBootstrap, runtime);
 	return {
 		state: () => runtime.state(),
+		startMailboxRun: (text) => runtime.startMailboxRun(text),
 		publishNativeEvent: (event) => runtime.publishNativeEvent(event),
 		failActiveRun: (error) => runtime.failActiveRun(error),
 		close: () => closeChildSocket(server),
@@ -1399,13 +1407,26 @@ async function closeChildSocket(handle: ChildSocketHandle): Promise<void> {
 	}
 }
 
-export function installChildBridgeExtension(pi: ExtensionAPI): void {
+export async function installChildBridgeExtension(pi: ExtensionAPI): Promise<void> {
 	if (process.env[CHILD_ENV] !== "1")
 		throw new ChildProtocolError("not_child", "The child bridge extension can only run in a PI_TEAMS_CHILD process");
 	let bridge: ChildBridgeHandle | undefined;
+	let mailbox: ChildMailboxHandle | undefined;
 	let started = false;
 	let bootstrapPromise: Promise<ChildBootstrap> | undefined;
 	const getBootstrap = () => (bootstrapPromise ??= loadChildBootstrap());
+	const initialBootstrap = await getBootstrap();
+	if (initialBootstrap.teamDir && initialBootstrap.teamKey && initialBootstrap.teammateName) {
+		pi.registerTool(
+			createChildMailboxTool(
+				new MailboxService({
+					teamDir: initialBootstrap.teamDir,
+					teamKey: initialBootstrap.teamKey,
+					self: initialBootstrap.teammateName,
+				}),
+			),
+		);
+	}
 	pi.on("before_agent_start", async (event) => {
 		const bootstrap = await getBootstrap();
 		const additions = [bootstrap.systemPrompt, bootstrap.instructions]
@@ -1418,7 +1439,19 @@ export function installChildBridgeExtension(pi: ExtensionAPI): void {
 		if (started) return;
 		started = true;
 		const bootstrap = await getBootstrap();
-		bridge = await startChildBridge(bootstrap, createInteractiveHost(pi, context));
+		const host = createInteractiveHost(pi, context);
+		bridge = await startChildBridge(bootstrap, host);
+		if (bootstrap.teamDir && bootstrap.teamKey && bootstrap.teammateName) {
+			const activeBridge = bridge;
+			mailbox = watchChildMailbox({
+				teamDir: bootstrap.teamDir,
+				teamKey: bootstrap.teamKey,
+				self: bootstrap.teammateName,
+				isRunning: () => activeBridge.state().execution === "running",
+				prompt: (text) => activeBridge.startMailboxRun(text),
+				steer: (text) => host.steer(text),
+			});
+		}
 	});
 	const publishNativeEvent = (value: unknown) => {
 		const event = normalizeChildNativeEvent(value);
@@ -1432,6 +1465,8 @@ export function installChildBridgeExtension(pi: ExtensionAPI): void {
 	pi.on("tool_execution_update", (event) => publishNativeEvent(event));
 	pi.on("tool_execution_end", (event) => publishNativeEvent(event));
 	pi.on("session_shutdown", async () => {
+		mailbox?.close();
+		mailbox = undefined;
 		await bridge?.close();
 		bridge = undefined;
 	});
@@ -1535,12 +1570,6 @@ function createInteractiveHost(pi: ExtensionAPI, context: ExtensionContext): Chi
 			}
 			throw new ChildProtocolError("unsupported_command", "Manual compaction is unavailable in the process backend");
 		},
-		sendInbox: async (message) => {
-			pi.sendMessage(
-				{ customType: "pi-teams-inbox", content: JSON.stringify(message), display: true },
-				{ triggerTurn: false },
-			);
-		},
 		prompt: async (prompt) => {
 			// Dispatch is void; native preflight failures otherwise emit no settlement event.
 			// Validate with the native registry before acknowledging admission.
@@ -1572,6 +1601,6 @@ function createInteractiveHost(pi: ExtensionAPI, context: ExtensionContext): Chi
 	};
 }
 
-export default function childBridgeExtension(pi: ExtensionAPI): void {
-	installChildBridgeExtension(pi);
+export default async function childBridgeExtension(pi: ExtensionAPI): Promise<void> {
+	await installChildBridgeExtension(pi);
 }

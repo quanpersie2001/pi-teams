@@ -5,6 +5,7 @@
 // receipt: a corrupt roster warns and re-creates (mailboxes/boards/history on
 // disk are untouched), unlike registry rows which are never rewritten.
 
+import { randomBytes } from "node:crypto";
 import { deriveTeamId, type TeamRoster, upsertMember } from "../domain/team.js";
 
 /** Durable roster adapter; implementations write atomically with owner-only permissions. */
@@ -63,6 +64,7 @@ export class TeamService {
 			teamId,
 			sessionId: this.sessionId,
 			createdAt: this.now(),
+			teamKey: randomBytes(32).toString("hex"),
 			members: [],
 		};
 		this.persist();

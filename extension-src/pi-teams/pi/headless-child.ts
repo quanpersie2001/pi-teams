@@ -11,8 +11,8 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { MailboxService } from "../app/mailbox-service.js";
 import { type ChildBootstrap, ChildProtocolError } from "../domain/child-protocol.js";
-import type { InboxRecipient } from "../domain/message.js";
 import {
 	type ChildBridgeHandle,
 	type ChildBridgeHost,
@@ -22,9 +22,7 @@ import {
 	parseChildBootstrap,
 	startChildBridge,
 } from "./child-bridge.js";
-import { ChildRpcClient } from "./child-rpc-client.js";
-import type { InboxToolPort } from "./tools.js";
-import { createInboxTools } from "./tools.js";
+import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
 
 const CHILD_ENV = "PI_TEAMS_CHILD";
 
@@ -132,51 +130,11 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 	const sessionManager = requestedSessionFile
 		? SessionManager.open(requestedSessionFile, sessionDir, bootstrap.cwd)
 		: SessionManager.create(bootstrap.cwd, sessionDir);
-	const messageClient = new ChildRpcClient({
-		socketPath: bootstrap.socketPath,
-		childId: bootstrap.childId,
-		token: bootstrap.token,
-	});
-	const childRecipient: InboxRecipient = { kind: "agent", agentId: bootstrap.childId };
-	const inboxPort: InboxToolPort = {
-		sendFromParent: async () => {
-			throw new ChildProtocolError(
-				"unsupported_message_scope",
-				"Child inbox tools cannot impersonate a parent session",
-			);
-		},
-		sendFromAgent: async (agentId, target, text) => {
-			if (agentId !== bootstrap.childId)
-				throw new ChildProtocolError("unauthorized", "Child inbox identity does not match its authenticated process");
-			await messageClient.connect();
-			const reply = await messageClient.messageRequest({ action: "send", target, text });
-			if (reply.action !== "sent")
-				throw new ChildProtocolError("invalid_reply", "Parent did not return a sent inbox receipt");
-			return {
-				id: reply.message.id,
-				...(reply.message.deliveredAt !== undefined ? { deliveredAt: reply.message.deliveredAt } : {}),
-			};
-		},
-		listInbox: async (recipient) => {
-			if (recipient.kind !== "agent" || recipient.agentId !== bootstrap.childId)
-				throw new ChildProtocolError("unauthorized", "Inbox reads must target the authenticated child");
-			await messageClient.connect();
-			const reply = await messageClient.messageRequest({ action: "list" });
-			if (reply.action !== "listed")
-				throw new ChildProtocolError("invalid_reply", "Parent did not return an inbox listing");
-			return reply.messages;
-		},
-		consumeInbox: async (recipient, messageId) => {
-			if (recipient.kind !== "agent" || recipient.agentId !== bootstrap.childId)
-				throw new ChildProtocolError("unauthorized", "Inbox consumption must target the authenticated child");
-			await messageClient.connect();
-			const reply = await messageClient.messageRequest({ action: "consume", messageId });
-			if (reply.action !== "consumed" || reply.message.id !== messageId)
-				throw new ChildProtocolError("invalid_reply", "Parent did not acknowledge the requested inbox message");
-			return { id: reply.message.id };
-		},
-	};
-	const inboxTools = createInboxTools(inboxPort, () => childRecipient);
+
+	const mailboxService =
+		bootstrap.teamDir && bootstrap.teamKey && bootstrap.teammateName
+			? new MailboxService({ teamDir: bootstrap.teamDir, teamKey: bootstrap.teamKey, self: bootstrap.teammateName })
+			: undefined;
 	const sessionOptions: CreateAgentSessionOptions = {
 		cwd: bootstrap.cwd,
 		agentDir,
@@ -184,9 +142,9 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		settingsManager,
 		resourceLoader,
 		sessionManager,
+		...(mailboxService ? { customTools: [createChildMailboxTool(mailboxService)] } : {}),
 		...(model ? { model } : {}),
 		...(!requestedSessionFile && bootstrap.thinking !== undefined ? { thinkingLevel: bootstrap.thinking } : {}),
-		customTools: inboxTools,
 		...(bootstrap.tools !== undefined ? { tools: [...bootstrap.tools] } : {}),
 	};
 	const { session } = await createAgentSession(sessionOptions);
@@ -218,6 +176,7 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		throw error;
 	}
 	let bridge: ChildBridgeHandle | undefined;
+	let mailbox: ChildMailboxHandle | undefined;
 	let unsubscribe = () => {};
 	let closePromise: Promise<void> | undefined;
 	const closeRuntime = (): Promise<void> =>
@@ -226,7 +185,7 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 				await session.abort();
 			} finally {
 				unsubscribe();
-				messageClient.disconnect();
+				mailbox?.close();
 				try {
 					await bridge?.close();
 				} finally {
@@ -311,12 +270,6 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 				throw new ChildProtocolError("unsupported_command", "Unsupported child control command");
 			}
 		},
-		sendInbox: async (message) => {
-			await session.sendCustomMessage(
-				{ customType: "pi-teams-inbox", content: JSON.stringify(message), display: true },
-				{ triggerTurn: false },
-			);
-		},
 		prompt: async (prompt) => {
 			let accepted = false;
 			let accept!: () => void;
@@ -370,7 +323,19 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 	});
 	try {
 		bridge = await startChildBridge(bootstrap, host);
+		if (bootstrap.teamDir && bootstrap.teamKey && bootstrap.teammateName) {
+			const activeBridge = bridge;
+			mailbox = watchChildMailbox({
+				teamDir: bootstrap.teamDir,
+				teamKey: bootstrap.teamKey,
+				self: bootstrap.teammateName,
+				isRunning: () => activeBridge.state().execution === "running",
+				prompt: (text) => activeBridge.startMailboxRun(text),
+				steer: (text) => host.steer(text),
+			});
+		}
 	} catch (error) {
+		mailbox?.close();
 		unsubscribe();
 		session.dispose();
 		throw error;

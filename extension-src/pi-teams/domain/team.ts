@@ -16,12 +16,13 @@ export interface TeamMember {
 	lastAssignedAt: number;
 }
 
-/** Roster at `.pi/teams/t/<team-id>/config.json`; how participants discover peers. */
 export interface TeamRoster {
 	version: 1;
 	teamId: string;
 	sessionId: string;
 	createdAt: number;
+	/** Per-team HMAC key for mailbox message signing (ADR 0007 §3); distributed via the authenticated bootstrap. */
+	teamKey: string;
 	members: TeamMember[];
 }
 

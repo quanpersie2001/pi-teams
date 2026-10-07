@@ -6,18 +6,17 @@ import type { RestoreObservers } from "../app/run-registry.js";
 import { WorktreeService } from "../app/worktree-service.js";
 import { isTerminalStatus } from "../domain/agent-run.js";
 import { DEFAULT_SUBAGENTS_SETTINGS } from "../domain/config.js";
-import type { InboxRecipient } from "../domain/message.js";
 import { loadAgentMarkdownFiles, resolveAgentSourceDirs } from "./agent-files.js";
-import { installAgentMentionAutocomplete } from "./agent-mention-autocomplete.js";
+import { installAgentMentionAutocomplete, installTeammateMentionRouting } from "./agent-mention-autocomplete.js";
 import { shouldSkipExtensionInChildSession } from "./child-guard.js";
 import { registerAgentsCommand, registerBackendCommand } from "./commands.js";
 import { loadSubagentsSettings } from "./config-host.js";
-import { createPiDeliveryHost, createPiInboxDelivery } from "./delivery-host.js";
+import { createPiDeliveryHost, installLeadMailbox } from "./delivery-host.js";
 import { ProcessAgentExecutionBackend, resolveLauncherHint, resolveSessionLauncherHint } from "./process-backend.js";
 import { createSubagentRunStore } from "./registry-host.js";
 import { type SubagentsRpcWiring, wireSubagentsRpc } from "./rpc.js";
 import { createPiTeamStore } from "./teams-host.js";
-import { registerInboxTools, registerParentMessageInspectionTool, registerSubagentTools } from "./tools.js";
+import { registerLeadSendMessageTool, registerSubagentTools } from "./tools.js";
 import { createPiTranscriptSource } from "./transcript-host.js";
 import { installSubagentsUi, type SubagentsUiHandle } from "./ui-host.js";
 import { createGitRunner, worktreeTmpRoot } from "./worktree-host.js";
@@ -75,11 +74,12 @@ export default function (pi: ExtensionAPI): void {
 		runStore: createSubagentRunStore(configCwd),
 		restoreObservers: restoreObservers(backend),
 		deliveryHost: createPiDeliveryHost(pi, () => latestCtx),
-		sendToParent: createPiInboxDelivery(pi, () => latestCtx),
 		createTeamStore: (sessionId) => createPiTeamStore(configCwd, sessionId),
 	});
 	const transcripts = createPiTranscriptSource({ backends: [backend] });
 	let uiHandle: SubagentsUiHandle | undefined;
+	let closeLeadMailbox: (() => void) | undefined;
+	let stopMentionRouting: (() => void) | undefined;
 	let rpc: SubagentsRpcWiring | undefined;
 	// No message renderer is registered: the teammate-notification customType
 	// plus its structured plain-text content IS the renderer contract exported
@@ -88,33 +88,50 @@ export default function (pi: ExtensionAPI): void {
 	registerAgentsCommand(pi, { manager: app.manager, openHub: () => uiHandle?.openHub() });
 	registerBackendCommand(pi, { backend });
 	registerSubagentTools(pi, app.manager, app.registry);
-	const resolveInboxRecipient = (): InboxRecipient => {
-		const sessionId = latestCtx?.sessionManager.getSessionId();
-		if (!sessionId) throw new Error("Inbox tools require an active parent session.");
-		return { kind: "parent", sessionId };
-	};
-	registerInboxTools(pi, app.messages, resolveInboxRecipient);
-	registerParentMessageInspectionTool(pi, app.messages, resolveInboxRecipient);
+	registerLeadSendMessageTool(
+		pi,
+		() => app.mailbox,
+		() => app.teams?.current?.members.map((member) => member.name) ?? [],
+	);
+
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		rpc?.dispose();
 		rpc = wireSubagentsRpc({ events: pi.events, manager: app.manager });
 		uiHandle?.dispose();
+		closeLeadMailbox?.();
+		stopMentionRouting?.();
+		closeLeadMailbox = undefined;
+		stopMentionRouting = undefined;
 		const settings = await loadSubagentsSettings(configCwd);
 		app.updateSettings(settings);
 		// Env override (four launchers) wins over the settings key (auto|headless).
 		backend.setLauncherHint(resolveSessionLauncherHint(process.env, settings.backend));
 		await app.sessionStart();
-		if (ctx.mode === "tui") installAgentMentionAutocomplete(ctx, app.registry);
+		if (app.mailbox) closeLeadMailbox = installLeadMailbox(pi, app.mailbox);
 		uiHandle = installSubagentsUi(ctx, {
 			manager: app.manager,
 			focus: createAgentFocusPort({ manager: app.manager, transcripts }),
 			settings: () => app.manager.currentSettings,
 			transcripts,
 		});
+		if (ctx.mode === "tui") {
+			const routing = {
+				names: () => app.manager.list().flatMap((run) => (run.teammateName && run.handle ? [run.teammateName] : [])),
+				isMainEditorFocused: () => uiHandle?.isMainEditorFocused() ?? false,
+				send: (target: string, text: string) =>
+					app.mailbox?.send(target, text) ?? { delivered: false as const, error: "No active team" },
+			};
+			installAgentMentionAutocomplete(ctx, app.registry, routing);
+			stopMentionRouting = installTeammateMentionRouting(ctx, routing);
+		}
 		rpc.announceReady();
 	});
 	pi.on("session_before_switch", () => {
+		closeLeadMailbox?.();
+		stopMentionRouting?.();
+		closeLeadMailbox = undefined;
+		stopMentionRouting = undefined;
 		app.delivery?.handleSessionSwitch();
 		// Session-bound lifetime (ADR 0007 §1): switching sessions ends the
 		// owning session's team — tear its children down before the next
@@ -124,6 +141,10 @@ export default function (pi: ExtensionAPI): void {
 		});
 	});
 	pi.on("session_shutdown", async () => {
+		closeLeadMailbox?.();
+		stopMentionRouting?.();
+		closeLeadMailbox = undefined;
+		stopMentionRouting = undefined;
 		rpc?.dispose();
 		rpc = undefined;
 		uiHandle?.dispose();

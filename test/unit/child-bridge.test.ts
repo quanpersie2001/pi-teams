@@ -87,7 +87,6 @@ describe("child bridge over an owner-only Unix socket", () => {
 				capabilities: { models: [], thinking: ["high"], commands: ["model", "thinking", "compact"] },
 			}),
 			async controlFocus() {},
-			async sendInbox() {},
 			async prompt() {
 				promptCalls++;
 				promptStarted.resolve();
@@ -286,7 +285,7 @@ describe("child bridge over an owner-only Unix socket", () => {
 				dispatched++;
 			},
 		};
-		installChildBridgeExtension(pi as never);
+		await installChildBridgeExtension(pi as never);
 		closeInstalledBridge = async () => {
 			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context);
 		};
@@ -349,6 +348,68 @@ describe("child bridge over an owner-only Unix socket", () => {
 	});
 });
 
+describe("mailbox assignment admission", () => {
+	it("waits for capacity and preserves earlier full results across native assignments", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "teams-mailbox-admission-"));
+		tempDir = dir;
+		const bootstrap = {
+			childId: "mailbox-child",
+			token: TOKEN,
+			socketPath: join(dir, "child.sock"),
+			sessionDir: join(dir, "sessions"),
+			cwd: dir,
+			configCwd: dir,
+			systemPrompt: "",
+			promptMode: "append" as const,
+		};
+		const injected: string[] = [];
+		const runtime = await startChildBridge(bootstrap, {
+			getSessionFile: () => join(dir, "sessions", "native.jsonl"),
+			getTranscript: () => [],
+			getFocus: () => ({ cwd: dir, thinking: "off", capabilities: { models: [], thinking: ["off"], commands: [] } }),
+			controlFocus: async () => {},
+			prompt: async (text) => {
+				injected.push(text);
+			},
+			steer: async () => {},
+			abort: async () => {},
+			shutdown: async () => {},
+		});
+		bridge = runtime;
+		const client = new ChildRpcClient({ socketPath: bootstrap.socketPath, childId: bootstrap.childId, token: TOKEN });
+		clients.push(client);
+		await client.connect();
+		let earlierResult: string | undefined;
+		for (const text of ["first findings", "second findings"]) {
+			const ready = Promise.withResolvers<string>();
+			const unsubscribe = client.subscribe((event) => {
+				if (event.event === "mailbox_assignment" && typeof event.payload.runId === "string")
+					ready.resolve(event.payload.runId);
+			});
+			const admission = runtime.startMailboxRun(text);
+			const runId = await ready.promise;
+			expect(runtime.state().execution).toBe("idle");
+			expect(injected).not.toContain(text);
+			await client.admitAssignment(runId);
+			await admission;
+			expect(runtime.state().currentRunId).toBe(runId);
+			runtime.publishNativeEvent({
+				type: "message_end",
+				message: { role: "assistant", content: text, stopReason: "stop" },
+			});
+			runtime.publishNativeEvent({ type: "agent_settled" });
+			const outcome = runtime.state().lastOutcome;
+			if (!outcome?.resultFile) throw new Error("Native settlement did not persist a full result");
+			expect(readFileSync(outcome.resultFile, "utf8")).toBe(text);
+			if (earlierResult) {
+				expect(outcome.resultFile).not.toBe(earlierResult);
+				expect(readFileSync(earlierResult, "utf8")).toBe("first findings");
+			} else earlierResult = outcome.resultFile;
+			unsubscribe();
+		}
+	});
+});
+
 describe("control-loss self-termination (ADR 0007 §1)", () => {
 	it("aborts, preserves an annotated partial result and stops after the control socket stays lost", async () => {
 		vi.useFakeTimers();
@@ -378,7 +439,6 @@ describe("control-loss self-termination (ADR 0007 §1)", () => {
 					capabilities: { models: [], thinking: ["off"] as const, commands: [] },
 				}),
 				controlFocus: async () => {},
-				sendInbox: async () => {},
 				prompt: async () => {},
 				steer: async () => {},
 				abort: async () => {
@@ -447,8 +507,6 @@ describe("control-loss self-termination (ADR 0007 §1)", () => {
 					capabilities: { models: [], thinking: ["off"] as const, commands: [] },
 				}),
 				controlFocus: async () => {},
-				sendInbox: async () => {},
-				prompt: async () => {},
 				steer: async () => {},
 				abort: async () => {},
 				shutdown: async () => {},
