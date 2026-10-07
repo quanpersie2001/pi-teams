@@ -542,7 +542,7 @@ function tmuxLauncher(runner: LauncherCommandRunner, env: Record<string, string 
 		async launch(spec, plan) {
 			if (!defaultSocketPath || !isAbsolute(defaultSocketPath)) throw new Error("tmux socket path is unavailable");
 			const ownerToken = randomUUID();
-			const command = shellCommand(spec.interactiveArgv, { ...spec.env, PI_SUBAGENTS_LAUNCH_OWNER: ownerToken });
+			const command = shellCommand(spec.interactiveArgv, { ...spec.env, PI_TEAMS_LAUNCH_OWNER: ownerToken });
 			const result = await run(
 				[
 					"split-window",
@@ -707,7 +707,7 @@ function processLauncher(runner: LauncherCommandRunner, spawnProcess: typeof spa
 		async launch(spec) {
 			mkdirSync(spec.runDir, { recursive: true });
 			const ownerToken = randomUUID();
-			const env = { ...process.env, ...spec.env, PI_SUBAGENTS_LAUNCH_OWNER: ownerToken };
+			const env = { ...process.env, ...spec.env, PI_TEAMS_LAUNCH_OWNER: ownerToken };
 			const logPath = join(spec.runDir, "child.log");
 			const logFd = openSync(logPath, "a", 0o600);
 			let child: ChildProcess;

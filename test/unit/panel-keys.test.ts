@@ -10,7 +10,7 @@ import {
 	type PanelRowLike,
 	selectAtIndex,
 	selectionIndex,
-} from "../../extension-src/pi-subagents/features/agent-panel/panel-keys.js";
+} from "../../extension-src/pi-teams/features/agent-panel/panel-keys.js";
 
 const rows: readonly PanelRowLike[] = [{ id: "a" }, { id: "b" }, { id: "c" }];
 

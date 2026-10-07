@@ -103,7 +103,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 		label: "Agent",
 		description:
 			"Launch a specialist sub-agent for a task matching its description. A pinned agent model remains primary; model availability and authentication are checked before spawning, with automatic fallback to an available authenticated model. Subagents are valuable for parallelizing independent queries or protecting this conversation from excessive results. When the agent runs detached you will be notified on completion — do not poll or sleep waiting for it.",
-		promptSnippet: "Launch autonomous sub-agents for complex multi-step tasks",
+		promptSnippet: "Launch autonomous teams for complex multi-step tasks",
 		parameters: agentParameters,
 		prepareLoadout() {
 			const agents = registry.availableTypes.map((type) => {

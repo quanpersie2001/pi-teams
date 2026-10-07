@@ -14,8 +14,8 @@ import {
 	type GitRunner,
 	WorktreeGitError,
 	WorktreeService,
-} from "../../extension-src/pi-subagents/app/worktree-service.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
+} from "../../extension-src/pi-teams/app/worktree-service.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
 import { BASE_SHA, COMMITTED_SHA, FakeGit } from "../helpers/fake-git.js";
 
 const tempRoots: string[] = [];
@@ -33,7 +33,7 @@ function makeService(
 	service: WorktreeService;
 	tmpRoot: string;
 } {
-	const tmpRoot = join("/tmp", `subagents-${git.topLevel.replace(/[^a-z0-9]/gi, "").slice(-8)}`);
+	const tmpRoot = join("/tmp", `teams-${git.topLevel.replace(/[^a-z0-9]/gi, "").slice(-8)}`);
 	tempRoots.push(tmpRoot);
 	const service = new WorktreeService({
 		runGit: git.run,
@@ -46,7 +46,7 @@ function makeService(
 }
 
 async function mkTmpRoot(): Promise<string> {
-	return mkdtemp(join(tmpdir(), "subagents-wt-"));
+	return mkdtemp(join(tmpdir(), "teams-wt-"));
 }
 
 async function runGit(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv): Promise<string> {
@@ -66,8 +66,8 @@ async function makeRealGitRepo(): Promise<{ root: string; env: NodeJS.ProcessEnv
 		GIT_CONFIG_GLOBAL: join(root, "isolated-global-config"),
 	};
 	await runGit(["init", "--quiet"], root, env);
-	await runGit(["config", "user.name", "Pi Subagents Test"], root, env);
-	await runGit(["config", "user.email", "pi-subagents-test@example.invalid"], root, env);
+	await runGit(["config", "user.name", "Pi Teams Test"], root, env);
+	await runGit(["config", "user.email", "pi-teams-test@example.invalid"], root, env);
 	await runGit(["commit", "--allow-empty", "-m", "base"], root, env);
 	const run: GitRunner = async (args, { cwd }) => ({ stdout: await runGit(args, cwd, env) });
 	return { root, env, run };
@@ -82,7 +82,7 @@ describe("createForRun", () => {
 
 		expect(info.baseRepo).toBe(await realpath(repo));
 		expect(info.branch).toBe(`agent/task-123-${BASE_SHA.slice(0, 8)}`);
-		expect(info.path).toMatch(/pi-subagents-task-123-abc12345$/);
+		expect(info.path).toMatch(/pi-teams-task-123-abc12345$/);
 		expect(info.checkoutRoot).toBe(info.path);
 
 		const flat = git.calls.map((call) => call.args.join(" "));
@@ -101,7 +101,7 @@ describe("createForRun", () => {
 		const git = new FakeGit(repo);
 		const { service } = makeService(git);
 		const info = await service.createForRun("run-1", subdir);
-		expect(info.path).toMatch(new RegExp(`pi-subagents-run-1-abc12345${"\\/"}packages\\/pkg-a$`));
+		expect(info.path).toMatch(new RegExp(`pi-teams-run-1-abc12345${"\\/"}packages\\/pkg-a$`));
 		expect(info.baseRepo).toBe(await realpath(repo));
 		expect(info.checkoutRoot).toBeDefined();
 	});

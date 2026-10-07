@@ -2,7 +2,7 @@
 
 ## Boundary
 
-`pi-tasks` owns Task status, dependencies, priority, assignment/retry and review. `pi-subagents` owns specialist definitions, independent child processes, AgentRun lifecycle, transcript/result and optional worktree artifacts. Task → run mapping belongs to the consumer; no Task entity is stored in this package.
+`pi-tasks` owns Task status, dependencies, priority, assignment/retry and review. `pi-teams` owns specialist definitions, independent child processes, AgentRun lifecycle, transcript/result and optional worktree artifacts. Task → run mapping belongs to the consumer; no Task entity is stored in this package.
 
 ## Public transport: version 3
 
@@ -53,7 +53,7 @@ Status snapshots contain identity/type/description/status, `backend: "process"`,
 
 Required strings must be non-empty; optional numeric fields must be finite and boolean fields correctly typed. Invalid requests with a usable `requestId` receive an error envelope; without it, no correlated reply is possible. Unknown/settled controls, failed admission and unsafe cleanup also return errors, not success. `subagents:ready` with `{}` is emitted each `session_start`; late consumers should re-probe version/status.
 
-`Symbol.for("pi-subagents:service")` on `globalThis` exposes the current integration service as an optional same-process fast path. Events RPC remains the public versioned boundary; the symbol is removed on disposal.
+`Symbol.for("pi-teams:service")` on `globalThis` exposes the current integration service as an optional same-process fast path. Events RPC remains the public versioned boundary; the symbol is removed on disposal.
 
 ## Lifecycle
 

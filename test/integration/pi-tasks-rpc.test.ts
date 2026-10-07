@@ -10,11 +10,11 @@
 import { randomUUID } from "node:crypto";
 import { createEventBus, type EventBus } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { createPiSubagentsApp } from "../../extension-src/pi-subagents/app/index.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import type { AgentLifecycleEvent } from "../../extension-src/pi-subagents/domain/integration-protocol.js";
-import { PROTOCOL_VERSION } from "../../extension-src/pi-subagents/domain/integration-protocol.js";
-import { toLifecycleBroadcast, wireSubagentsRpc } from "../../extension-src/pi-subagents/pi/rpc.js";
+import { createPiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
+import { PROTOCOL_VERSION } from "../../extension-src/pi-teams/domain/integration-protocol.js";
+import { toLifecycleBroadcast, wireSubagentsRpc } from "../../extension-src/pi-teams/pi/rpc.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 
 const CHANNEL_SPAWN = "subagents:rpc:spawn";

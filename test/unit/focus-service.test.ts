@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { AgentManager } from "../../extension-src/pi-subagents/app/agent-manager.js";
-import { AgentRegistry } from "../../extension-src/pi-subagents/app/agent-registry.js";
-import { createAgentFocusPort } from "../../extension-src/pi-subagents/app/focus-service.js";
-import { MessageService } from "../../extension-src/pi-subagents/app/message-service.js";
-import type { AgentBackendHandle } from "../../extension-src/pi-subagents/domain/backend.js";
-import type { ChildState } from "../../extension-src/pi-subagents/domain/child-protocol.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import type { TranscriptItem } from "../../extension-src/pi-subagents/domain/transcript.js";
+import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
+import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
+import { createAgentFocusPort } from "../../extension-src/pi-teams/app/focus-service.js";
+import { MessageService } from "../../extension-src/pi-teams/app/message-service.js";
+import type { AgentBackendHandle } from "../../extension-src/pi-teams/domain/backend.js";
+import type { ChildState } from "../../extension-src/pi-teams/domain/child-protocol.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { TranscriptItem } from "../../extension-src/pi-teams/domain/transcript.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 
 class FocusBackend extends FakeBackend {

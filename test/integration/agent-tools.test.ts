@@ -3,9 +3,9 @@
 // deterministic FakeBackend. No real model calls.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createPiSubagentsApp } from "../../extension-src/pi-subagents/app/index.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import { registerSubagentTools } from "../../extension-src/pi-subagents/pi/tools.js";
+import { createPiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import { registerSubagentTools } from "../../extension-src/pi-teams/pi/tools.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 import { FakePiHost } from "../helpers/fake-pi-host.js";
 

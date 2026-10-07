@@ -3,7 +3,7 @@ import {
 	CHILD_SESSION_ENV_VAR,
 	isChildSessionContext,
 	shouldSkipExtensionInChildSession,
-} from "../../extension-src/pi-subagents/pi/child-guard.js";
+} from "../../extension-src/pi-teams/pi/child-guard.js";
 
 function freshEnv(): Record<string, string | undefined> {
 	return {};

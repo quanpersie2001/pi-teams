@@ -1,7 +1,7 @@
 // Completion notification renderer (docs/ui/AGENT-PANEL-AND-VIEW.md §7).
 //
 // pi/delivery-host.ts injects completion settlements as custom messages with
-// customType "subagent-notification"; this feature registers a message
+// customType "teammate-notification"; this feature registers a message
 // renderer that styles them as a compact box: outcome icon, agent type +
 // status label, optional owner reference, stats and a result preview.
 //
@@ -16,7 +16,7 @@ import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { bindThemeFg, type ThemeFg, type UiColorToken } from "../../shared/theme.js";
 
 /** pi.sendMessage customType for completion notifications. */
-export const SUBAGENT_NOTIFICATION_TYPE = "subagent-notification";
+export const TEAMMATE_NOTIFICATION_TYPE = "teammate-notification";
 
 export type NotificationOutcome = "completed" | "failed" | "stopped";
 

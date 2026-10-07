@@ -10,20 +10,20 @@ import type { CompletedRunHistoryEntry, PersistedRegistryEntry, SubagentRunStore
 import { coerceRegistryEntry, isIncompatibleRegistryEntry } from "../app/run-registry.js";
 import { findNearestPiDir } from "./artifacts.js";
 
-export function subagentsArtifactDir(cwd: string): string {
-	return join(findNearestPiDir(cwd), "subagents");
+export function teamsArtifactDir(cwd: string): string {
+	return join(findNearestPiDir(cwd), "teams");
 }
 
 export function registryFilePath(cwd: string): string {
-	return join(subagentsArtifactDir(cwd), "registry.json");
+	return join(teamsArtifactDir(cwd), "registry.json");
 }
 
 export function historyFilePath(cwd: string): string {
-	return join(subagentsArtifactDir(cwd), "history.json");
+	return join(teamsArtifactDir(cwd), "history.json");
 }
 
 function warn(message: string): void {
-	console.warn(`[pi-subagents] ${message}`);
+	console.warn(`[pi-teams] ${message}`);
 }
 
 /** Read a JSON array; strict callers never rewrite corrupt data as empty. */

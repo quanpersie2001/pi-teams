@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { TranscriptItem } from "../../extension-src/pi-subagents/domain/transcript.js";
+import type { TranscriptItem } from "../../extension-src/pi-teams/domain/transcript.js";
 import {
 	type ChildBridgeHandle,
 	type ChildBridgeHost,
@@ -10,8 +10,8 @@ import {
 	installChildBridgeExtension,
 	parseChildBootstrap,
 	startChildBridge,
-} from "../../extension-src/pi-subagents/pi/child-bridge.js";
-import { ChildRpcClient } from "../../extension-src/pi-subagents/pi/child-rpc-client.js";
+} from "../../extension-src/pi-teams/pi/child-bridge.js";
+import { ChildRpcClient } from "../../extension-src/pi-teams/pi/child-rpc-client.js";
 
 const TOKEN = "bridge-test-secret-token";
 let tempDir: string | undefined;
@@ -28,10 +28,10 @@ afterEach(async () => {
 	bridge = undefined;
 	if (tempDir) rmSync(tempDir, { recursive: true, force: true });
 	if (previousChildEnv) {
-		if (previousChildEnv.child === undefined) delete process.env.PI_SUBAGENTS_CHILD;
-		else process.env.PI_SUBAGENTS_CHILD = previousChildEnv.child;
-		if (previousChildEnv.bootstrap === undefined) delete process.env.PI_SUBAGENTS_BOOTSTRAP;
-		else process.env.PI_SUBAGENTS_BOOTSTRAP = previousChildEnv.bootstrap;
+		if (previousChildEnv.child === undefined) delete process.env.PI_TEAMS_CHILD;
+		else process.env.PI_TEAMS_CHILD = previousChildEnv.child;
+		if (previousChildEnv.bootstrap === undefined) delete process.env.PI_TEAMS_BOOTSTRAP;
+		else process.env.PI_TEAMS_BOOTSTRAP = previousChildEnv.bootstrap;
 		previousChildEnv = undefined;
 	}
 	tempDir = undefined;
@@ -47,7 +47,7 @@ function createDeferred() {
 
 describe("child bridge over an owner-only Unix socket", () => {
 	it("deduplicates reconnect retries and preserves run, transcript, and shutdown state", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "subagents-bridge-"));
+		const dir = mkdtempSync(join(tmpdir(), "teams-bridge-"));
 		tempDir = dir;
 		const sessionFile = join(dir, "sessions", "child.jsonl");
 		const bootstrap = {
@@ -229,7 +229,7 @@ describe("child bridge over an owner-only Unix socket", () => {
 	});
 
 	it("settles native prompt preflight authentication failures for RPC consumers", async () => {
-		tempDir = mkdtempSync(join(tmpdir(), "subagents-auth-preflight-"));
+		tempDir = mkdtempSync(join(tmpdir(), "teams-auth-preflight-"));
 		const bootstrap = {
 			childId: "child-auth",
 			token: TOKEN,
@@ -244,11 +244,11 @@ describe("child bridge over an owner-only Unix socket", () => {
 		const bootstrapPath = join(tempDir, "bootstrap.json");
 		writeFileSync(bootstrapPath, JSON.stringify(bootstrap), { mode: 0o600 });
 		previousChildEnv = {
-			child: process.env.PI_SUBAGENTS_CHILD,
-			bootstrap: process.env.PI_SUBAGENTS_BOOTSTRAP,
+			child: process.env.PI_TEAMS_CHILD,
+			bootstrap: process.env.PI_TEAMS_BOOTSTRAP,
 		};
-		process.env.PI_SUBAGENTS_CHILD = "1";
-		process.env.PI_SUBAGENTS_BOOTSTRAP = bootstrapPath;
+		process.env.PI_TEAMS_CHILD = "1";
+		process.env.PI_TEAMS_BOOTSTRAP = bootstrapPath;
 
 		let hasConfiguredAuth = false;
 		let providerAuth: object | undefined;
@@ -318,7 +318,7 @@ describe("child bridge over an owner-only Unix socket", () => {
 	});
 
 	it("fails at the readiness deadline when no child opens its socket", async () => {
-		tempDir = mkdtempSync(join(tmpdir(), "subagents-deadline-"));
+		tempDir = mkdtempSync(join(tmpdir(), "teams-deadline-"));
 		const client = new ChildRpcClient({
 			socketPath: join(tempDir, "missing.sock"),
 			childId: "missing",
@@ -330,7 +330,7 @@ describe("child bridge over an owner-only Unix socket", () => {
 	});
 
 	it("cancels an in-flight startup connection without waiting for its deadline", async () => {
-		tempDir = mkdtempSync(join(tmpdir(), "subagents-cancel-"));
+		tempDir = mkdtempSync(join(tmpdir(), "teams-cancel-"));
 		const client = new ChildRpcClient({
 			socketPath: join(tempDir, "missing.sock"),
 			childId: "cancelled",

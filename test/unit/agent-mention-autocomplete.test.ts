@@ -4,9 +4,9 @@ import { join } from "node:path";
 import type { AutocompleteProvider, AutocompleteProviderFactory } from "@earendil-works/pi-coding-agent";
 import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AgentRegistry } from "../../extension-src/pi-subagents/app/agent-registry.js";
-import { DEFAULT_SUBAGENTS_SETTINGS } from "../../extension-src/pi-subagents/domain/config.js";
-import { installAgentMentionAutocomplete } from "../../extension-src/pi-subagents/pi/agent-mention-autocomplete.js";
+import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
+import { DEFAULT_SUBAGENTS_SETTINGS } from "../../extension-src/pi-teams/domain/config.js";
+import { installAgentMentionAutocomplete } from "../../extension-src/pi-teams/pi/agent-mention-autocomplete.js";
 
 let root: string;
 

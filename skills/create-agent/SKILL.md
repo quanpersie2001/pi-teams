@@ -5,7 +5,7 @@ description: Create or refine a focused Pi specialist agent from a task descript
 
 # Create a Pi specialist agent
 
-Turn the user's requirements into an autonomous, focused specialist for the pi-subagents extension. Deliver a real Markdown agent definition, not an OMP JSON draft. This skill guides creation; it is not itself an agent definition.
+Turn the user's requirements into an autonomous, focused specialist for the pi-teams extension. Deliver a real Markdown agent definition, not an OMP JSON draft. This skill guides creation; it is not itself an agent definition.
 
 ## Workflow
 

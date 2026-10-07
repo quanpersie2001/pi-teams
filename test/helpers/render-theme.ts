@@ -90,7 +90,7 @@ function installRenderTheme(): void {
 			toolErrorBg: "",
 		},
 		"truecolor",
-		{ name: "pi-subagents-render-test" },
+		{ name: "pi-teams-render-test" },
 	);
 	globalWithTheme[key] = theme;
 	globalWithTheme[Symbol.for("@mariozechner/pi-coding-agent:theme")] = theme;

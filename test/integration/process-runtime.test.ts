@@ -5,22 +5,22 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentManager } from "../../extension-src/pi-subagents/app/agent-manager.js";
-import { AgentRegistry } from "../../extension-src/pi-subagents/app/agent-registry.js";
-import { createPiSubagentsApp } from "../../extension-src/pi-subagents/app/index.js";
-import type { SerializableBackendHandle, SubagentRunStore } from "../../extension-src/pi-subagents/app/run-registry.js";
-import { buildAgentListView } from "../../extension-src/pi-subagents/app/ui-snapshot.js";
-import { type AgentRun, isTerminalStatus } from "../../extension-src/pi-subagents/domain/agent-run.js";
+import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
+import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
+import { createPiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
+import type { SerializableBackendHandle, SubagentRunStore } from "../../extension-src/pi-teams/app/run-registry.js";
+import { buildAgentListView } from "../../extension-src/pi-teams/app/ui-snapshot.js";
+import { type AgentRun, isTerminalStatus } from "../../extension-src/pi-teams/domain/agent-run.js";
 import type {
 	AgentBackendHandle,
 	AgentLaunchInput,
 	BackendStatus,
-} from "../../extension-src/pi-subagents/domain/backend.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import type { LauncherHandle, ProcessLauncher } from "../../extension-src/pi-subagents/domain/process-launcher.js";
-import { ProcessAgentExecutionBackend } from "../../extension-src/pi-subagents/pi/process-backend.js";
-import { createProcessLaunchers } from "../../extension-src/pi-subagents/pi/process-launchers.js";
-import { createSubagentRunStore } from "../../extension-src/pi-subagents/pi/registry-host.js";
+} from "../../extension-src/pi-teams/domain/backend.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { LauncherHandle, ProcessLauncher } from "../../extension-src/pi-teams/domain/process-launcher.js";
+import { ProcessAgentExecutionBackend } from "../../extension-src/pi-teams/pi/process-backend.js";
+import { createProcessLaunchers } from "../../extension-src/pi-teams/pi/process-launchers.js";
+import { createSubagentRunStore } from "../../extension-src/pi-teams/pi/registry-host.js";
 
 const tempRoots: string[] = [];
 const servers: Server[] = [];
@@ -50,7 +50,7 @@ interface LocalProvider {
 }
 
 async function localProvider(options: { holdFirst?: boolean } = {}): Promise<LocalProvider> {
-	const root = await mkdtemp(join(tmpdir(), "subagents-process-runtime-"));
+	const root = await mkdtemp(join(tmpdir(), "teams-process-runtime-"));
 	tempRoots.push(root);
 	const agentDir = join(root, "agent");
 	const cwd = join(root, "project");
@@ -214,7 +214,7 @@ interface ScriptedProvider {
  * budget abort followed by a completing resume turn.
  */
 async function scriptedProvider(behaviors: readonly ProviderBehavior[]): Promise<ScriptedProvider> {
-	const root = await mkdtemp(join(tmpdir(), "subagents-budget-runtime-"));
+	const root = await mkdtemp(join(tmpdir(), "teams-budget-runtime-"));
 	tempRoots.push(root);
 	const agentDir = join(root, "agent");
 	const cwd = join(root, "project");
@@ -633,7 +633,7 @@ describe("real process runtime", () => {
 			expect(store.readRegistry()).toEqual([]);
 			expect(spawned).toEqual([]);
 			expect(provider.requests).toEqual([]);
-			await expect(access(join(provider.cwd, ".pi", "subagents"))).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(access(join(provider.cwd, ".pi", "teams"))).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
 			await manager.shutdownSession();
 			process.env = previousEnv;

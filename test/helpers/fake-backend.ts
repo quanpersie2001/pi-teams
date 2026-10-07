@@ -2,7 +2,7 @@
 // Execution changes only when a test emits a backend status event; command
 // acknowledgements are separate from run settlement.
 
-import type { SerializableBackendHandle } from "../../extension-src/pi-subagents/app/run-registry.js";
+import type { SerializableBackendHandle } from "../../extension-src/pi-teams/app/run-registry.js";
 import type {
 	AgentBackendHandle,
 	AgentExecutionBackend,
@@ -11,14 +11,14 @@ import type {
 	BackendStatus,
 	ModelAdmission,
 	ModelAdmissionInput,
-} from "../../extension-src/pi-subagents/domain/backend.js";
-import type { ChildState } from "../../extension-src/pi-subagents/domain/child-protocol.js";
-import type { LauncherKind } from "../../extension-src/pi-subagents/domain/process-launcher.js";
+} from "../../extension-src/pi-teams/domain/backend.js";
+import type { ChildState } from "../../extension-src/pi-teams/domain/child-protocol.js";
+import type { LauncherKind } from "../../extension-src/pi-teams/domain/process-launcher.js";
 import {
 	emptyTranscriptSnapshot,
 	type TranscriptItem,
 	type TranscriptSnapshot,
-} from "../../extension-src/pi-subagents/domain/transcript.js";
+} from "../../extension-src/pi-teams/domain/transcript.js";
 
 export class FakeBackend implements AgentExecutionBackend {
 	readonly kind = "process" as const;

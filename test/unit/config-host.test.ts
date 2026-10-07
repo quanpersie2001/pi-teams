@@ -2,12 +2,12 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_SUBAGENTS_SETTINGS, MIN_MAX_CONCURRENT } from "../../extension-src/pi-subagents/domain/config.js";
+import { DEFAULT_SUBAGENTS_SETTINGS, MIN_MAX_CONCURRENT } from "../../extension-src/pi-teams/domain/config.js";
 import {
 	loadSubagentsSettings,
 	mergeSettings,
 	resolveSettingsPaths,
-} from "../../extension-src/pi-subagents/pi/config-host.js";
+} from "../../extension-src/pi-teams/pi/config-host.js";
 
 let root: string | undefined;
 
@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 async function makeRoot(): Promise<string> {
-	root = await mkdtemp(join(tmpdir(), "pi-subagents-config-"));
+	root = await mkdtemp(join(tmpdir(), "pi-teams-config-"));
 	return root;
 }
 
@@ -51,8 +51,8 @@ describe("mergeSettings", () => {
 describe("resolveSettingsPaths", () => {
 	it("maps global under the agent dir and project under configCwd/.pi", () => {
 		const paths = resolveSettingsPaths("/proj", "/agentdir");
-		expect(paths.global).toBe(join("/agentdir", "subagents.json"));
-		expect(paths.project).toBe(join("/proj", ".pi", "subagents.json"));
+		expect(paths.global).toBe(join("/agentdir", "teams.json"));
+		expect(paths.project).toBe(join("/proj", ".pi", "teams.json"));
 	});
 });
 
@@ -72,7 +72,7 @@ describe("loadSubagentsSettings", () => {
 		const rootDir = await makeRoot();
 		const agentDir = join(rootDir, "agent");
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "subagents.json"), JSON.stringify({ maxConcurrent: 12 }));
+		await writeFile(join(agentDir, "teams.json"), JSON.stringify({ maxConcurrent: 12 }));
 		const settings = await loadSubagentsSettings(rootDir, { agentDir });
 		expect(settings.maxConcurrent).toBe(12);
 		expect(settings.backgroundByDefault).toBe(true); // untouched default
@@ -81,7 +81,7 @@ describe("loadSubagentsSettings", () => {
 	it("applies a project-only file", async () => {
 		const rootDir = await makeRoot();
 		await mkdir(join(rootDir, ".pi"), { recursive: true });
-		await writeFile(join(rootDir, ".pi", "subagents.json"), JSON.stringify({ maxConcurrent: 7 }));
+		await writeFile(join(rootDir, ".pi", "teams.json"), JSON.stringify({ maxConcurrent: 7 }));
 		const settings = await loadSubagentsSettings(rootDir, { agentDir: join(rootDir, "agent") });
 		expect(settings.maxConcurrent).toBe(7);
 	});
@@ -90,9 +90,9 @@ describe("loadSubagentsSettings", () => {
 		const rootDir = await makeRoot();
 		const agentDir = join(rootDir, "agent");
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "subagents.json"), JSON.stringify({ maxConcurrent: 4, graceTurns: 9 }));
+		await writeFile(join(agentDir, "teams.json"), JSON.stringify({ maxConcurrent: 4, graceTurns: 9 }));
 		await mkdir(join(rootDir, ".pi"), { recursive: true });
-		await writeFile(join(rootDir, ".pi", "subagents.json"), JSON.stringify({ maxConcurrent: 6 }));
+		await writeFile(join(rootDir, ".pi", "teams.json"), JSON.stringify({ maxConcurrent: 6 }));
 		const settings = await loadSubagentsSettings(rootDir, { agentDir });
 		expect(settings.maxConcurrent).toBe(6); // project wins
 		expect(settings.graceTurns).toBe(9); // global untouched key survives
@@ -102,9 +102,9 @@ describe("loadSubagentsSettings", () => {
 		const rootDir = await makeRoot();
 		const agentDir = join(rootDir, "agent");
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "subagents.json"), "not json{{{");
+		await writeFile(join(agentDir, "teams.json"), "not json{{{");
 		await mkdir(join(rootDir, ".pi"), { recursive: true });
-		await writeFile(join(rootDir, ".pi", "subagents.json"), JSON.stringify({ maxConcurrent: 3 }));
+		await writeFile(join(rootDir, ".pi", "teams.json"), JSON.stringify({ maxConcurrent: 3 }));
 		const warnings: string[] = [];
 		const settings = await loadSubagentsSettings(rootDir, { agentDir, warn: (m) => warnings.push(m) });
 		expect(settings.maxConcurrent).toBe(3);
@@ -116,9 +116,9 @@ describe("loadSubagentsSettings", () => {
 		const rootDir = await makeRoot();
 		const agentDir = join(rootDir, "agent");
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "subagents.json"), JSON.stringify({ maxConcurrent: 5 }));
+		await writeFile(join(agentDir, "teams.json"), JSON.stringify({ maxConcurrent: 5 }));
 		await mkdir(join(rootDir, ".pi"), { recursive: true });
-		await writeFile(join(rootDir, ".pi", "subagents.json"), "oops");
+		await writeFile(join(rootDir, ".pi", "teams.json"), "oops");
 		const warnings: string[] = [];
 		const settings = await loadSubagentsSettings(rootDir, { agentDir, warn: (m) => warnings.push(m) });
 		expect(settings.maxConcurrent).toBe(5);
@@ -129,9 +129,9 @@ describe("loadSubagentsSettings", () => {
 		const rootDir = await makeRoot();
 		const agentDir = join(rootDir, "agent");
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "subagents.json"), "[");
+		await writeFile(join(agentDir, "teams.json"), "[");
 		await mkdir(join(rootDir, ".pi"), { recursive: true });
-		await writeFile(join(rootDir, ".pi", "subagents.json"), "{ bad");
+		await writeFile(join(rootDir, ".pi", "teams.json"), "{ bad");
 		const warnings: string[] = [];
 		const settings = await loadSubagentsSettings(rootDir, { agentDir, warn: (m) => warnings.push(m) });
 		expect(settings).toEqual({ ...DEFAULT_SUBAGENTS_SETTINGS });
@@ -142,13 +142,13 @@ describe("loadSubagentsSettings", () => {
 		const rootDir = await makeRoot();
 		const agentDir = join(rootDir, "agent");
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "subagents.json"), "");
+		await writeFile(join(agentDir, "teams.json"), "");
 		const warnings: string[] = [];
 		const empty = await loadSubagentsSettings(rootDir, { agentDir, warn: (m) => warnings.push(m) });
 		expect(empty).toEqual({ ...DEFAULT_SUBAGENTS_SETTINGS });
 		expect(warnings).toHaveLength(1);
 
-		await writeFile(join(agentDir, "subagents.json"), "{}");
+		await writeFile(join(agentDir, "teams.json"), "{}");
 		const warnings2: string[] = [];
 		const emptyObj = await loadSubagentsSettings(rootDir, { agentDir, warn: (m) => warnings2.push(m) });
 		expect(emptyObj).toEqual({ ...DEFAULT_SUBAGENTS_SETTINGS });
@@ -167,7 +167,7 @@ describe("loadSubagentsSettings", () => {
 		const rootDir = await makeRoot();
 		const agentDir = join(rootDir, "agent");
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "subagents.json"), JSON.stringify({ maxConcurrent: 0, fallbackSubagent: "   " }));
+		await writeFile(join(agentDir, "teams.json"), JSON.stringify({ maxConcurrent: 0, fallbackSubagent: "   " }));
 		const settings = await loadSubagentsSettings(rootDir, { agentDir });
 		expect(settings.maxConcurrent).toBe(MIN_MAX_CONCURRENT);
 		expect(settings.fallbackSubagent).toBe("none");

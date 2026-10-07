@@ -7,12 +7,12 @@ import {
 	type RestoreDeps,
 	type RestoreObservation,
 	restoreRegisteredRuns,
-} from "../../extension-src/pi-subagents/app/restore.js";
+} from "../../extension-src/pi-teams/app/restore.js";
 import type {
 	AgentRegistryEntry,
 	PersistedRegistryEntry,
 	RestoreCompletionObservation,
-} from "../../extension-src/pi-subagents/app/run-registry.js";
+} from "../../extension-src/pi-teams/app/run-registry.js";
 
 function entry(overrides: Partial<AgentRegistryEntry> = {}): AgentRegistryEntry {
 	return {
@@ -24,9 +24,9 @@ function entry(overrides: Partial<AgentRegistryEntry> = {}): AgentRegistryEntry 
 		handle: {
 			kind: "process",
 			childId: "child-1",
-			socketPath: "/tmp/pi-subagents/child-1.sock",
+			socketPath: "/tmp/pi-teams/child-1.sock",
 			token: "opaque-test-token",
-			runDir: "/proj/.pi/subagents/sessions/child-1",
+			runDir: "/proj/.pi/teams/sessions/child-1",
 			launcher: { kind: "headless", childId: "child-1", pid: 4312, identity: { ownerToken: "owner-1" } },
 		},
 		cwd: "/proj/work",

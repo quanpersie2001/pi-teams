@@ -3,17 +3,17 @@
 // decision audit trail. Manager driven by FakeBackend — no model calls, no Pi.
 
 import { describe, expect, it } from "vitest";
-import { AgentManager } from "../../extension-src/pi-subagents/app/agent-manager.js";
-import { AgentRegistry } from "../../extension-src/pi-subagents/app/agent-registry.js";
+import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
+import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
 import type {
 	CompletionNotification,
 	DeliveryHost,
 	SessionSnapshot,
-} from "../../extension-src/pi-subagents/app/delivery-service.js";
-import { DeliveryService } from "../../extension-src/pi-subagents/app/delivery-service.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import type { AgentLifecycleEvent } from "../../extension-src/pi-subagents/domain/integration-protocol.js";
-import { isStaleExtensionCtxError } from "../../extension-src/pi-subagents/shared/stale-context.js";
+} from "../../extension-src/pi-teams/app/delivery-service.js";
+import { DeliveryService } from "../../extension-src/pi-teams/app/delivery-service.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
+import { isStaleExtensionCtxError } from "../../extension-src/pi-teams/shared/stale-context.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 
 interface Fixture {

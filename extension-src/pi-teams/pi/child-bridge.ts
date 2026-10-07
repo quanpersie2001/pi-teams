@@ -35,8 +35,8 @@ const MAX_TEXT_CHARS = 8_192;
 const MAX_REQUESTS = 512;
 const MAX_CONNECTIONS = 16;
 const MAX_SOCKET_PATH_BYTES = process.platform === "darwin" ? 103 : 107;
-const CHILD_ENV = "PI_SUBAGENTS_CHILD";
-const BOOTSTRAP_ENV = "PI_SUBAGENTS_BOOTSTRAP";
+const CHILD_ENV = "PI_TEAMS_CHILD";
+const BOOTSTRAP_ENV = "PI_TEAMS_BOOTSTRAP";
 const SOFT_LIMIT_NOTICE = "subagents: soft turn limit reached — steering the agent to wrap up.";
 const HARD_LIMIT_NOTICE = "subagents: hard turn limit reached — aborting the agent.";
 
@@ -1233,10 +1233,7 @@ async function closeChildSocket(handle: ChildSocketHandle): Promise<void> {
 
 export function installChildBridgeExtension(pi: ExtensionAPI): void {
 	if (process.env[CHILD_ENV] !== "1")
-		throw new ChildProtocolError(
-			"not_child",
-			"The child bridge extension can only run in a PI_SUBAGENTS_CHILD process",
-		);
+		throw new ChildProtocolError("not_child", "The child bridge extension can only run in a PI_TEAMS_CHILD process");
 	let bridge: ChildBridgeHandle | undefined;
 	let started = false;
 	let bootstrapPromise: Promise<ChildBootstrap> | undefined;
@@ -1372,7 +1369,7 @@ function createInteractiveHost(pi: ExtensionAPI, context: ExtensionContext): Chi
 		},
 		sendInbox: async (message) => {
 			pi.sendMessage(
-				{ customType: "pi-subagents-inbox", content: JSON.stringify(message), display: true },
+				{ customType: "pi-teams-inbox", content: JSON.stringify(message), display: true },
 				{ triggerTurn: false },
 			);
 		},

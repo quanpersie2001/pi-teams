@@ -26,7 +26,7 @@ import { ChildRpcClient } from "./child-rpc-client.js";
 import type { InboxToolPort } from "./tools.js";
 import { createInboxTools } from "./tools.js";
 
-const CHILD_ENV = "PI_SUBAGENTS_CHILD";
+const CHILD_ENV = "PI_TEAMS_CHILD";
 
 export interface HeadlessChildOptions {
 	/** Optional canonical native model/auth runtime, primarily for provider fixtures. */
@@ -103,7 +103,7 @@ function validateSessionFile(path: string | undefined, sessionDir: string): stri
 
 async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOptions): Promise<HeadlessChildHandle> {
 	if (process.env[CHILD_ENV] !== "1")
-		throw new ChildProtocolError("not_child", "The headless runtime can only run in a PI_SUBAGENTS_CHILD process");
+		throw new ChildProtocolError("not_child", "The headless runtime can only run in a PI_TEAMS_CHILD process");
 	const sessionDir = resolve(bootstrap.sessionDir);
 	await validateSessionDirectory(sessionDir);
 	const requestedSessionFile = validateSessionFile(bootstrap.sessionFile, sessionDir);
@@ -313,7 +313,7 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		},
 		sendInbox: async (message) => {
 			await session.sendCustomMessage(
-				{ customType: "pi-subagents-inbox", content: JSON.stringify(message), display: true },
+				{ customType: "pi-teams-inbox", content: JSON.stringify(message), display: true },
 				{ triggerTurn: false },
 			);
 		},
@@ -385,7 +385,7 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 /** Start a real, persistent, headless Pi child after its owner-only bootstrap is available. */
 export async function runHeadlessChild(options: HeadlessChildOptions = {}): Promise<HeadlessChildHandle> {
 	if (process.env[CHILD_ENV] !== "1")
-		throw new ChildProtocolError("not_child", "The headless runtime can only run in a PI_SUBAGENTS_CHILD process");
+		throw new ChildProtocolError("not_child", "The headless runtime can only run in a PI_TEAMS_CHILD process");
 	const bootstrap = parseChildBootstrap(options.bootstrap ?? (await loadChildBootstrap()));
 	return createRuntime(bootstrap, options);
 }

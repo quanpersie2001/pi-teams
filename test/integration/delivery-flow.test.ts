@@ -5,11 +5,11 @@
 // No real model calls, no real Pi.
 
 import { describe, expect, it } from "vitest";
-import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-subagents/app/index.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import type { AgentLifecycleEvent } from "../../extension-src/pi-subagents/domain/integration-protocol.js";
-import { SUBAGENT_NOTIFICATION_TYPE } from "../../extension-src/pi-subagents/features/notifications/index.js";
-import { createPiDeliveryHost } from "../../extension-src/pi-subagents/pi/delivery-host.js";
+import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
+import { TEAMMATE_NOTIFICATION_TYPE } from "../../extension-src/pi-teams/features/notifications/index.js";
+import { createPiDeliveryHost } from "../../extension-src/pi-teams/pi/delivery-host.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 import { FakePiHost } from "../helpers/fake-pi-host.js";
 
@@ -95,7 +95,7 @@ describe("delivery host integration", () => {
 		fixture.app.delivery?.dispose();
 	});
 
-	it("injects a subagent-notification custom message into the conversation on completion", async () => {
+	it("injects a teammate-notification custom message into the conversation on completion", async () => {
 		const fixture = await makeFixture({ sessionId: "session-a" });
 		const record = await fixture.app.manager.spawn({
 			type: "general-purpose",
@@ -108,7 +108,7 @@ describe("delivery host integration", () => {
 
 		expect(fixture.host.sentMessages).toHaveLength(1);
 		const sent = fixture.host.sentMessages[0];
-		expect(sent.message.customType).toBe(SUBAGENT_NOTIFICATION_TYPE);
+		expect(sent.message.customType).toBe(TEAMMATE_NOTIFICATION_TYPE);
 		expect(sent.message.display).toBe(true);
 		expect(String(sent.message.content)).toContain("Found 8 authentication-related files.");
 		expect(sent.options).toEqual({ deliverAs: "followUp", triggerTurn: true });

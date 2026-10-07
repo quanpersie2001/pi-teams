@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { loadAgentMarkdownFiles, resolveAgentSourceDirs } from "../../extension-src/pi-subagents/pi/agent-files.js";
+import { loadAgentMarkdownFiles, resolveAgentSourceDirs } from "../../extension-src/pi-teams/pi/agent-files.js";
 
 describe("loadAgentMarkdownFiles", () => {
 	let root: string;
@@ -10,7 +10,7 @@ describe("loadAgentMarkdownFiles", () => {
 	let projectDir: string;
 
 	beforeAll(async () => {
-		root = await mkdtemp(join(tmpdir(), "pi-subagents-agent-files-"));
+		root = await mkdtemp(join(tmpdir(), "pi-teams-agent-files-"));
 		globalDir = join(root, "global");
 		projectDir = join(root, "project");
 		await mkdir(globalDir, { recursive: true });

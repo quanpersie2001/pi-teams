@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { resolveAgentSnapshot } from "../../extension-src/pi-subagents/domain/agent-definition.js";
-import { EMPTY_USAGE } from "../../extension-src/pi-subagents/domain/agent-run.js";
+import { resolveAgentSnapshot } from "../../extension-src/pi-teams/domain/agent-definition.js";
+import { EMPTY_USAGE } from "../../extension-src/pi-teams/domain/agent-run.js";
 import {
 	isConversationOwner,
 	isExtensionOwner,
 	type ParentSessionRef,
-} from "../../extension-src/pi-subagents/domain/delivery.js";
+} from "../../extension-src/pi-teams/domain/delivery.js";
 import {
 	PROTOCOL_VERSION,
 	rpcError,
@@ -13,13 +13,13 @@ import {
 	subagentsRpcChannel,
 	subagentsRpcReplyChannel,
 	toRunSnapshot,
-} from "../../extension-src/pi-subagents/domain/integration-protocol.js";
-import { type TranscriptSnapshot, transcriptItemsAfter } from "../../extension-src/pi-subagents/domain/transcript.js";
+} from "../../extension-src/pi-teams/domain/integration-protocol.js";
+import { type TranscriptSnapshot, transcriptItemsAfter } from "../../extension-src/pi-teams/domain/transcript.js";
 import {
 	supportsChangedFiles,
 	type WorktreeInfo,
 	type WorktreeResult,
-} from "../../extension-src/pi-subagents/domain/worktree.js";
+} from "../../extension-src/pi-teams/domain/worktree.js";
 
 describe("transcript contract", () => {
 	it("returns only transcript items after the supplied cursor", () => {

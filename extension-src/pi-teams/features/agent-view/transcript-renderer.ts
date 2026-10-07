@@ -106,7 +106,7 @@ function assistantMessage(item: TranscriptItem): AssistantMessage {
 		role: "assistant",
 		content: item.text?.trim() ? [{ type: "text", text: item.text }] : [],
 		api: "openai-completions",
-		provider: "pi-subagents",
+		provider: "pi-teams",
 		model: "normalized-transcript",
 		// Normalized history has no native billing fields; this shape is needed
 		// only by the message renderer, not used as displayed run usage.

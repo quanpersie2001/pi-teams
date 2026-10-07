@@ -75,7 +75,7 @@ export class WorktreeService {
 		const packagePath = subdir ?? relative(baseRepo, realpathSync(original));
 		if (isAbsolute(packagePath) || packagePath === ".." || packagePath.startsWith(`..${sep}`))
 			throw new Error("Execution cwd must stay within the repository checkout.");
-		const checkoutRoot = join(this.tmpRoot, `pi-subagents-${runId}-${this.uniqueSuffix()}`);
+		const checkoutRoot = join(this.tmpRoot, `pi-teams-${runId}-${this.uniqueSuffix()}`);
 		await this.runGit(["worktree", "add", "--detach", checkoutRoot, baseSha], { cwd: baseRepo });
 		const canonicalCheckout = realpathSync(checkoutRoot);
 		let workPath: string;

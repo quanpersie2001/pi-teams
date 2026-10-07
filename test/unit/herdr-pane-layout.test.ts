@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { LauncherCommandRunner } from "../../extension-src/pi-subagents/domain/process-launcher.js";
-import { createHerdrPaneLayoutAdapter } from "../../extension-src/pi-subagents/pi/herdr-pane-layout.js";
+import type { LauncherCommandRunner } from "../../extension-src/pi-teams/domain/process-launcher.js";
+import { createHerdrPaneLayoutAdapter } from "../../extension-src/pi-teams/pi/herdr-pane-layout.js";
 
 // Native split trees observed in HerdR 0.9.1. Direction chooses the adjacent
 // boundary, not an unconditional height delta on the requested pane.

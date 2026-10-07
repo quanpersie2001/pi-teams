@@ -19,7 +19,7 @@ import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CompletionNotification, DeliveryHost, SessionSnapshot } from "../app/delivery-service.js";
 import type { InboxMessage } from "../domain/message.js";
-import { SUBAGENT_NOTIFICATION_TYPE } from "../features/notifications/index.js";
+import { TEAMMATE_NOTIFICATION_TYPE } from "../features/notifications/index.js";
 import { ignoreStaleExtensionCtx } from "../shared/stale-context.js";
 
 interface SessionManagerView {
@@ -101,7 +101,7 @@ export function createPiDeliveryHost(pi: ExtensionAPI, getContext: () => Extensi
 		ignoreStaleExtensionCtx(() => {
 			pi.sendMessage(
 				{
-					customType: SUBAGENT_NOTIFICATION_TYPE,
+					customType: TEAMMATE_NOTIFICATION_TYPE,
 					content,
 					display: true,
 					details: {

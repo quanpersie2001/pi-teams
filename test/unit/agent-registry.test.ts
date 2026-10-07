@@ -1,16 +1,16 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { LoadedAgentFile } from "../../extension-src/pi-subagents/app/agent-registry.js";
-import { AgentRegistry } from "../../extension-src/pi-subagents/app/agent-registry.js";
+import type { LoadedAgentFile } from "../../extension-src/pi-teams/app/agent-registry.js";
+import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
 import {
 	AgentFileError,
 	DEFAULT_BUILTIN_TOOL_NAMES,
 	normalizeAgentDefinition,
 	parseToolsField,
 	resolveAgentSnapshot,
-} from "../../extension-src/pi-subagents/domain/agent-definition.js";
-import { DEFAULT_SUBAGENTS_SETTINGS, sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import { loadAgentMarkdownFiles } from "../../extension-src/pi-subagents/pi/agent-files.js";
+} from "../../extension-src/pi-teams/domain/agent-definition.js";
+import { DEFAULT_SUBAGENTS_SETTINGS, sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import { loadAgentMarkdownFiles } from "../../extension-src/pi-teams/pi/agent-files.js";
 
 const FIXTURES = join(import.meta.dirname, "../fixtures/agents");
 const GLOBAL_DIR = join(FIXTURES, "global");

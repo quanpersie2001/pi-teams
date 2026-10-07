@@ -4,17 +4,17 @@
 // the full transport cycle lives in test/integration/pi-tasks-rpc.test.ts.
 
 import { describe, expect, it } from "vitest";
-import { AgentManager } from "../../extension-src/pi-subagents/app/agent-manager.js";
-import { AgentRegistry } from "../../extension-src/pi-subagents/app/agent-registry.js";
-import { IntegrationService } from "../../extension-src/pi-subagents/app/integration-service.js";
-import type { SubagentsSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
+import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
+import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
+import { IntegrationService } from "../../extension-src/pi-teams/app/integration-service.js";
+import type { SubagentsSettings } from "../../extension-src/pi-teams/domain/config.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
 import {
 	PROTOCOL_VERSION,
 	type RpcReply,
 	SUBAGENTS_RPC_OPS,
 	subagentsRpcReplyChannel,
-} from "../../extension-src/pi-subagents/domain/integration-protocol.js";
+} from "../../extension-src/pi-teams/domain/integration-protocol.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 
 interface CapturedReply {

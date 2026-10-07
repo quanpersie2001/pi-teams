@@ -7,8 +7,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createPiSubagentsApp } from "../../extension-src/pi-subagents/app/index.js";
-import { loadSubagentsSettings } from "../../extension-src/pi-subagents/pi/config-host.js";
+import { createPiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
+import { loadSubagentsSettings } from "../../extension-src/pi-teams/pi/config-host.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 import { FakePiHost } from "../helpers/fake-pi-host.js";
 
@@ -22,15 +22,15 @@ afterEach(async () => {
 });
 
 describe("session_start settings load", () => {
-	it("reads a temp project .pi/subagents.json and propagates it to registry + manager", async () => {
-		root = await mkdtemp(join(tmpdir(), "pi-subagents-settings-int-"));
+	it("reads a temp project .pi/teams.json and propagates it to registry + manager", async () => {
+		root = await mkdtemp(join(tmpdir(), "pi-teams-settings-int-"));
 		const project = join(root, "project");
 		const agentDir = join(root, "agent");
 		await mkdir(join(project, ".pi"), { recursive: true });
 		// Manager directly reflects maxConcurrent; fallbackSubagent exercises
 		// the sanitized merge end-to-end as well.
 		await writeFile(
-			join(project, ".pi", "subagents.json"),
+			join(project, ".pi", "teams.json"),
 			JSON.stringify({ maxConcurrent: 7, fallbackSubagent: "general-purpose" }),
 		);
 
@@ -60,7 +60,7 @@ describe("session_start settings load", () => {
 	});
 
 	it("falls back to defaults when no settings file exists anywhere", async () => {
-		root = await mkdtemp(join(tmpdir(), "pi-subagents-settings-int-"));
+		root = await mkdtemp(join(tmpdir(), "pi-teams-settings-int-"));
 		const project = join(root, "project");
 		const agentDir = join(root, "agent");
 		await mkdir(project, { recursive: true });

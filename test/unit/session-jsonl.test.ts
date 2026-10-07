@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { readTranscriptItems } from "../../extension-src/pi-subagents/pi/session-jsonl.js";
+import { readTranscriptItems } from "../../extension-src/pi-teams/pi/session-jsonl.js";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -13,7 +13,7 @@ afterEach(async () => {
 });
 
 async function makeSession(content: string): Promise<string> {
-	const dir = await mkdtemp(join(tmpdir(), "subagents-session-"));
+	const dir = await mkdtemp(join(tmpdir(), "teams-session-"));
 	tempDirs.push(dir);
 	await writeFile(join(dir, "session.jsonl"), content, "utf8");
 	return dir;

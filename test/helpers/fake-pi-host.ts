@@ -480,7 +480,7 @@ export class FakePiHost {
 					return (await closed.promise) as never;
 				}
 				options.onHandle?.(handle as never);
-				this.componentFactories.set("pi-subagents.fake-overlay", (() => component) as never);
+				this.componentFactories.set("pi-teams.fake-overlay", (() => component) as never);
 				for (const resolve of this.overlayOpenWaiters.splice(0)) resolve(overlay);
 				this.requestRender();
 				return (await closed.promise) as never;

@@ -9,10 +9,10 @@ import {
 	buildAgentListView,
 	buildAgentTranscriptView,
 	TRANSCRIPT_TAIL_ITEMS,
-} from "../../extension-src/pi-subagents/app/ui-snapshot.js";
-import type { AgentRun } from "../../extension-src/pi-subagents/domain/agent-run.js";
-import { EMPTY_USAGE } from "../../extension-src/pi-subagents/domain/agent-run.js";
-import type { TranscriptItem } from "../../extension-src/pi-subagents/domain/transcript.js";
+} from "../../extension-src/pi-teams/app/ui-snapshot.js";
+import type { AgentRun } from "../../extension-src/pi-teams/domain/agent-run.js";
+import { EMPTY_USAGE } from "../../extension-src/pi-teams/domain/agent-run.js";
+import type { TranscriptItem } from "../../extension-src/pi-teams/domain/transcript.js";
 
 let nextId = 0;
 

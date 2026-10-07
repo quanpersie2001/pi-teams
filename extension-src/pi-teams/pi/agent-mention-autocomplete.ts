@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import type { AgentRegistry } from "../app/agent-registry.js";
 
-const MENTION_PREFIX = "\u0000pi-subagents-agent-mention\u0000";
+const MENTION_PREFIX = "\u0000pi-teams-agent-mention\u0000";
 const installedContexts = new WeakSet<object>();
 
 type CompletionOrigin =

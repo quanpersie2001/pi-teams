@@ -2,7 +2,7 @@
 
 ## 1. System boundary
 
-`pi-subagents` owns specialist definitions and `AgentRun` execution. Task status, dependencies, priority, assignment/retry, acceptance criteria and review belong to consumers such as `pi-tasks`.
+`pi-teams` owns specialist definitions and `AgentRun` execution. Task status, dependencies, priority, assignment/retry, acceptance criteria and review belong to consumers such as `pi-tasks`.
 
 ```text
 model tools / agent UI / extension consumers
@@ -23,7 +23,7 @@ Every specialist runs in an independent process. SDK creates the native session 
 ## 2. Repository and layers
 
 ```text
-extension-src/pi-subagents/
+extension-src/pi-teams/
 ├── shared/     host-independent primitives
 ├── domain/     contracts, state transitions and policies
 ├── features/   isolated UI surfaces
@@ -66,7 +66,7 @@ Steering is a command, not a lifecycle state. Backend `disconnected` is unknown 
 
 `Agent.prepareLoadout` exposes canonical enabled specialist names/effective descriptions before each model turn. `pi/agent-mention-autocomplete.ts` wraps public `ctx.ui.addAutocompleteProvider`, merges native/agent suggestions and delegates acceptance to the owning provider. It neither replaces the editor nor launches children.
 
-Build emits `dist/extensions/pi-subagents.js`, `child-bridge.js`, `headless-child.js` and shared chunks. Interactive launchers resolve the installed supported Pi peer's CLI, not global `pi` from PATH.
+Build emits `dist/extensions/pi-teams.js`, `child-bridge.js`, `headless-child.js` and shared chunks. Interactive launchers resolve the installed supported Pi peer's CLI, not global `pi` from PATH.
 
 ## 5. AgentManager
 
@@ -115,7 +115,7 @@ Incompatible live receipts are preserved without adopting their control credenti
 
 ## 9. Launcher selection
 
-New launches resolve their launcher hint in this order: the session `/sub-agents-backend` runtime switch (`auto`/`headless`), then the `PI_SUBAGENTS_BACKEND` env override (`auto|herdr|tmux|headless`), then the `backend` settings key (`auto`/`headless`), then `auto`. It is a launcher hint, not an alternate execution backend. Auto chooses the first available launcher:
+New launches resolve their launcher hint in this order: the session `/teams-backend` runtime switch (`auto`/`headless`), then the `PI_TEAMS_BACKEND` env override (`auto|herdr|tmux|headless`), then the `backend` settings key (`auto`/`headless`), then `auto`. It is a launcher hint, not an alternate execution backend. Auto chooses the first available launcher:
 
 ```text
 auto → HerdR → tmux → independent headless child
@@ -129,7 +129,7 @@ Adding a full-height column reparents the prior column's lower rows beneath its 
 
 ## 10. Durable registry and recovery
 
-Registry/history live under the nearest original-project `.pi/subagents/`; bootstraps and native sessions live under `sessions/<child-id>/`. Atomic registry writes use `0600` because handles include control credentials. Corrupt registry data is not silently rewritten as empty; incompatible records remain preserved.
+Registry/history live under the nearest original-project `.pi/teams/`; bootstraps and native sessions live under `sessions/<child-id>/`. Atomic registry writes use `0600` because handles include control credentials. Corrupt registry data is not silently rewritten as empty; incompatible records remain preserved.
 
 Restore validates bootstrap identity, authenticates RPC and reconciles native outcomes. Stored terminal results stay authoritative even if their process later disappears. Verified child loss sets `BackendStatus.outcomeUnavailable`: it fails an active execution but cannot overwrite a saved terminal result/error.
 
@@ -143,7 +143,7 @@ Resume is always cold: validate saved bootstrap, admit its model, open persisted
 
 ## 11. Model tools and recursion guard
 
-Parent orchestration tools are `Agent`, `get_subagent_result`, `steer_subagent`; stop/release use UI, commands or integration. Children set `PI_SUBAGENTS_CHILD=1`, omit the parent orchestration extension and exclude these tools.
+Parent orchestration tools are `Agent`, `get_subagent_result`, `steer_subagent`; stop/release use UI, commands or integration. Children set `PI_TEAMS_CHILD=1`, omit the parent orchestration extension and exclude these tools.
 
 `Agent` accepts only implemented inputs. Instance `name`, `inherit_context` and invocation `isolation` are unsupported; supply context in the prompt and configure isolation on the specialist/master switch.
 

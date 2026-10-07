@@ -3,8 +3,8 @@ import type {
 	ChildLaunchSpec,
 	LauncherHandle,
 	ProcessLauncher,
-} from "../../extension-src/pi-subagents/domain/process-launcher.js";
-import { type PaneGeometry, withTerminalPaneLayout } from "../../extension-src/pi-subagents/pi/terminal-pane-layout.js";
+} from "../../extension-src/pi-teams/domain/process-launcher.js";
+import { type PaneGeometry, withTerminalPaneLayout } from "../../extension-src/pi-teams/pi/terminal-pane-layout.js";
 
 type PaneTree = { paneId: string } | { direction: "right" | "down"; ratio: number; first: PaneTree; second: PaneTree };
 

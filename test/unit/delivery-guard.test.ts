@@ -7,7 +7,7 @@ import {
 	evaluateDeliveryGuard,
 	previewOf,
 	shouldDeliverToConversation,
-} from "../../extension-src/pi-subagents/app/delivery-service.js";
+} from "../../extension-src/pi-teams/app/delivery-service.js";
 
 function guard(overrides: Partial<DeliveryGuardInput> = {}) {
 	return evaluateDeliveryGuard({

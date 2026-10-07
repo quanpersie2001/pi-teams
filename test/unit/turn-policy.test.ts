@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decideTurnEvent, SOFT_STEER_MESSAGE } from "../../extension-src/pi-subagents/app/turn-policy.js";
+import { decideTurnEvent, SOFT_STEER_MESSAGE } from "../../extension-src/pi-teams/app/turn-policy.js";
 
 describe("decideTurnEvent", () => {
 	describe("unlimited (maxTurnLimit undefined or 0)", () => {

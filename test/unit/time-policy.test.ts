@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decideTimeBudget, nextBudgetDeadlineAt } from "../../extension-src/pi-subagents/domain/time-policy.js";
+import { decideTimeBudget, nextBudgetDeadlineAt } from "../../extension-src/pi-teams/domain/time-policy.js";
 
 const START = 1_000_000;
 

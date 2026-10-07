@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createModelAdmission } from "../../extension-src/pi-subagents/pi/model-admission.js";
+import { createModelAdmission } from "../../extension-src/pi-teams/pi/model-admission.js";
 
 interface FixtureModel {
 	id: string;
@@ -29,7 +29,7 @@ let agentDir: string;
 let originalEnvironment: NodeJS.ProcessEnv;
 
 beforeEach(async () => {
-	root = await mkdtemp(join(tmpdir(), "subagents-model-admission-"));
+	root = await mkdtemp(join(tmpdir(), "teams-model-admission-"));
 	agentDir = join(root, "agent");
 	await mkdir(agentDir);
 	originalEnvironment = process.env;

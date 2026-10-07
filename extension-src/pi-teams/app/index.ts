@@ -1,4 +1,4 @@
-// Application composition root for the pi-subagents runtime (ARCHITECTURE.md §4).
+// Application composition root for the pi-teams runtime (ARCHITECTURE.md §4).
 //
 // Host-injectable by contract: concrete adapters (agent-file loader, backend
 // instances, session id source, durable registry store, restore observers) are
@@ -202,7 +202,7 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 				recordCompleted: (entry) => store.recordCompleted(entry),
 				persist: (kept) => store.writeRegistry([...kept, ...retainedForeign]),
 				rememberAgents: options.settings.rememberAgents,
-				warn: (message) => console.warn(`[pi-subagents] ${message}`),
+				warn: (message) => console.warn(`[pi-teams] ${message}`),
 				now: () => Date.now(),
 			});
 			this.lastRestoreSummary = summary;

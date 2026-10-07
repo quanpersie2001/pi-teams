@@ -6,7 +6,7 @@ import {
 	decodeChildFrame,
 	encodeChildFrame,
 	parseChildRequest,
-} from "../../extension-src/pi-subagents/domain/child-protocol.js";
+} from "../../extension-src/pi-teams/domain/child-protocol.js";
 
 const validState: ChildState = {
 	childId: "child-a",

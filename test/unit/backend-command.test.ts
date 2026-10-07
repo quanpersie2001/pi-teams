@@ -1,12 +1,12 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import type { BackendSelector } from "../../extension-src/pi-subagents/domain/config.js";
-import type { ProcessLauncher } from "../../extension-src/pi-subagents/domain/process-launcher.js";
-import { type BackendModePort, registerBackendCommand } from "../../extension-src/pi-subagents/pi/commands.js";
+import type { BackendSelector } from "../../extension-src/pi-teams/domain/config.js";
+import type { ProcessLauncher } from "../../extension-src/pi-teams/domain/process-launcher.js";
+import { type BackendModePort, registerBackendCommand } from "../../extension-src/pi-teams/pi/commands.js";
 import {
 	ProcessAgentExecutionBackend,
 	resolveSessionLauncherHint,
-} from "../../extension-src/pi-subagents/pi/process-backend.js";
+} from "../../extension-src/pi-teams/pi/process-backend.js";
 
 interface CapturedNotification {
 	message: string;
@@ -52,7 +52,7 @@ function captureCommand(): {
 	let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
 	const pi = {
 		registerCommand: (name: string, options: { handler: typeof handler }) => {
-			if (name === "sub-agents-backend") handler = options.handler;
+			if (name === "teams-backend") handler = options.handler;
 		},
 	} as unknown as Pick<ExtensionAPI, "registerCommand">;
 	return {
@@ -64,7 +64,7 @@ function captureCommand(): {
 	};
 }
 
-describe("/sub-agents-backend command", () => {
+describe("/teams-backend command", () => {
 	it("registers under its own name", () => {
 		const { pi } = captureCommand();
 		registerBackendCommand(pi as ExtensionAPI, { backend: stubBackend("auto") });
@@ -113,7 +113,7 @@ describe("/sub-agents-backend command", () => {
 			await handler(bad, ctx);
 			expect(backend.hint).toBe("auto");
 			expect(notifications[0]?.type).toBe("error");
-			expect(notifications[0]?.message).toContain("Usage: /sub-agents-backend [auto|headless]");
+			expect(notifications[0]?.message).toContain("Usage: /teams-backend [auto|headless]");
 		}
 	});
 
@@ -126,17 +126,17 @@ describe("/sub-agents-backend command", () => {
 	});
 
 	it("notes an active env override in status output", async () => {
-		const previous = process.env.PI_SUBAGENTS_BACKEND;
-		process.env.PI_SUBAGENTS_BACKEND = "headless";
+		const previous = process.env.PI_TEAMS_BACKEND;
+		process.env.PI_TEAMS_BACKEND = "headless";
 		try {
 			const { pi, handler } = captureCommand();
 			registerBackendCommand(pi as ExtensionAPI, { backend: stubBackend("headless") });
 			const { ctx, notifications } = commandContext();
 			await handler("", ctx);
-			expect(notifications[0]?.message).toContain("PI_SUBAGENTS_BACKEND=headless");
+			expect(notifications[0]?.message).toContain("PI_TEAMS_BACKEND=headless");
 		} finally {
-			if (previous === undefined) delete process.env.PI_SUBAGENTS_BACKEND;
-			else process.env.PI_SUBAGENTS_BACKEND = previous;
+			if (previous === undefined) delete process.env.PI_TEAMS_BACKEND;
+			else process.env.PI_TEAMS_BACKEND = previous;
 		}
 	});
 });
@@ -145,18 +145,18 @@ describe("resolveSessionLauncherHint", () => {
 	it("uses the settings mode when the env var is unset", () => {
 		expect(resolveSessionLauncherHint({}, "auto")).toBe("auto");
 		expect(resolveSessionLauncherHint({}, "headless")).toBe("headless");
-		expect(resolveSessionLauncherHint({ PI_SUBAGENTS_BACKEND: "  " }, "headless")).toBe("headless");
+		expect(resolveSessionLauncherHint({ PI_TEAMS_BACKEND: "  " }, "headless")).toBe("headless");
 	});
 
 	it("lets the env var override settings, including forced launchers", () => {
-		expect(resolveSessionLauncherHint({ PI_SUBAGENTS_BACKEND: "headless" }, "auto")).toBe("headless");
-		expect(resolveSessionLauncherHint({ PI_SUBAGENTS_BACKEND: "tmux" }, "headless")).toBe("tmux");
-		expect(resolveSessionLauncherHint({ PI_SUBAGENTS_BACKEND: " herdr " }, "auto")).toBe("herdr");
+		expect(resolveSessionLauncherHint({ PI_TEAMS_BACKEND: "headless" }, "auto")).toBe("headless");
+		expect(resolveSessionLauncherHint({ PI_TEAMS_BACKEND: "tmux" }, "headless")).toBe("tmux");
+		expect(resolveSessionLauncherHint({ PI_TEAMS_BACKEND: " herdr " }, "auto")).toBe("herdr");
 	});
 
 	it("rejects invalid env values instead of guessing", () => {
-		expect(() => resolveSessionLauncherHint({ PI_SUBAGENTS_BACKEND: "vscode" }, "auto")).toThrow(
-			/Unsupported PI_SUBAGENTS_BACKEND/,
+		expect(() => resolveSessionLauncherHint({ PI_TEAMS_BACKEND: "vscode" }, "auto")).toThrow(
+			/Unsupported PI_TEAMS_BACKEND/,
 		);
 	});
 });

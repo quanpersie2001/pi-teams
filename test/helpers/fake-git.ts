@@ -3,7 +3,7 @@
 
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { GitRunner } from "../../extension-src/pi-subagents/app/worktree-service.js";
+import type { GitRunner } from "../../extension-src/pi-teams/app/worktree-service.js";
 
 export const BASE_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f900aabbccdd";
 export const COMMITTED_SHA = "9988776655443322110099887766554433221100";

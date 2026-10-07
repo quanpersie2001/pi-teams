@@ -41,8 +41,8 @@ const TICK_MS = 1000;
 /** Two deliberate presses, rather than a held key or an old boundary press. */
 const HUB_DOUBLE_LEFT_MS = 500;
 
-const PANEL_WIDGET_KEY = "subagents-agents";
-const STATUS_KEY = "subagents";
+const PANEL_WIDGET_KEY = "teams-agents";
+const STATUS_KEY = "teams";
 
 export interface SubagentsUiOptions {
 	manager: AgentManager;

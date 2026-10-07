@@ -18,7 +18,7 @@
 //
 // Fast path (optional optimization, docs/INTEGRATION.md): the live
 // IntegrationService instance is registered under
-// `Symbol.for("pi-subagents:service")` on globalThis for same-process callers
+// `Symbol.for("pi-teams:service")` on globalThis for same-process callers
 // that want direct method access. This is NOT the public contract — events RPC
 // remains the compatibility boundary, and anything not going through the
 // versioned channels bypasses protocol versioning at its own risk. The key is
@@ -30,7 +30,7 @@ import { IntegrationService } from "../app/integration-service.js";
 import type { AgentLifecycleEvent } from "../domain/integration-protocol.js";
 
 /** globalThis key of the optional in-process fast path (not the public boundary). */
-export const SUBAGENTS_SERVICE_KEY: unique symbol = Symbol.for("pi-subagents:service");
+export const SUBAGENTS_SERVICE_KEY: unique symbol = Symbol.for("pi-teams:service");
 
 /** Lifecycle broadcast payload: domain event + consumer-facing id alias. */
 export type LifecycleBroadcast = AgentLifecycleEvent & {

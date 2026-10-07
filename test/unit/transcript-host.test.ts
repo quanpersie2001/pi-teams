@@ -6,16 +6,16 @@ import { mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { AgentRun } from "../../extension-src/pi-subagents/domain/agent-run.js";
-import { EMPTY_USAGE } from "../../extension-src/pi-subagents/domain/agent-run.js";
-import type { AgentBackendHandle, AgentExecutionBackend } from "../../extension-src/pi-subagents/domain/backend.js";
-import type { TranscriptItem } from "../../extension-src/pi-subagents/domain/transcript.js";
-import { createPiTranscriptSource, TAIL_WINDOW_ITEMS } from "../../extension-src/pi-subagents/pi/transcript-host.js";
+import type { AgentRun } from "../../extension-src/pi-teams/domain/agent-run.js";
+import { EMPTY_USAGE } from "../../extension-src/pi-teams/domain/agent-run.js";
+import type { AgentBackendHandle, AgentExecutionBackend } from "../../extension-src/pi-teams/domain/backend.js";
+import type { TranscriptItem } from "../../extension-src/pi-teams/domain/transcript.js";
+import { createPiTranscriptSource, TAIL_WINDOW_ITEMS } from "../../extension-src/pi-teams/pi/transcript-host.js";
 
 let dir: string;
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), "subagents-transcript-"));
+	dir = mkdtempSync(join(tmpdir(), "teams-transcript-"));
 });
 
 afterEach(() => {

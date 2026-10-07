@@ -320,7 +320,7 @@ export class DeliveryService {
 			// in both cases the result stays recoverable (never deleted).
 			record(isStaleExtensionCtxError(error) ? "stale-ctx-swallowed" : "send-failed");
 			if (!isStaleExtensionCtxError(error)) {
-				console.warn(`[pi-subagents] delivery of agent ${event.agentId} failed: ${String(error)}`);
+				console.warn(`[pi-teams] delivery of agent ${event.agentId} failed: ${String(error)}`);
 			}
 			return;
 		}

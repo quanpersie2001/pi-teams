@@ -1,7 +1,7 @@
 // Host adapter: operational settings I/O (docs/CONFIGURATION.md §5).
 //
-// Global settings live at ~/.pi/agent/subagents.json; project overrides at
-// <project>/.pi/subagents.json. Project keys override global keys shallowly;
+// Global settings live at ~/.pi/agent/teams.json; project overrides at
+// <project>/.pi/teams.json. Project keys override global keys shallowly;
 // the merged raw object is then sanitized by the pure domain function.
 // Missing/unreadable/unparseable files are tolerated and never throw: a
 // corrupt file logs a warning and contributes no keys, while the other level
@@ -16,15 +16,15 @@ import { type SubagentsSettings, sanitizeSettings } from "../domain/config.js";
 
 /** Resolved settings file paths for one host cwd. */
 export interface SettingsFilePaths {
-	/** ~/.pi/agent/subagents.json — global defaults. */
+	/** ~/.pi/agent/teams.json — global defaults. */
 	global: string;
-	/** <project>/.pi/subagents.json — project overrides. */
+	/** <project>/.pi/teams.json — project overrides. */
 	project: string;
 }
 
 /** Handles for environment-dependent parts of the read (injectable in tests). */
 export interface LoadSettingsHandlers {
-	/** Warning sink; defaults to console.warn with a [pi-subagents] prefix. */
+	/** Warning sink; defaults to console.warn with a [pi-teams] prefix. */
 	warn?: (message: string) => void;
 	/** Override the global agent dir (tests avoid the real ~/.pi/agent). */
 	agentDir?: string;
@@ -38,11 +38,11 @@ export function resolveSettingsPaths(configCwd: string, agentDir = getAgentDir()
 }
 
 export function globalSettingsPath(agentDir = getAgentDir()): string {
-	return join(agentDir, "subagents.json");
+	return join(agentDir, "teams.json");
 }
 
 export function projectSettingsPath(configCwd: string): string {
-	return join(configCwd, ".pi", "subagents.json");
+	return join(configCwd, ".pi", "teams.json");
 }
 
 /**
@@ -87,7 +87,7 @@ export async function loadSubagentsSettings(
 	configCwd: string,
 	handlers: LoadSettingsHandlers = {},
 ): Promise<SubagentsSettings> {
-	const warn = handlers.warn ?? ((message: string) => console.warn(`[pi-subagents] ${message}`));
+	const warn = handlers.warn ?? ((message: string) => console.warn(`[pi-teams] ${message}`));
 	const paths = resolveSettingsPaths(configCwd, handlers.agentDir);
 	const [global, project] = await Promise.all([
 		readRawJson(paths.global, "global settings file", warn),

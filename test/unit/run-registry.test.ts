@@ -6,20 +6,17 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type {
-	AgentRegistryEntry,
-	CompletedRunHistoryEntry,
-} from "../../extension-src/pi-subagents/app/run-registry.js";
+import type { AgentRegistryEntry, CompletedRunHistoryEntry } from "../../extension-src/pi-teams/app/run-registry.js";
 import {
 	coerceRegistryEntry,
 	isIncompatibleRegistryEntry,
 	isSerializableBackendHandle,
-} from "../../extension-src/pi-subagents/app/run-registry.js";
+} from "../../extension-src/pi-teams/app/run-registry.js";
 import {
 	createSubagentRunStore,
 	historyFilePath,
 	registryFilePath,
-} from "../../extension-src/pi-subagents/pi/registry-host.js";
+} from "../../extension-src/pi-teams/pi/registry-host.js";
 
 const tempRoots: string[] = [];
 
@@ -32,7 +29,7 @@ afterEach(() => {
 });
 
 async function makeProject(): Promise<{ root: string; cwd: string; piDir: string }> {
-	const root = await mkdtemp(join(tmpdir(), "pi-subagents-registry-"));
+	const root = await mkdtemp(join(tmpdir(), "pi-teams-registry-"));
 	tempRoots.push(root);
 	mkdirSync(join(root, ".pi"), { recursive: true });
 	const cwd = join(root, "work");
@@ -50,9 +47,9 @@ function entry(overrides: Partial<AgentRegistryEntry> = {}): AgentRegistryEntry 
 		handle: {
 			kind: "process",
 			childId: "child-1",
-			socketPath: "/tmp/subagents/child-1.sock",
+			socketPath: "/tmp/teams/child-1.sock",
 			token: "opaque-test-token",
-			runDir: "/proj/.pi/subagents/sessions/child-1",
+			runDir: "/proj/.pi/teams/sessions/child-1",
 			launcher: {
 				kind: "headless",
 				childId: "child-1",
@@ -60,7 +57,7 @@ function entry(overrides: Partial<AgentRegistryEntry> = {}): AgentRegistryEntry 
 				identity: { startTime: "now", ownerToken: "owner-1" },
 			},
 		},
-		sessionFile: "/proj/.pi/subagents/sessions/run-1/agent-run-explore-run1.jsonl",
+		sessionFile: "/proj/.pi/teams/sessions/run-1/agent-run-explore-run1.jsonl",
 		cwd: "/proj/work",
 		configCwd: "/proj",
 		owner: { kind: "conversation", sessionId: "sess-1" },
@@ -71,12 +68,12 @@ function entry(overrides: Partial<AgentRegistryEntry> = {}): AgentRegistryEntry 
 }
 
 describe("registry roundtrip", () => {
-	it("writes and reads entries at .pi/subagents/registry.json", async () => {
+	it("writes and reads entries at .pi/teams/registry.json", async () => {
 		const project = await makeProject();
 		const store = createSubagentRunStore(project.cwd);
 		store.writeRegistry([entry(), entry({ id: "run-2", status: "running" })]);
 
-		expect(registryFilePath(project.cwd)).toBe(join(project.piDir, "subagents", "registry.json"));
+		expect(registryFilePath(project.cwd)).toBe(join(project.piDir, "teams", "registry.json"));
 		expect(store.readRegistry()).toHaveLength(2);
 		expect(store.readRegistry()[0]).toMatchObject({ id: "run-1", status: "running" });
 	});
@@ -103,7 +100,7 @@ describe("registry roundtrip", () => {
 describe("fail-closed registry persistence", () => {
 	it("preserves corrupt registry bytes instead of rewriting the file", async () => {
 		const project = await makeProject();
-		mkdirSync(join(project.piDir, "subagents"), { recursive: true });
+		mkdirSync(join(project.piDir, "teams"), { recursive: true });
 		const original = "{ this is not json";
 		writeFileSync(registryFilePath(project.cwd), original, "utf8");
 
@@ -114,7 +111,7 @@ describe("fail-closed registry persistence", () => {
 
 	it("preserves non-array registry bytes instead of rewriting the file", async () => {
 		const project = await makeProject();
-		mkdirSync(join(project.piDir, "subagents"), { recursive: true });
+		mkdirSync(join(project.piDir, "teams"), { recursive: true });
 		const original = JSON.stringify({ oops: true });
 		writeFileSync(registryFilePath(project.cwd), original, "utf8");
 
@@ -124,7 +121,7 @@ describe("fail-closed registry persistence", () => {
 
 	it("retains incompatible rows without adopting or dropping their raw data", async () => {
 		const project = await makeProject();
-		mkdirSync(join(project.piDir, "subagents"), { recursive: true });
+		mkdirSync(join(project.piDir, "teams"), { recursive: true });
 		const rawRows = [entry(), { nope: true }, "junk"];
 		writeFileSync(registryFilePath(project.cwd), JSON.stringify(rawRows), "utf8");
 
@@ -159,7 +156,7 @@ describe("history upsert", () => {
 		store.recordCompleted(completed);
 		store.recordCompleted({ ...completed, result: "updated after retry" });
 
-		expect(historyFilePath(project.cwd)).toBe(join(project.piDir, "subagents", "history.json"));
+		expect(historyFilePath(project.cwd)).toBe(join(project.piDir, "teams", "history.json"));
 		const history = store.readHistory();
 		expect(history).toHaveLength(1);
 		expect(history[0]).toMatchObject({ id: "run-1", completedAt: 2000, result: "updated after retry" });
@@ -173,7 +170,7 @@ describe("history upsert", () => {
 
 	it("skips history rows without completedAt", async () => {
 		const project = await makeProject();
-		mkdirSync(join(project.piDir, "subagents"), { recursive: true });
+		mkdirSync(join(project.piDir, "teams"), { recursive: true });
 		writeFileSync(historyFilePath(project.cwd), JSON.stringify([{ id: "x" }]), "utf8");
 		vi.spyOn(console, "warn").mockImplementation(() => {});
 

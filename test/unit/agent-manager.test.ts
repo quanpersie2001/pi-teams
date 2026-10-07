@@ -4,16 +4,16 @@
 // process FakeBackend — no external model calls.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentManager } from "../../extension-src/pi-subagents/app/agent-manager.js";
-import { AgentRegistry, type LoadedAgentFile } from "../../extension-src/pi-subagents/app/agent-registry.js";
+import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
+import { AgentRegistry, type LoadedAgentFile } from "../../extension-src/pi-teams/app/agent-registry.js";
 import type {
 	AgentRegistryEntry,
 	PersistedRegistryEntry,
 	SubagentRunStore,
-} from "../../extension-src/pi-subagents/app/run-registry.js";
-import type { SubagentsSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import type { AgentLifecycleEvent } from "../../extension-src/pi-subagents/domain/integration-protocol.js";
+} from "../../extension-src/pi-teams/app/run-registry.js";
+import type { SubagentsSettings } from "../../extension-src/pi-teams/domain/config.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 
 interface ManagerFixture {

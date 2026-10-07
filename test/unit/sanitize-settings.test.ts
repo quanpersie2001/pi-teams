@@ -4,7 +4,7 @@ import {
 	MAX_MAX_CONCURRENT,
 	MIN_MAX_CONCURRENT,
 	sanitizeSettings,
-} from "../../extension-src/pi-subagents/domain/config.js";
+} from "../../extension-src/pi-teams/domain/config.js";
 
 describe("sanitizeSettings", () => {
 	it("keeps valid values as-is", () => {
@@ -43,7 +43,7 @@ describe("sanitizeSettings", () => {
 		expect(sanitizeSettings({ backend: "auto" }).backend).toBe("auto");
 		expect(sanitizeSettings({ backend: "headless" }).backend).toBe("headless");
 		expect(sanitizeSettings({}).backend).toBe("auto");
-		// herdr/tmux forcing is env-only (PI_SUBAGENTS_BACKEND); settings reject it.
+		// herdr/tmux forcing is env-only (PI_TEAMS_BACKEND); settings reject it.
 		expect(sanitizeSettings({ backend: "herdr" }).backend).toBe("auto");
 		expect(sanitizeSettings({ backend: "tmux" }).backend).toBe("auto");
 		expect(sanitizeSettings({ backend: " TMUX " }).backend).toBe("auto");

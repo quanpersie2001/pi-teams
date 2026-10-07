@@ -109,8 +109,8 @@ Semantics:
 ## 5. Operational settings
 
 ```text
-~/.pi/agent/subagents.json       global defaults (Pi agent directory)
-<configCwd>/.pi/subagents.json  project overrides
+~/.pi/agent/teams.json       global defaults (Pi agent directory)
+<configCwd>/.pi/teams.json  project overrides
 ```
 
 Defaults:
@@ -145,7 +145,7 @@ Defaults:
 | `strictAgentFiles` | Strict mode fails loading on malformed files or validated invalid fields, naming the source path. Lenient mode skips unreadable/unparseable files, but corrects invalid fields with warnings while retaining the specialist. |
 | `fallbackSubagent` | Specialist name to use when requested type is unknown/disabled/ambiguous; `none` rejects. Empty/mistyped values default to `none`. |
 | `agentPanel` | Enables inline panel, Hub and remote child focus; no effect on lifecycle or automatic cleanup. |
-| `backend` | Multiplexer mode: `auto` (default) detects HerdR → tmux with a headless fallback; `headless` never attaches a multiplexer. Explicit `herdr`/`tmux` forcing is env-only. `/sub-agents-backend [auto\|headless]` switches the mode for the current session (future launches only). |
+| `backend` | Multiplexer mode: `auto` (default) detects HerdR → tmux with a headless fallback; `headless` never attaches a multiplexer. Explicit `herdr`/`tmux` forcing is env-only. `/teams-backend [auto\|headless]` switches the mode for the current session (future launches only). |
 
 Both settings files are read at each `session_start`, merged per key (`project > global`), then sanitized. Missing/unreadable files contribute nothing; corrupt JSON warns and contributes nothing. Unknown keys are dropped and mistyped values use built-in defaults. Project values are not sanitized independently before overriding global values. The runtime only reads these files; operators own edits.
 
@@ -154,13 +154,13 @@ Both settings files are read at each `session_start`, merged per key (`project >
 Selection precedence for new launches:
 
 ```text
-/sub-agents-backend <mode>   (runtime, current session; auto | headless)
-    > PI_SUBAGENTS_BACKEND   (env; auto | herdr | tmux | headless)
+/teams-backend <mode>   (runtime, current session; auto | headless)
+    > PI_TEAMS_BACKEND   (env; auto | herdr | tmux | headless)
     > settings "backend"    (project > global; auto | headless)
     > auto
 ```
 
-`auto` picks the first available launcher — HerdR, then tmux, then an independent headless process — so explicit herdr/tmux forcing is normally unnecessary. `/sub-agents-backend` without arguments reports the current mode, what auto detects, and any active env override; switching affects only future launches (started children keep their launcher) and resets at the next session start. A forced unavailable launcher fails explicitly; launch failure does not silently switch implementation: Headless uses native SDK in its own child process, never the parent.
+`auto` picks the first available launcher — HerdR, then tmux, then an independent headless process — so explicit herdr/tmux forcing is normally unnecessary. `/teams-backend` without arguments reports the current mode, what auto detects, and any active env override; switching affects only future launches (started children keep their launcher) and resets at the next session start. A forced unavailable launcher fails explicitly; launch failure does not silently switch implementation: Headless uses native SDK in its own child process, never the parent.
 
 Requires Node >=22.19, Unix sockets and Pi peers >=1.0.4 <1.1.0. Interactive launchers use the installed peer's CLI, not global `pi` from PATH. Headless supports the same parent Hub/focus without terminal attachment.
 
@@ -169,10 +169,10 @@ Requires Node >=22.19, Unix sockets and Pi peers >=1.0.4 <1.1.0. Interactive lau
 Artifacts use the nearest `.pi/` from the original configuration cwd (or its `.pi/` when none exists), not the execution worktree:
 
 ```text
-.pi/subagents/registry.json
-.pi/subagents/history.json
-.pi/subagents/sessions/<child-id>/bootstrap.json
-.pi/subagents/sessions/<child-id>/*.jsonl
+.pi/teams/registry.json
+.pi/teams/history.json
+.pi/teams/sessions/<child-id>/bootstrap.json
+.pi/teams/sessions/<child-id>/*.jsonl
 ```
 
 Child ID differs from run ID. Cold continuation validates the saved bootstrap, prefers its saved model and opens the original native JSONL in a new child/run. Missing/corrupt bootstrap is an error, not a fallback to new context. Only a materialized JSONL is advertised as resumable history.

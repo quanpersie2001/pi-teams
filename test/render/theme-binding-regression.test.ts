@@ -6,20 +6,16 @@
 // a method-style theme that behaves like Pi's ResolvedTheme.
 
 import { describe, expect, it } from "vitest";
-import { EMPTY_USAGE } from "../../extension-src/pi-subagents/domain/agent-run.js";
-import type {
-	AgentListRow,
-	AgentListView,
-	AgentTranscriptView,
-} from "../../extension-src/pi-subagents/domain/ui-view.js";
-import { createAgentListComponent } from "../../extension-src/pi-subagents/features/agent-panel/index.js";
+import { EMPTY_USAGE } from "../../extension-src/pi-teams/domain/agent-run.js";
+import type { AgentListRow, AgentListView, AgentTranscriptView } from "../../extension-src/pi-teams/domain/ui-view.js";
+import { createAgentListComponent } from "../../extension-src/pi-teams/features/agent-panel/index.js";
 import {
 	type AgentViewEditor,
 	createAgentTranscriptPane,
 	createAgentViewOverlay,
-} from "../../extension-src/pi-subagents/features/agent-view/index.js";
-import { createSubagentNotificationRenderer } from "../../extension-src/pi-subagents/features/notifications/index.js";
-import { bindThemeFg } from "../../extension-src/pi-subagents/shared/theme.js";
+} from "../../extension-src/pi-teams/features/agent-view/index.js";
+import { createSubagentNotificationRenderer } from "../../extension-src/pi-teams/features/notifications/index.js";
+import { bindThemeFg } from "../../extension-src/pi-teams/shared/theme.js";
 
 /**
  * A theme whose `fg` is a real method reading `this.fgColors` — structurally
@@ -162,7 +158,7 @@ describe("component factories with a method-style theme (regression: detached fg
 		const renderer = createSubagentNotificationRenderer();
 		const component = renderer(
 			{
-				customType: "subagent-notification",
+				customType: "teammate-notification",
 				content: [{ type: "text", text: "done" }],
 				display: "done",
 				details: { id: "run-1", type: "explore", result: "ok" },

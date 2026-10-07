@@ -1,7 +1,7 @@
 // Operational settings contract and pure sanitization.
 //
 // Exactly the ten accepted operational keys. Values are read from
-// ~/.pi/agent/subagents.json (global) and <project>/.pi/subagents.json
+// ~/.pi/agent/teams.json (global) and <project>/.pi/teams.json
 // (overrides), then passed through sanitizeSettings before use.
 
 import { MAX_BUDGET_SECONDS } from "./time-policy.js";
@@ -51,7 +51,7 @@ export type BackendSelector = "auto" | "herdr" | "tmux" | "headless";
 /**
  * User-facing multiplexer mode. `auto` detects herdr → tmux and falls back to
  * an independent headless process; `headless` never attaches a multiplexer.
- * Explicit herdr/tmux forcing stays env-only (`PI_SUBAGENTS_BACKEND`).
+ * Explicit herdr/tmux forcing stays env-only (`PI_TEAMS_BACKEND`).
  */
 export type BackendMode = "auto" | "headless";
 

@@ -5,7 +5,7 @@ import {
 	isActiveStatus,
 	isTerminalStatus,
 	transition,
-} from "../../extension-src/pi-subagents/domain/agent-run.js";
+} from "../../extension-src/pi-teams/domain/agent-run.js";
 
 describe("AgentRun process lifecycle state machine", () => {
 	it("walks queued → starting → running → completed", () => {

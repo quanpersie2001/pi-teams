@@ -2,9 +2,9 @@ import { defineConfig } from "tsup";
 
 export default defineConfig({
 	entry: {
-		"pi-subagents": "extension-src/pi-subagents/pi/index.ts",
-		"child-bridge": "extension-src/pi-subagents/pi/child-bridge.ts",
-		"headless-child": "extension-src/pi-subagents/pi/headless-child.ts",
+		"pi-teams": "extension-src/pi-teams/pi/index.ts",
+		"child-bridge": "extension-src/pi-teams/pi/child-bridge.ts",
+		"headless-child": "extension-src/pi-teams/pi/headless-child.ts",
 	},
 	format: ["esm"],
 	dts: false,

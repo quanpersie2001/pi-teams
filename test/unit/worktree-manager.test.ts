@@ -8,11 +8,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentManager } from "../../extension-src/pi-subagents/app/agent-manager.js";
-import { AgentRegistry } from "../../extension-src/pi-subagents/app/agent-registry.js";
-import { WorktreeService } from "../../extension-src/pi-subagents/app/worktree-service.js";
-import { type SubagentsSettings, sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import type { AgentLifecycleEvent } from "../../extension-src/pi-subagents/domain/integration-protocol.js";
+import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
+import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
+import { WorktreeService } from "../../extension-src/pi-teams/app/worktree-service.js";
+import { type SubagentsSettings, sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 import { BASE_SHA, FakeGit } from "../helpers/fake-git.js";
 
@@ -49,9 +49,9 @@ interface Fixture {
 }
 
 async function makeFixture(settingsOverrides: Partial<SubagentsSettings> = {}): Promise<Fixture> {
-	const repo = await mkdtemp(join(tmpdir(), "subagents-mgr-"));
+	const repo = await mkdtemp(join(tmpdir(), "teams-mgr-"));
 	tempRoots.push(repo);
-	const tmpRoot = await mkdtemp(join(tmpdir(), "subagents-wt-"));
+	const tmpRoot = await mkdtemp(join(tmpdir(), "teams-wt-"));
 	tempRoots.push(tmpRoot);
 
 	const backend = new FakeBackend();
@@ -96,7 +96,7 @@ describe("worktree isolation through the manager", () => {
 		await waitFor(() => fixture.backend.launches.length > 0);
 		const launch = fixture.backend.launches[0];
 		const worktreePath = launch?.cwd ?? "";
-		expect(worktreePath).toMatch(new RegExp(`pi-subagents-${record.id}-abc12345$`));
+		expect(worktreePath).toMatch(new RegExp(`pi-teams-${record.id}-abc12345$`));
 		expect(launch?.isolation).toBe("worktree");
 		expect(launch?.configCwd).toBe(fixture.repo);
 		expect(fixture.manager.get(record.id)?.worktree?.path).toBe(worktreePath);

@@ -1,5 +1,5 @@
 // /agents command — alternative access path to the native Agents Hub.
-// /sub-agents-backend — show or switch the multiplexer mode (auto | headless).
+// /teams-backend — show or switch the multiplexer mode (auto | headless).
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../app/agent-manager.js";
 import type { BackendSelector } from "../domain/config.js";
@@ -53,40 +53,37 @@ export interface BackendModePort {
 }
 
 /**
- * Register `/sub-agents-backend`: without arguments it reports the current
+ * Register `/teams-backend`: without arguments it reports the current
  * multiplexer mode (and what auto detects); with `auto` or `headless` it
  * switches future launches for this session. Explicit herdr/tmux forcing
  * remains env-only — auto already detects both multiplexers.
  */
 export function registerBackendCommand(pi: ExtensionAPI, deps: { backend: BackendModePort }): void {
-	pi.registerCommand("sub-agents-backend", {
+	pi.registerCommand("teams-backend", {
 		description: "Show or switch subagent launcher mode: auto (detect herdr/tmux) or headless",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const mode = args.trim().toLowerCase();
 			if (mode === "") {
 				const hint = deps.backend.getLauncherHint();
 				const detected = hint === "auto" ? await deps.backend.detectLauncherKind().catch(() => "unavailable") : "";
-				const env = process.env.PI_SUBAGENTS_BACKEND?.trim();
+				const env = process.env.PI_TEAMS_BACKEND?.trim();
 				const detail = hint === "auto" ? ` (detects: ${detected})` : "";
-				const envNote = env ? ` — env PI_SUBAGENTS_BACKEND=${env} overrides settings` : "";
+				const envNote = env ? ` — env PI_TEAMS_BACKEND=${env} overrides settings` : "";
 				ctx.ui.notify(
-					`Subagent launcher: ${hint}${detail}${envNote}. Persist via the "backend" key in subagents.json.`,
+					`Team launcher: ${hint}${detail}${envNote}. Persist via the "backend" key in teams.json.`,
 					"info",
 				);
 				return;
 			}
 			if (mode !== "auto" && mode !== "headless") {
-				ctx.ui.notify(
-					"Usage: /sub-agents-backend [auto|headless]. herdr/tmux are picked automatically by auto.",
-					"error",
-				);
+				ctx.ui.notify("Usage: /teams-backend [auto|headless]. herdr/tmux are picked automatically by auto.", "error");
 				return;
 			}
 			deps.backend.setLauncherHint(mode);
 			ctx.ui.notify(
 				mode === "headless"
-					? "Subagent launcher set to headless for new runs (no multiplexer panes). Running children keep their launcher; resets at next session start."
-					: "Subagent launcher set to auto (herdr → tmux → headless) for new runs. Running children keep their launcher; resets at next session start.",
+					? "Team launcher set to headless for new runs (no multiplexer panes). Running children keep their launcher; resets at next session start."
+					: "Team launcher set to auto (herdr → tmux → headless) for new runs. Running children keep their launcher; resets at next session start.",
 				"info",
 			);
 		},

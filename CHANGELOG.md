@@ -5,7 +5,7 @@
 ### Added
 
 - Optional per-run time budgets: `defaultTimeout`/`defaultIdleTimeout` settings (seconds, `0` = unlimited) with definition frontmatter (`timeout`, `idle_timeout`/`idle-timeout`) and `Agent` invocation overrides (`timeout`, `idle_timeout`). Precedence is invocation > definition > settings; malformed values fail instead of falling back to unlimited. Expiry triggers the cooperative abort with a bounded window, then verified force-termination of the owned child process group (visible failure instead of fabricated outcome when enforcement is refused); the result identifies the exhausted budget, the limit in seconds and possibly incomplete partial work. Resume re-applies the same effective budgets on fresh clocks.
-- Slash command `/sub-agents-backend [auto|headless]` plus a `backend` settings key to toggle multiplexer usage: `auto` keeps HerdR/tmux auto-detection, `headless` never attaches a multiplexer. `PI_SUBAGENTS_BACKEND` (all four launchers) still overrides settings; runtime switches affect new launches only.
+- Slash command `/teams-backend [auto|headless]` plus a `backend` settings key to toggle multiplexer usage: `auto` keeps HerdR/tmux auto-detection, `headless` never attaches a multiplexer. `PI_TEAMS_BACKEND` (all four launchers) still overrides settings; runtime switches affect new launches only.
 
 - Independent-process specialist runtime with HerdR/tmux Pi TUIs, a native headless fallback, authenticated child control and durable session recovery.
 - Main/children Agents Hub, fullscreen child transcripts, independent composers, child-only model/thinking controls and native `@agent` autocomplete.
@@ -15,6 +15,8 @@
 - Bundled `scout` for cited external-source research and shell-free `reviewer` for evidence-backed code review.
 
 ### Changed
+
+- Rename the product to `pi-teams` (ADR 0008): package `@quandev104/pi-teams`, source tree `extension-src/pi-teams/`, settings `teams.json`, command `/teams-backend`, environment variables `PI_TEAMS_*`, notification customType `teammate-notification`, and artifact root `.pi/teams/` (`registry.json`, `history.json`, `sessions/<child-id>/`, future `t/<team-id>/`). Model tool names (`Agent`, `get_subagent_result`, `steer_subagent`), child protocol v2 and integration events v3 channels are unchanged. Existing local `.pi/subagents/` state is not migrated — delete it manually.
 
 - Scope runs to their owning conversation: startup restore adopts only rows whose conversation owner matches the current session. Rows owned by other conversations or extension consumers are never surfaced or controlled here — settled/verified-dead foreign rows are archived to history and dropped, live foreign rows stay untouched on disk and survive registry rewrites. Reopening the same session (`pi --resume`) re-adopts its still-running children.
 - Target Pi peers >=1.0.4 <1.1.0 and Node >=22.19; package parent, bridge and headless entrypoints.

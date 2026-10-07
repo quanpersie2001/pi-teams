@@ -6,13 +6,13 @@
 import type { EditorFactory } from "@earendil-works/pi-coding-agent";
 import { type Component, Editor, type TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
-import { createAgentFocusPort } from "../../extension-src/pi-subagents/app/focus-service.js";
-import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-subagents/app/index.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
-import type { AgentViewOverlay } from "../../extension-src/pi-subagents/features/agent-view/index.js";
-import { registerAgentsCommand } from "../../extension-src/pi-subagents/pi/commands.js";
-import { createPiTranscriptSource } from "../../extension-src/pi-subagents/pi/transcript-host.js";
-import { installSubagentsUi, type SubagentsUiHandle } from "../../extension-src/pi-subagents/pi/ui-host.js";
+import { createAgentFocusPort } from "../../extension-src/pi-teams/app/focus-service.js";
+import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { AgentViewOverlay } from "../../extension-src/pi-teams/features/agent-view/index.js";
+import { registerAgentsCommand } from "../../extension-src/pi-teams/pi/commands.js";
+import { createPiTranscriptSource } from "../../extension-src/pi-teams/pi/transcript-host.js";
+import { installSubagentsUi, type SubagentsUiHandle } from "../../extension-src/pi-teams/pi/ui-host.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 import { FakePiHost } from "../helpers/fake-pi-host.js";
 
@@ -84,7 +84,7 @@ async function makeFixture(
 		ui.refresh();
 		if (options.agentPanel !== false) {
 			await vi.waitFor(() => {
-				const factory = host.componentFactories.get("subagents-agents");
+				const factory = host.componentFactories.get("teams-agents");
 				const lines = factory?.({ requestRender() {} }, host.theme).render(100);
 				expect(lines?.[0]).toContain(`agents (${app.manager.list().length})`);
 				if (description) expect(lines?.join("\n")).toContain(description);
@@ -125,7 +125,7 @@ function mountMainEditor(
 	};
 	const editor = createEditor(tui as unknown as TUI);
 	if (editor !== undefined) tui.focusedComponent = editor;
-	const factory = fx.host.componentFactories.get("subagents-agents");
+	const factory = fx.host.componentFactories.get("teams-agents");
 	if (!factory) throw new Error("Inline agent widget is not installed");
 	const panel = factory(tui, fx.host.theme);
 	return { tui, editor, panel };
@@ -163,7 +163,7 @@ describe("inline UI installation", () => {
 			ui.openHub();
 			const hub = await fx.host.waitForOverlayOpen();
 			await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).toContain("RESTORED_IDLE"));
-			expect(fx.host.widgets.has("subagents-agents")).toBe(false);
+			expect(fx.host.widgets.has("teams-agents")).toBe(false);
 			expect(fx.app.manager.get(record.id)?.status).toBe("completed");
 		} finally {
 			ui.dispose();
@@ -178,7 +178,7 @@ describe("inline UI installation", () => {
 			const second = await fx.spawn("ACTIVE_SECOND");
 			fx.backend.complete(first, "FIRST_FINISHED");
 			await vi.waitFor(() => {
-				const factory = fx.host.componentFactories.get("subagents-agents");
+				const factory = fx.host.componentFactories.get("teams-agents");
 				const text = factory?.({ requestRender() {} }, fx.host.theme)
 					.render(100)
 					.join("\n");
@@ -187,7 +187,7 @@ describe("inline UI installation", () => {
 			});
 			fx.backend.complete(second, "SECOND_FINISHED");
 			await fx.app.manager.waitForAll();
-			await vi.waitFor(() => expect(fx.host.widgets.has("subagents-agents")).toBe(false));
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(false));
 			fx.ui.openHub();
 			const hub = await fx.host.waitForOverlayOpen();
 			expect(hub.component?.render(120).join("\n")).toContain("FIRST_FINISHED");
@@ -201,7 +201,7 @@ describe("inline UI installation", () => {
 	it("agentPanel=false skips widget install while the lifecycle stays untouched", async () => {
 		const fx = await makeFixture({ agentPanel: false });
 		await fx.spawn();
-		expect(fx.host.widgets.has("subagents-agents")).toBe(false);
+		expect(fx.host.widgets.has("teams-agents")).toBe(false);
 		// ↓ is NOT consumed (no UI active)
 		expect(fx.host.emitTerminalInput(DOWN)).toBe(false);
 		expect(fx.app.manager.get("run-1")?.status).toBe("running");
@@ -458,7 +458,7 @@ describe("composer routing in the transcript view", () => {
 	it("finished agents route text + Enter to manager.resume instead of steer", async () => {
 		const fx = await makeFixture();
 		const runId = await fx.spawn();
-		fx.backend.complete(runId, "finished work", "/tmp/subagents-ui-test/session.jsonl");
+		fx.backend.complete(runId, "finished work", "/tmp/teams-ui-test/session.jsonl");
 		await fx.app.manager.waitForAll();
 
 		fx.ui.openHub(); // Settled rows are not part of inline navigation.
@@ -486,8 +486,8 @@ describe("degraded mode (foreign custom editor)", () => {
 		await fx.spawn();
 
 		// Panel still installed below the editor.
-		expect(fx.host.widgets.has("subagents-agents")).toBe(true);
-		expect(fx.host.widgets.get("subagents-agents")?.placement).toBe("belowEditor");
+		expect(fx.host.widgets.has("teams-agents")).toBe(true);
+		expect(fx.host.widgets.get("teams-agents")?.placement).toBe("belowEditor");
 
 		// ↓ not consumed (foreign editor owns the prompt).
 		expect(fx.host.emitTerminalInput(DOWN)).toBe(false);

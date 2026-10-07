@@ -1,4 +1,4 @@
-# @quandev104/pi-subagents
+# @quandev104/pi-teams
 
 [![Pi compatibility](https://img.shields.io/badge/Pi-%3E%3D1.0.4%20%3C1.1.0-8b5cf6)](https://pi.dev)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.19-339933)](package.json)
@@ -100,7 +100,7 @@ Children do not inherit the parent's conversation automatically. For change revi
 | Input | Action |
 |---|---|
 | `/agents` or **Alt+G** | Open the Main/children Agents Hub |
-| `/sub-agents-backend [auto\|headless]` | Show or switch the launcher mode for this session (session-start value comes from settings/env) |
+| `/teams-backend [auto\|headless]` | Show or switch the launcher mode for this session (session-start value comes from settings/env) |
 | **Left twice within 500 ms** at Main's document start or from bottom navigation | Open Hub without losing the draft |
 | **Down** from empty Main | Enter the visible inline bottom navigation |
 | **Arrows / Enter** in navigation | Select / view a child |
@@ -131,7 +131,7 @@ Closed recipients queue inbox messages without revival. Inbox/history is bounded
 
 No custom agent files are required. Runtime defaults include **4 concurrent runs**, **30 turns + 3 wrap-up turns**, background execution, shared workspaces, and remembered sessions.
 
-Override operational settings in `.pi/subagents.json` or globally in `~/.pi/agent/subagents.json`:
+Override operational settings in `.pi/teams.json` or globally in `~/.pi/agent/teams.json`:
 
 ```json
 {
@@ -146,7 +146,7 @@ Override operational settings in `.pi/subagents.json` or globally in `~/.pi/agen
 }
 ```
 
-`backend` selects the multiplexer mode: `auto` (default) detects HerdR → tmux and falls back to headless; `headless` never attaches a multiplexer. Launcher precedence for new launches: `/sub-agents-backend <mode>` (current session) > `PI_SUBAGENTS_BACKEND` > settings `backend` > `auto`. The env variable does not override a session switch, and switching affects only new launches — running children keep their launcher. Auto tries HerdR, then tmux, then an independent headless child. A forced unavailable launcher fails explicitly.
+`backend` selects the multiplexer mode: `auto` (default) detects HerdR → tmux and falls back to headless; `headless` never attaches a multiplexer. Launcher precedence for new launches: `/teams-backend <mode>` (current session) > `PI_TEAMS_BACKEND` > settings `backend` > `auto`. The env variable does not override a session switch, and switching affects only new launches — running children keep their launcher. Auto tries HerdR, then tmux, then an independent headless child. A forced unavailable launcher fails explicitly.
 
 Global paths follow Pi's agent-directory override. Settings merge per key with project values winning. Agent definitions resolve in this order:
 
@@ -172,7 +172,7 @@ Precedence is the reverse of model/turn pinning: invocation > definition > setti
 {
   "subagent_type": "explore",
   "description": "Audit config loading with a budget",
-  "prompt": "Trace how .pi/subagents.json merges over the built-in defaults. Report every key and where it is read. Do not edit files.",
+  "prompt": "Trace how .pi/teams.json merges over the built-in defaults. Report every key and where it is read. Do not edit files.",
   "run_in_background": true,
   "timeout": 900,
   "idle_timeout": 180
@@ -280,7 +280,7 @@ Install `pi-style` separately to customize Pi's visual surfaces:
 pi install npm:@quandev104/pi-style
 ```
 
-`pi-style` is an optional companion, not a dependency of `pi-subagents`.
+`pi-style` is an optional companion, not a dependency of `pi-teams`.
 
 ---
 

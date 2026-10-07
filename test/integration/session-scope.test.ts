@@ -4,15 +4,15 @@
 // bookkeeping-only and never surface in this session's manager or UI.
 
 import { describe, expect, it, vi } from "vitest";
-import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-subagents/app/index.js";
+import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
 import type {
 	AgentRegistryEntry,
 	CompletedRunHistoryEntry,
 	PersistedRegistryEntry,
 	RestoreObservers,
 	SubagentRunStore,
-} from "../../extension-src/pi-subagents/app/run-registry.js";
-import { sanitizeSettings } from "../../extension-src/pi-subagents/domain/config.js";
+} from "../../extension-src/pi-teams/app/run-registry.js";
+import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 
 function row(id: string, overrides: Partial<AgentRegistryEntry> = {}): AgentRegistryEntry {
@@ -25,9 +25,9 @@ function row(id: string, overrides: Partial<AgentRegistryEntry> = {}): AgentRegi
 		handle: {
 			kind: "process",
 			childId: `child-${id}`,
-			socketPath: `/tmp/pi-subagents/child-${id}.sock`,
+			socketPath: `/tmp/pi-teams/child-${id}.sock`,
 			token: `token-${id}`,
-			runDir: `/tmp/pi-subagents/sessions/child-${id}`,
+			runDir: `/tmp/pi-teams/sessions/child-${id}`,
 			launcher: { kind: "headless", childId: `child-${id}`, pid: 4312, identity: { ownerToken: `owner-${id}` } },
 		},
 		cwd: "/tmp/project",

@@ -1,10 +1,10 @@
-// Every independent child process carries PI_SUBAGENTS_CHILD=1. The parent
+// Every independent child process carries PI_TEAMS_CHILD=1. The parent
 // extension must not install recursive orchestration, UI or lifecycle hooks
 // if loaded there. Interactive children load only the bridge extension;
 // headless children load no extensions and expose only specialist tools.
 
 /** Environment variable marking a child specialist session. */
-export const CHILD_SESSION_ENV_VAR = "PI_SUBAGENTS_CHILD";
+export const CHILD_SESSION_ENV_VAR = "PI_TEAMS_CHILD";
 
 const TRUTHY_MARKER_VALUES: ReadonlySet<string> = new Set(["1", "true", "yes", "on"]);
 

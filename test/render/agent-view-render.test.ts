@@ -8,22 +8,22 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
-import { buildAgentTranscriptView } from "../../extension-src/pi-subagents/app/ui-snapshot.js";
-import { EMPTY_USAGE } from "../../extension-src/pi-subagents/domain/agent-run.js";
-import type { TranscriptItem } from "../../extension-src/pi-subagents/domain/transcript.js";
-import type { AgentTranscriptView } from "../../extension-src/pi-subagents/domain/ui-view.js";
+import { buildAgentTranscriptView } from "../../extension-src/pi-teams/app/ui-snapshot.js";
+import { EMPTY_USAGE } from "../../extension-src/pi-teams/domain/agent-run.js";
+import type { TranscriptItem } from "../../extension-src/pi-teams/domain/transcript.js";
+import type { AgentTranscriptView } from "../../extension-src/pi-teams/domain/ui-view.js";
 import {
 	type AgentViewEditor,
 	type AgentViewOverlay,
 	createAgentTranscriptPane,
 	createAgentViewOverlay,
-} from "../../extension-src/pi-subagents/features/agent-view/index.js";
-import { renderTranscriptItems } from "../../extension-src/pi-subagents/features/agent-view/transcript-renderer.js";
+} from "../../extension-src/pi-teams/features/agent-view/index.js";
+import { renderTranscriptItems } from "../../extension-src/pi-teams/features/agent-view/transcript-renderer.js";
 import {
 	createSubagentNotificationRenderer,
 	renderNotificationLines,
-	SUBAGENT_NOTIFICATION_TYPE,
-} from "../../extension-src/pi-subagents/features/notifications/index.js";
+	TEAMMATE_NOTIFICATION_TYPE,
+} from "../../extension-src/pi-teams/features/notifications/index.js";
 import { renderTheme } from "../helpers/render-theme.js";
 
 const theme = renderTheme();
@@ -357,9 +357,9 @@ describe("fullscreen agent transcript", () => {
 		expect(updated.match(/UPDATED_OUTPUT/g)).toHaveLength(1);
 	});
 });
-describe("subagent-notification rendering", () => {
+describe("teammate-notification rendering", () => {
 	const message = {
-		customType: SUBAGENT_NOTIFICATION_TYPE,
+		customType: TEAMMATE_NOTIFICATION_TYPE,
 		content: "✓ explore completed (Find auth files)\n\nFound 8 authentication-related files.",
 		display: true,
 		details: {
@@ -397,7 +397,7 @@ describe("subagent-notification rendering", () => {
 	});
 
 	it("degrades to plain fallback content when details are absent", () => {
-		const bare = { customType: SUBAGENT_NOTIFICATION_TYPE, content: "plain text only" };
+		const bare = { customType: TEAMMATE_NOTIFICATION_TYPE, content: "plain text only" };
 		const lines = renderNotificationLines(bare, { expanded: false }, fg, 60);
 		expect(lines.join("\n")).toContain("plain text only");
 		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(60);

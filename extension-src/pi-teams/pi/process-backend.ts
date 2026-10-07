@@ -27,7 +27,7 @@ import type { TranscriptSnapshot } from "../domain/transcript.js";
 import { ChildRpcClient } from "./child-rpc-client.js";
 import { createModelAdmission } from "./model-admission.js";
 import { createProcessLaunchers } from "./process-launchers.js";
-import { subagentsArtifactDir } from "./registry-host.js";
+import { teamsArtifactDir } from "./registry-host.js";
 
 interface ChildConnection {
 	bootstrap: ChildBootstrap;
@@ -68,20 +68,20 @@ export interface ProcessBackendOptions {
 }
 
 export function resolveLauncherHint(env: NodeJS.ProcessEnv = process.env): BackendSelector {
-	const value = env.PI_SUBAGENTS_BACKEND?.trim() ?? "auto";
+	const value = env.PI_TEAMS_BACKEND?.trim() ?? "auto";
 	if (value !== "auto" && value !== "herdr" && value !== "tmux" && value !== "headless") {
-		throw new Error(`Unsupported PI_SUBAGENTS_BACKEND "${value}"; use auto, herdr, tmux or headless.`);
+		throw new Error(`Unsupported PI_TEAMS_BACKEND "${value}"; use auto, herdr, tmux or headless.`);
 	}
 	return value;
 }
 
 /**
- * Effective launcher hint at session start: an explicit `PI_SUBAGENTS_BACKEND`
+ * Effective launcher hint at session start: an explicit `PI_TEAMS_BACKEND`
  * (full four-launcher selection) overrides the `backend` settings key
  * (auto/headless only); without either, launchers auto-detect.
  */
 export function resolveSessionLauncherHint(env: NodeJS.ProcessEnv, settingsBackend: BackendMode): BackendSelector {
-	const raw = env.PI_SUBAGENTS_BACKEND?.trim();
+	const raw = env.PI_TEAMS_BACKEND?.trim();
 	if (raw !== undefined && raw.length > 0) return resolveLauncherHint(env);
 	return settingsBackend;
 }
@@ -178,11 +178,11 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		const launcher = await this.chooseLauncher();
 		const paths = this.options.entryPaths ?? entryPaths();
 		const childId = randomUUID();
-		const runDir = join(subagentsArtifactDir(input.configCwd), "sessions", childId);
+		const runDir = join(teamsArtifactDir(input.configCwd), "sessions", childId);
 		mkdirSync(runDir, { recursive: true, mode: 0o700 });
 		chmodSync(runDir, 0o700);
 		// Unix socket pathname limits are small; project/session paths may be arbitrarily long.
-		const controlDir = mkdtempSync("/tmp/pi-subagents-");
+		const controlDir = mkdtempSync("/tmp/pi-teams-");
 		chmodSync(controlDir, 0o700);
 		const bootstrap: ChildBootstrap = {
 			childId,
@@ -221,8 +221,8 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				runDir,
 				cwd: input.cwd,
 				env: {
-					PI_SUBAGENTS_BOOTSTRAP: configFile,
-					PI_SUBAGENTS_CHILD: "1",
+					PI_TEAMS_BOOTSTRAP: configFile,
+					PI_TEAMS_CHILD: "1",
 					...(this.options.agentDir !== undefined ? { PI_CODING_AGENT_DIR: this.options.agentDir } : {}),
 				},
 				interactiveArgv: [...command, ...interactiveArgv],

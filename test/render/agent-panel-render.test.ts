@@ -3,8 +3,8 @@
 
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
-import type { AgentListRow, AgentListView } from "../../extension-src/pi-subagents/domain/ui-view.js";
-import { renderAgentPanel } from "../../extension-src/pi-subagents/features/agent-panel/index.js";
+import type { AgentListRow, AgentListView } from "../../extension-src/pi-teams/domain/ui-view.js";
+import { renderAgentPanel } from "../../extension-src/pi-teams/features/agent-panel/index.js";
 import { renderTheme } from "../helpers/render-theme.js";
 
 const fg = renderTheme().fg.bind(renderTheme());

@@ -3,7 +3,7 @@
 // expiry is deterministic without real waiting.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type BudgetExpiry, TimeBudgetWatcher } from "../../extension-src/pi-subagents/app/time-budget-watcher.js";
+import { type BudgetExpiry, TimeBudgetWatcher } from "../../extension-src/pi-teams/app/time-budget-watcher.js";
 
 describe("TimeBudgetWatcher", () => {
 	let clock: number;

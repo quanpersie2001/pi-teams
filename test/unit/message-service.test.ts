@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { MessageService } from "../../extension-src/pi-subagents/app/message-service.js";
-import type { AgentRun } from "../../extension-src/pi-subagents/domain/agent-run.js";
+import { MessageService } from "../../extension-src/pi-teams/app/message-service.js";
+import type { AgentRun } from "../../extension-src/pi-teams/domain/agent-run.js";
 
 function makeRun(id: string, sessionId?: string): AgentRun {
 	return {

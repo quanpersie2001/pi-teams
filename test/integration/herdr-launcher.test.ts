@@ -3,8 +3,8 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { LauncherCommandRunner } from "../../extension-src/pi-subagents/domain/process-launcher.js";
-import { createProcessLaunchers } from "../../extension-src/pi-subagents/pi/process-launchers.js";
+import type { LauncherCommandRunner } from "../../extension-src/pi-teams/domain/process-launcher.js";
+import { createProcessLaunchers } from "../../extension-src/pi-teams/pi/process-launchers.js";
 
 function harness() {
 	let child: ChildProcess | undefined;
