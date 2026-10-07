@@ -41,5 +41,6 @@
 
 ### Maintenance
 
+- Teams-pivot quality gates (roadmap T5): `gpt-6-luna` task-board and archive/native-lifecycle reviews, native peer/lead tool execution, contested claims and dependency unlocks, session-isolated cold continuation, same-child TUI assignment, verified teardown, and the complete `npm run check` gate. Retain native regressions for refused-assignment capacity and duplicate teammate-address prevention.
 - Remove unused utilities/exports, obsolete architecture documents, duplicated smoke diaries and stale test artifacts; keep one documentation index and include linked docs in the package.
 - Reorganize the README with compatibility badges, installation/quick-start guidance, bundled-agent and control tables, documentation links, and the optional `pi-style` companion.
