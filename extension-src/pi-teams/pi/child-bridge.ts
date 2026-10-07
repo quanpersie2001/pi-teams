@@ -38,6 +38,18 @@ const MAX_CONNECTIONS = 16;
 const MAX_SOCKET_PATH_BYTES = process.platform === "darwin" ? 103 : 107;
 const CHILD_ENV = "PI_TEAMS_CHILD";
 const BOOTSTRAP_ENV = "PI_TEAMS_BOOTSTRAP";
+// Session-bound lifetime (ADR 0007 §1): losing the authenticated control
+// socket is the local parent-death signal. A short reconnect grace absorbs
+// the parent's own client reconnect; staying silent past it means the parent
+// is gone and the child stops itself.
+const CONTROL_LOSS_GRACE_MS = 5_000;
+/** Bounded wait for a cooperative abort to settle before force-preserving. */
+const CONTROL_LOSS_SETTLE_MS = 5_000;
+/** Last-resort exit if a wedged host shutdown outlives the annotation. */
+const CONTROL_LOSS_EXIT_MS = 3_000;
+const CONTROL_LOSS_POLL_MS = 100;
+/** First line of the preserved artifact when the parent control socket is lost. */
+const CONTROL_LOSS_ANNOTATION = "stopped: parent control lost";
 const SOFT_LIMIT_NOTICE = "subagents: soft turn limit reached — steering the agent to wrap up.";
 const HARD_LIMIT_NOTICE = "subagents: hard turn limit reached — aborting the agent.";
 
@@ -103,6 +115,8 @@ interface ChildSocketHandle {
 	server: Server;
 	clients: Set<Socket>;
 	socketPath: string;
+	/** Marks the socket as intentionally closing; disarms the control-loss watch. */
+	beginIntentionalClose(): void;
 }
 
 function parseOptionalString(record: Record<string, unknown>, field: string, maxLength = 32_768): string | undefined {
@@ -307,6 +321,13 @@ function extractText(content: unknown): string {
 	return previewContent(content).text;
 }
 
+function delay(ms: number): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const timer = setTimeout(resolve, ms);
+	timer.unref();
+	return promise;
+}
+
 export function normalizeMessage(message: unknown): TranscriptItem[] {
 	if (!isRecord(message) || typeof message.role !== "string") return [];
 	const timestamp =
@@ -466,6 +487,9 @@ class ChildRuntime {
 	>();
 	private shuttingDown = false;
 	private shutdownStarted = false;
+	/** Set once control loss is confirmed; annotates the preserved result. */
+	private controlLost = false;
+	private controlLossHandled = false;
 
 	constructor(
 		readonly bootstrap: ChildBootstrap,
@@ -910,14 +934,60 @@ class ChildRuntime {
 	 * Last settled run wins when a child settles multiple runs.
 	 */
 	private persistFullResult(text: string): string | undefined {
-		if (text.length === 0) return undefined;
+		// Control loss annotates whatever partial answer exists so the stopped
+		// artifact explains itself (ADR 0007 orphan self-termination).
+		const body = this.controlLost
+			? text.length > 0
+				? `${CONTROL_LOSS_ANNOTATION}\n\n${text}`
+				: CONTROL_LOSS_ANNOTATION
+			: text;
+		if (body.length === 0) return undefined;
 		const file = join(this.bootstrap.sessionDir, "result.md");
 		try {
 			mkdirSync(this.bootstrap.sessionDir, { recursive: true, mode: 0o700 });
-			writeFileSync(file, text, { mode: 0o600 });
+			writeFileSync(file, body, { mode: 0o600 });
 			return file;
 		} catch {
 			return undefined;
+		}
+	}
+
+	/**
+	 * Session-bound lifetime (ADR 0007 §1): the authenticated control socket
+	 * disappeared and did not come back. Abort the current turn through the
+	 * native cooperative path, give settlement a bounded window to flush and
+	 * persist the annotated partial result, then stop the host process — the
+	 * headless worker exits and the interactive TUI pane closes with it. A
+	 * hung parent that never dropped the socket changes nothing: the child
+	 * simply runs to completion.
+	 */
+	async handleControlLoss(): Promise<void> {
+		if (this.controlLossHandled) return;
+		this.controlLossHandled = true;
+		this.controlLost = true;
+		this.shuttingDown = true;
+		const run = this.activeRun;
+		if (run) {
+			run.abortRequested = true;
+			try {
+				await this.host.abort();
+			} catch {
+				// The annotated artifact is written regardless of abort acceptance.
+			}
+			const deadline = Date.now() + CONTROL_LOSS_SETTLE_MS;
+			while (this.activeRun === run && Date.now() < deadline) {
+				await delay(CONTROL_LOSS_POLL_MS);
+			}
+			if (this.activeRun === run) {
+				// No native settlement in the window: preserve directly.
+				const resultFile = this.persistFullResult(this.latestAssistant ? fullTextOf(this.latestAssistant.content) : "");
+				this.finish(run.runId, { runId: run.runId, status: "stopped", ...(resultFile ? { resultFile } : {}) });
+			}
+		}
+		try {
+			await this.host.shutdown();
+		} catch {
+			// The caller's failsafe exit covers a wedged shutdown.
 		}
 	}
 
@@ -1042,6 +1112,23 @@ async function openChildSocket(bootstrap: ChildBootstrap, runtime: ChildRuntime)
 	const clients = new Set<Socket>();
 	const cache = new Map<string, CachedCommand>();
 	let connections = 0;
+	let intentionalClose = false;
+	let controlLossTimer: NodeJS.Timeout | undefined;
+	const cancelControlLossWatch = (): void => {
+		if (controlLossTimer !== undefined) {
+			clearTimeout(controlLossTimer);
+			controlLossTimer = undefined;
+		}
+	};
+	const armControlLossWatch = (): void => {
+		if (intentionalClose) return;
+		cancelControlLossWatch();
+		controlLossTimer = setTimeout(() => {
+			controlLossTimer = undefined;
+			void terminateAfterControlLoss(server, clients, runtime, cancelControlLossWatch);
+		}, CONTROL_LOSS_GRACE_MS);
+		controlLossTimer.unref?.();
+	};
 	const server = createServer((socket) => {
 		if (connections >= MAX_CONNECTIONS) {
 			socket.destroy();
@@ -1049,9 +1136,11 @@ async function openChildSocket(bootstrap: ChildBootstrap, runtime: ChildRuntime)
 		}
 		connections++;
 		clients.add(socket);
+		cancelControlLossWatch();
 		attachClient(socket, bootstrap, runtime, cache, () => {
 			connections--;
 			clients.delete(socket);
+			if (connections === 0) armControlLossWatch();
 		});
 	});
 	await new Promise<void>((resolve, reject) => {
@@ -1074,7 +1163,42 @@ async function openChildSocket(bootstrap: ChildBootstrap, runtime: ChildRuntime)
 		await new Promise<void>((resolve) => server.close(() => resolve()));
 		throw error;
 	}
-	return { server, clients, socketPath: bootstrap.socketPath };
+	return {
+		server,
+		clients,
+		socketPath: bootstrap.socketPath,
+		beginIntentionalClose: () => {
+			intentionalClose = true;
+			cancelControlLossWatch();
+		},
+	};
+}
+
+/**
+ * Orphan self-termination (ADR 0007 §1): the parent's control connection is
+ * gone and stayed gone. Preserve the annotated partial result through the
+ * runtime, tear the socket down, shut the host (headless exit / TUI pane
+ * close) and keep an unref'd failsafe exit for a wedged shutdown.
+ */
+async function terminateAfterControlLoss(
+	server: Server,
+	clients: Set<Socket>,
+	runtime: ChildRuntime,
+	disarm: () => void,
+): Promise<void> {
+	disarm();
+	console.error(
+		"[pi-teams] parent control socket lost — aborting, preserving the partial result and stopping this child (session-bound lifetime, ADR 0007)",
+	);
+	const failsafe = setTimeout(() => process.exit(0), CONTROL_LOSS_EXIT_MS);
+	failsafe.unref();
+	try {
+		await runtime.handleControlLoss();
+	} catch {
+		// Preservation is best-effort; the failsafe exit still applies.
+	}
+	for (const socket of clients) socket.destroy();
+	await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
 function attachClient(
@@ -1263,6 +1387,7 @@ async function handleSocketRequest(
 }
 
 async function closeChildSocket(handle: ChildSocketHandle): Promise<void> {
+	handle.beginIntentionalClose();
 	for (const socket of handle.clients) socket.destroy();
 	await new Promise<void>((resolve) => handle.server.close(() => resolve()));
 	try {

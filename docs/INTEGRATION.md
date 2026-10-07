@@ -134,7 +134,7 @@ Without `cleanupWorktree: true`, release retries any retained verified child-res
 
 ## Recovery handshake
 
-The parent restores registry records before installing the initial UI projection. Only rows whose conversation owner matches the current session are adopted; rows owned by another conversation or an extension consumer are bookkeeping-only — settled or verified-dead foreign children are archived to history and dropped, live foreign rows stay untouched on disk. Supported process handles reconnect via the authenticated socket and verified launcher identity; terminal records remain available from native session history. Legacy incompatible receipts are retained, not adopted as fake process handles.
+The parent restores registry records before installing the initial UI projection. Only rows whose conversation owner matches the current session are considered; rows owned by another conversation or an extension consumer are bookkeeping-only — settled or verified-dead foreign children are archived to history and dropped, live foreign rows stay untouched on disk. Session-bound lifetime (ADR 0007): own leftover ACTIVE rows are never re-adopted — they archive `stopped` with an honest recovery note and their resources go through verified disposal; a settled child outcome observed first stays authoritative. Legacy incompatible receipts are retained, not adopted as fake process handles.
 
 `pi-tasks` restores its own tasks/mappings, probes `ping`, calls `status`, subscribes to lifecycle and decides assignment/retry/review. Assignment prompts must be self-contained: goal, parent context, exact scope/non-goals, edit policy, acceptance and verification. The runtime does not validate task-specific acceptance criteria.
 

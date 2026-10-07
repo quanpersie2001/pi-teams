@@ -41,6 +41,7 @@ async function fixture() {
 		cwd: "/parent",
 		configCwd: "/parent",
 		getSessionId: () => "parent-session",
+		teardownGraceMs: 10,
 	});
 	const run = await manager.spawn({ type: "general-purpose", prompt: "work", run_in_background: true });
 	for (let step = 0; step < 24; step++) await Promise.resolve();

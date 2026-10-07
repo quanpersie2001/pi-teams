@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TranscriptItem } from "../../extension-src/pi-teams/domain/transcript.js";
 import {
 	type ChildBridgeHandle,
@@ -346,5 +346,130 @@ describe("child bridge over an owner-only Unix socket", () => {
 		const pending = client.connect();
 		client.disconnect();
 		await expect(pending).rejects.toMatchObject({ code: "disconnected" });
+	});
+});
+
+describe("control-loss self-termination (ADR 0007 §1)", () => {
+	it("aborts, preserves an annotated partial result and stops after the control socket stays lost", async () => {
+		vi.useFakeTimers();
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+		try {
+			const dir = mkdtempSync(join(tmpdir(), "teams-orphan-"));
+			tempDir = dir;
+			const sessionFile = join(dir, "sessions", "child.jsonl");
+			const bootstrap = {
+				childId: "child-orphan",
+				token: TOKEN,
+				socketPath: join(dir, "child.sock"),
+				sessionDir: join(dir, "sessions"),
+				sessionFile,
+				cwd: dir,
+				configCwd: dir,
+				systemPrompt: "child prompt",
+				promptMode: "append" as const,
+			};
+			const calls = { abort: 0, shutdown: 0 };
+			const host: ChildBridgeHost = {
+				getSessionFile: () => sessionFile,
+				getTranscript: () => [],
+				getFocus: () => ({
+					cwd: dir,
+					thinking: "off" as const,
+					capabilities: { models: [], thinking: ["off"] as const, commands: [] },
+				}),
+				controlFocus: async () => {},
+				sendInbox: async () => {},
+				prompt: async () => {},
+				steer: async () => {},
+				abort: async () => {
+					calls.abort += 1;
+				},
+				shutdown: async () => {
+					calls.shutdown += 1;
+				},
+			};
+			bridge = await startChildBridge(bootstrap, host);
+			const client = new ChildRpcClient({
+				socketPath: bootstrap.socketPath,
+				childId: bootstrap.childId,
+				token: TOKEN,
+			});
+			clients.push(client);
+			await client.connect();
+			await client.prompt("run-orphan", "half-finished work");
+			// Partial assistant text exists but the run never settles natively.
+			bridge?.publishNativeEvent({
+				type: "message_end",
+				message: { role: "assistant", content: [{ type: "text", text: "partial findings" }] },
+			});
+
+			client.disconnect();
+			// Reconnect grace expires without a new authenticated connection.
+			await vi.advanceTimersByTimeAsync(5_100);
+			// Settle window expires and the shutdown path completes (the exit
+			// failsafe is disarmed by the process.exit spy).
+			await vi.runAllTimersAsync();
+
+			expect(calls.abort).toBe(1);
+			expect(calls.shutdown).toBe(1);
+			const artifact = readFileSync(join(dir, "sessions", "result.md"), "utf8");
+			expect(artifact.startsWith("stopped: parent control lost")).toBe(true);
+			expect(artifact).toContain("partial findings");
+		} finally {
+			exitSpy.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not stop while the parent reconnects inside the grace window", async () => {
+		vi.useFakeTimers();
+		try {
+			const dir = mkdtempSync(join(tmpdir(), "teams-reconnect-"));
+			tempDir = dir;
+			const sessionFile = join(dir, "sessions", "child.jsonl");
+			const bootstrap = {
+				childId: "child-reconnect",
+				token: TOKEN,
+				socketPath: join(dir, "child.sock"),
+				sessionDir: join(dir, "sessions"),
+				sessionFile,
+				cwd: dir,
+				configCwd: dir,
+				systemPrompt: "child prompt",
+				promptMode: "append" as const,
+			};
+			const host: ChildBridgeHost = {
+				getSessionFile: () => sessionFile,
+				getTranscript: () => [],
+				getFocus: () => ({
+					cwd: dir,
+					thinking: "off" as const,
+					capabilities: { models: [], thinking: ["off"] as const, commands: [] },
+				}),
+				controlFocus: async () => {},
+				sendInbox: async () => {},
+				prompt: async () => {},
+				steer: async () => {},
+				abort: async () => {},
+				shutdown: async () => {},
+			};
+			bridge = await startChildBridge(bootstrap, host);
+			const client = new ChildRpcClient({
+				socketPath: bootstrap.socketPath,
+				childId: bootstrap.childId,
+				token: TOKEN,
+			});
+			clients.push(client);
+			await client.connect();
+			client.disconnect();
+			await vi.advanceTimersByTimeAsync(3_000);
+			// The parent reconnects inside the grace window.
+			await client.connect();
+			await vi.advanceTimersByTimeAsync(6_000);
+			const state = await client.state();
+			expect(state.childId).toBe("child-reconnect");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

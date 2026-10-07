@@ -103,6 +103,8 @@ export interface AgentManagerOptions {
 	worktreeService?: WorktreeService;
 	idFactory?: () => string;
 	now?: () => number;
+	/** Test seam for the session-teardown cooperative window; default 15s. */
+	teardownGraceMs?: number;
 }
 
 type LaunchPlan =
@@ -122,6 +124,13 @@ type LaunchPlan =
  * it, the owned child is force-terminated through the backend port.
  */
 const BUDGET_ENFORCEMENT_GRACE_MS = 2_000;
+
+/**
+ * Session teardown grace (ADR 0007 §1, roadmap T1): after the abort request,
+ * children get this long to settle cooperatively and preserve their partial
+ * result artifact (1.1b) before the verified force-kill path runs.
+ */
+const SESSION_TEARDOWN_GRACE_MS = 15_000;
 
 function enforcementDelay(ms: number): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
@@ -195,6 +204,8 @@ export class AgentManager {
 	private readonly getSessionId: () => string;
 	private readonly idFactory: () => string;
 	private readonly now: () => number;
+	/** Cooperative window before the verified teardown force-kill. */
+	private readonly teardownGraceMs: number;
 	private readonly registryStore: SubagentRunStore | undefined;
 	private readonly worktreeService: WorktreeService | undefined;
 	private readonly terminalCleanupByChild = new WeakMap<AgentExecutionBackend, Map<string, Promise<void>>>();
@@ -215,6 +226,7 @@ export class AgentManager {
 		this.getSessionId = options.getSessionId ?? (() => "unknown-session");
 		this.idFactory = options.idFactory ?? (() => randomUUID());
 		this.now = options.now ?? (() => Date.now());
+		this.teardownGraceMs = options.teardownGraceMs ?? SESSION_TEARDOWN_GRACE_MS;
 		this.registryStore = options.registryStore;
 		this.worktreeService = options.worktreeService;
 		this.budgetWatcher = new TimeBudgetWatcher({
@@ -821,9 +833,19 @@ export class AgentManager {
 	}
 
 	private async enforceBudgetDeadline(internal: RunInternals): Promise<void> {
+		await this.enforceStopDeadline(internal, BUDGET_ENFORCEMENT_GRACE_MS);
+	}
+
+	/**
+	 * Bounded cooperative window, then verified force-termination of the owned
+	 * child through the budget-enforcement backend path (identity-verified,
+	 * SIGTERM→SIGKILL escalation, never a fabricated outcome). Shared by
+	 * budget expiry (2s) and session teardown (15s, ADR 0007 §1).
+	 */
+	private async enforceStopDeadline(internal: RunInternals, graceMs: number): Promise<void> {
 		const outcome = await Promise.race([
 			internal.settle.then(() => "settled" as const),
-			enforcementDelay(BUDGET_ENFORCEMENT_GRACE_MS).then(() => "deadline" as const),
+			enforcementDelay(graceMs).then(() => "deadline" as const),
 		]);
 		if (outcome === "settled") return;
 		if (this.runs.get(internal.record.id) !== internal || !isActiveStatus(internal.record.status)) return;
@@ -1267,6 +1289,29 @@ export class AgentManager {
 		return { state: "retained", entry: restoredEntry };
 	}
 
+	/**
+	 * Session-bound lifetime (ADR 0007 §1): an active row left behind by a
+	 * previous parent is never re-adopted. Its resource goes through verified
+	 * disposal only — restore the handle and force-terminate through the
+	 * budget-enforcement path (identity-checked, idempotent for resources
+	 * that already exited). Returns true when disposal is verified; false
+	 * retains the row for an explicit `/agents release` retry.
+	 */
+	async disposeOrphanedRun(entry: AgentRegistryEntry): Promise<boolean> {
+		if (this.disposed || !entry.handle || !isSerializableBackendHandle(entry.handle)) return false;
+		const backend = this.backends.find((candidate) => candidate.kind === "process");
+		if (!backend) return false;
+		const restorable = backend as unknown as RestorableExecutionBackend;
+		const handle = restorable.restoreHandle(entry.id, entry.handle);
+		if (!handle || backend.enforceTerminate === undefined) return false;
+		try {
+			await backend.enforceTerminate(handle, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	/** Preserve hidden and incompatible rows while the remember setting is off. */
 	setPreservedRegistryEntries(entries: readonly PersistedRegistryEntry[]): void {
 		this.preservedRegistryEntries = [...entries];
@@ -1277,17 +1322,31 @@ export class AgentManager {
 		this.foreignRegistryEntries = [...entries];
 	}
 
-	/** Session shutdown detaches RPC clients and persists ownership without stopping children. */
+	/**
+	 * Session teardown (ADR 0007 §1, roadmap T1): teammates die with the
+	 * owning session. Every active run gets the abort request first, a
+	 * bounded cooperative grace to settle and preserve its partial result
+	 * artifact (1.1b), then verified force-termination through the
+	 * budget-enforcement path. Worktrees, history and result files survive.
+	 */
 	async shutdownSession(): Promise<void> {
 		if (this.disposed) return;
 		this.shuttingDown = true;
 		this.admissionEpoch += 1;
-		for (const [id, internal] of [...this.runs]) {
-			if (internal.record.status === "queued") await this.stop(id);
+		const active = [...this.runs.values()].filter((internal) => isActiveStatus(internal.record.status));
+		for (const internal of active) {
+			try {
+				await this.stop(internal.record.id);
+			} catch {
+				// The enforcement deadline below covers an uncooperative child.
+			}
 		}
 		await Promise.allSettled(
 			[...this.runs.values()].map((internal) => internal.launchPromise).filter((promise) => promise !== undefined),
 		);
+		await Promise.allSettled(active.map((internal) => this.enforceStopDeadline(internal, this.teardownGraceMs)));
+		// Let settlement finalization (worktree preserve, registry/history
+		// writes) finish before detaching what is left.
 		await Promise.allSettled(
 			[...this.runs.values()].map((internal) => internal.finalizePromise).filter((promise) => promise !== undefined),
 		);

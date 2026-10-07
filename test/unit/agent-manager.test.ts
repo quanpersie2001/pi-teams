@@ -58,6 +58,7 @@ function makeManager(
 		getSessionId?: () => string;
 		now?: () => number;
 		store?: MemoryRunStore;
+		teardownGraceMs?: number;
 	} = {},
 ): ManagerFixture {
 	const store = options.store ?? new MemoryRunStore();
@@ -81,6 +82,7 @@ function makeManager(
 			return `run-${nextId}`;
 		},
 		...(options.now !== undefined ? { now: options.now } : {}),
+		...(options.teardownGraceMs !== undefined ? { teardownGraceMs: options.teardownGraceMs } : {}),
 	});
 	const events: AgentLifecycleEvent[] = [];
 	manager.subscribe((event) => events.push(event));
@@ -634,6 +636,39 @@ describe("get_subagent_result full-result channel", () => {
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+describe("session teardown (ADR 0007 §1)", () => {
+	it("cooperatively stops an active child at shutdown without force-kill", async () => {
+		const fixture = makeManager({ teardownGraceMs: 5_000 });
+		await load(fixture);
+		const record = await spawnBg(fixture.manager);
+		await settle(fixture.manager);
+		expect(fixture.manager.get(record.id)?.status).toBe("running");
+
+		const shutdown = fixture.manager.shutdownSession();
+		// The child honors the abort request inside the grace window.
+		fixture.backend.settleStopped(record.id);
+		await shutdown;
+
+		expect(fixture.backend.stops).toHaveLength(1);
+		expect(fixture.backend.enforced).toEqual([]);
+		expect(fixture.store.history[0]).toMatchObject({ id: record.id, status: "stopped" });
+		expect(fixture.manager.list()).toEqual([]);
+	});
+
+	it("force-kills an uncooperative child through the enforcement path after the grace", async () => {
+		const fixture = makeManager({ teardownGraceMs: 10 });
+		await load(fixture);
+		const record = await spawnBg(fixture.manager);
+		await settle(fixture.manager);
+
+		await fixture.manager.shutdownSession();
+
+		expect(fixture.backend.stops).toHaveLength(1);
+		expect(fixture.backend.enforced).toHaveLength(1);
+		expect(fixture.store.history[0]).toMatchObject({ id: record.id, status: "stopped" });
+	});
+});
 
 describe("AgentManager dispose", () => {
 	it("stops everything and disposes backend handles", async () => {

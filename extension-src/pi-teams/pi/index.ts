@@ -114,6 +114,12 @@ export default function (pi: ExtensionAPI): void {
 	});
 	pi.on("session_before_switch", () => {
 		app.delivery?.handleSessionSwitch();
+		// Session-bound lifetime (ADR 0007 §1): switching sessions ends the
+		// owning session's team — tear its children down before the next
+		// session_start re-arms the manager.
+		void app.sessionShutdown().catch((error: unknown) => {
+			console.warn(`[pi-teams] session teardown failed: ${error instanceof Error ? error.message : String(error)}`);
+		});
 	});
 	pi.on("session_shutdown", async () => {
 		rpc?.dispose();

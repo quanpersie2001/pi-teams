@@ -11,35 +11,30 @@ import type {
 import { isIncompatibleRegistryEntry } from "./run-registry.js";
 
 export interface RestoreObservation {
-	sessionPresent: boolean;
 	completion: RestoreCompletionObservation;
-	resourceAlive?: boolean;
 }
 
 export type RestoreDecision =
 	| { action: "defer"; reason: string }
-	| { action: "reconnect" }
 	| { action: "completed"; outcome: "completed" | "stopped" | "failed" }
-	| { action: "failed"; error: string }
-	| { action: "recover-terminal" };
+	| { action: "recover-terminal" }
+	| { action: "orphan-stopped" };
 
-/** Pure process-restore decision; child RPC outcome outranks launcher status. */
+/**
+ * Pure process-restore decision; child RPC outcome outranks launcher status.
+ * Session-bound lifetime (ADR 0007 §1): an ACTIVE row is never re-adopted —
+ * it is archived stopped with an honest note and its resource goes through
+ * verified disposal. A settled child outcome observed before that archiving
+ * stays authoritative.
+ */
 export function decideRestore(entry: AgentRegistryEntry, observation: RestoreObservation): RestoreDecision {
 	if (!entry.handle) return { action: "defer", reason: "process control identity is unavailable" };
 	if (observation.completion.finished) {
 		return { action: "completed", outcome: observation.completion.outcome ?? "completed" };
 	}
 	if (isTerminalStatus(entry.status)) return { action: "recover-terminal" };
-	if (observation.resourceAlive === undefined) {
-		return { action: "defer", reason: "child RPC state is unavailable; registry row is retained" };
-	}
-	if (observation.resourceAlive) return { action: "reconnect" };
-	return {
-		action: "failed",
-		error: observation.sessionPresent
-			? "child process is no longer available and has no settled RPC outcome"
-			: "child process and persisted session artifacts are unavailable, with no settled RPC outcome",
-	};
+	// Active leftover row: the owning session ended without settlement.
+	return { action: "orphan-stopped" };
 }
 
 export interface PartitionedRegistryEntries {
@@ -73,6 +68,8 @@ export function partitionOwnedEntries(
 
 export interface RestoreDeps extends RestoreObservers {
 	reconnect(entry: AgentRegistryEntry): RestoreReconnectResult | Promise<RestoreReconnectResult>;
+	/** Verified disposal of an orphaned active row's resource (ADR 0007 §1). */
+	disposeOrphan(entry: AgentRegistryEntry): boolean | Promise<boolean>;
 	persist(entries: readonly PersistedRegistryEntry[]): void;
 	recordCompleted(entry: CompletedRunHistoryEntry): void;
 	rememberAgents: boolean;
@@ -83,6 +80,8 @@ export interface RestoreDeps extends RestoreObservers {
 export interface RestoreSummary {
 	reconnected: string[];
 	completed: string[];
+	/** Active rows archived stopped under the session-bound lifetime. */
+	orphaned: string[];
 	failed: string[];
 	deferred: string[];
 	skippedByRememberAgents: string[];
@@ -97,6 +96,7 @@ export async function restoreRegisteredRuns(
 	const summary: RestoreSummary = {
 		reconnected: [],
 		completed: [],
+		orphaned: [],
 		failed: [],
 		deferred: [],
 		skippedByRememberAgents: [],
@@ -131,12 +131,7 @@ export async function restoreRegisteredRuns(
 		}
 
 		const completion = await deps.detectCompletion(entry);
-		const resourceAlive = await deps.resourceAlive(entry);
-		const decision = decideRestore(entry, {
-			sessionPresent: deps.sessionPresent(entry),
-			completion,
-			...(resourceAlive !== undefined ? { resourceAlive } : {}),
-		});
+		const decision = decideRestore(entry, { completion });
 
 		switch (decision.action) {
 			case "completed": {
@@ -156,20 +151,8 @@ export async function restoreRegisteredRuns(
 					...(completion.toolUses !== undefined ? { toolUses: completion.toolUses } : {}),
 				});
 				summary.completed.push(entry.id);
-				if (resourceAlive !== false) {
-					try {
-						const result = await deps.reconnect(entry);
-						if (result.state === "retained") kept.push(result.entry);
-						else if (result.state === "deferred") {
-							kept.push(entry);
-							summary.deferred.push(entry.id);
-							deps.warn(`retained settled process row "${entry.id}" because child reconnection did not complete`);
-						}
-					} catch (error) {
-						kept.push(entry);
-						summary.deferred.push(entry.id);
-						deps.warn(`retained settled process row "${entry.id}" after reconnect error: ${errorText(error)}`);
-					}
+				if ((await deps.resourceAlive(entry)) !== false) {
+					await retainSettledProcessRow(entry, deps, summary, kept);
 				}
 				break;
 			}
@@ -179,54 +162,41 @@ export async function restoreRegisteredRuns(
 				delete historyEntry.handle;
 				deps.recordCompleted({ ...historyEntry, completedAt: entry.completedAt ?? deps.now() });
 				summary.completed.push(entry.id);
-				if (resourceAlive !== false) {
-					try {
-						const result = await deps.reconnect(entry);
-						if (result.state === "retained") kept.push(result.entry);
-						else if (result.state === "deferred") {
-							kept.push(entry);
-							summary.deferred.push(entry.id);
-							deps.warn(`retained settled process row "${entry.id}" because child reconnection did not complete`);
-						}
-					} catch (error) {
-						kept.push(entry);
-						summary.deferred.push(entry.id);
-						deps.warn(`retained settled process row "${entry.id}" after reconnect error: ${errorText(error)}`);
-					}
+				if ((await deps.resourceAlive(entry)) !== false) {
+					await retainSettledProcessRow(entry, deps, summary, kept);
 				}
 				break;
 			}
 
-			case "failed": {
+			case "orphan-stopped": {
+				// Session-bound lifetime (ADR 0007 §1): never re-adopt an active
+				// row. Archive it stopped with an honest note; verified disposal
+				// of the leftover resource, with the row retained for an
+				// explicit release retry when disposal cannot be verified.
+				let disposalError: string | undefined;
+				try {
+					const disposed = await deps.disposeOrphan(entry);
+					if (!disposed) disposalError = "verified disposal did not complete; retry with /agents release";
+				} catch (error) {
+					disposalError = `verified disposal failed: ${errorText(error)}`;
+				}
 				const historyEntry = { ...entry };
 				delete historyEntry.handle;
 				deps.recordCompleted({
 					...historyEntry,
-					status: "error",
+					status: "stopped",
 					completedAt: deps.now(),
-					error: decision.error,
+					recoveryError:
+						disposalError ??
+						"stopped at startup: teammates are session-bound and are never re-adopted (ADR 0007); the owning session ended before settlement",
 				});
-				summary.failed.push(entry.id);
-				deps.warn(`run "${entry.id}" marked failed at restore: ${decision.error}`);
-				break;
-			}
-
-			case "reconnect": {
-				let result: RestoreReconnectResult;
-				try {
-					result = await deps.reconnect(entry);
-					if (result.state === "retained") summary.reconnected.push(entry.id);
-					else if (result.state === "deferred") {
-						summary.deferred.push(entry.id);
-						deps.warn(`restore deferred for run "${entry.id}": child reconnection did not complete`);
-					}
-				} catch (error) {
-					result = { state: "deferred" };
+				summary.orphaned.push(entry.id);
+				deps.warn(`run "${entry.id}" archived stopped at startup (session-bound lifetime)`);
+				if (disposalError !== undefined) {
+					kept.push(entry);
 					summary.deferred.push(entry.id);
-					deps.warn(`restore deferred for run "${entry.id}": ${errorText(error)}`);
+					deps.warn(`run "${entry.id}" retains its resource receipt: ${disposalError}`);
 				}
-				if (result.state === "retained") kept.push(result.entry);
-				else if (result.state === "deferred") kept.push(entry);
 				break;
 			}
 
@@ -240,6 +210,31 @@ export async function restoreRegisteredRuns(
 
 	deps.persist(kept);
 	return summary;
+}
+
+/**
+ * A settled row whose child may still hold resources: retry verified cleanup
+ * through the manager; a retained/deferred receipt stays in the registry.
+ */
+async function retainSettledProcessRow(
+	entry: AgentRegistryEntry,
+	deps: RestoreDeps,
+	summary: RestoreSummary,
+	kept: PersistedRegistryEntry[],
+): Promise<void> {
+	try {
+		const result = await deps.reconnect(entry);
+		if (result.state === "retained") kept.push(result.entry);
+		else if (result.state === "deferred") {
+			kept.push(entry);
+			summary.deferred.push(entry.id);
+			deps.warn(`retained settled process row "${entry.id}" because child reconnection did not complete`);
+		}
+	} catch (error) {
+		kept.push(entry);
+		summary.deferred.push(entry.id);
+		deps.warn(`retained settled process row "${entry.id}" after reconnect error: ${errorText(error)}`);
+	}
 }
 
 function errorText(error: unknown): string {

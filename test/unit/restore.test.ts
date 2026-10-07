@@ -40,9 +40,7 @@ function entry(overrides: Partial<AgentRegistryEntry> = {}): AgentRegistryEntry 
 
 function observation(overrides: Partial<RestoreObservation> = {}): RestoreObservation {
 	return {
-		sessionPresent: true,
 		completion: { finished: false },
-		resourceAlive: true,
 		...overrides,
 	};
 }
@@ -53,9 +51,11 @@ interface DepsHarness {
 	history: AgentRegistryEntry[];
 	persists: PersistedRegistryEntry[][];
 	reconnects: string[];
+	disposals: string[];
 	resourceAlive: boolean | undefined;
 	completion: RestoreCompletionObservation;
 	reconnectResult: "retained" | "closed" | "deferred";
+	disposalResult: boolean | Error;
 }
 
 function makeDeps(overrides: Partial<DepsHarness> = {}): DepsHarness {
@@ -64,9 +64,11 @@ function makeDeps(overrides: Partial<DepsHarness> = {}): DepsHarness {
 		history: [],
 		persists: [],
 		reconnects: [],
+		disposals: [],
 		resourceAlive: "resourceAlive" in overrides ? overrides.resourceAlive : true,
 		completion: overrides.completion ?? { finished: false },
 		reconnectResult: overrides.reconnectResult ?? "retained",
+		disposalResult: overrides.disposalResult ?? true,
 		deps: undefined as unknown as RestoreDeps,
 	};
 	harness.deps = {
@@ -78,6 +80,11 @@ function makeDeps(overrides: Partial<DepsHarness> = {}): DepsHarness {
 			const state = harness.reconnectResult;
 			return state === "retained" ? { state, entry: row } : { state };
 		},
+		disposeOrphan: (row) => {
+			harness.disposals.push(row.id);
+			if (harness.disposalResult instanceof Error) throw harness.disposalResult;
+			return harness.disposalResult;
+		},
 		recordCompleted: (row) => harness.history.push(row),
 		persist: (rows) => harness.persists.push([...rows]),
 		rememberAgents: true,
@@ -88,24 +95,13 @@ function makeDeps(overrides: Partial<DepsHarness> = {}): DepsHarness {
 }
 
 describe("decideRestore for process children", () => {
-	it("reconnects only when the authenticated child endpoint is available", () => {
-		expect(decideRestore(entry(), observation())).toEqual({ action: "reconnect" });
-	});
-
-	it("defers disconnected or indeterminate child state without discarding the durable row", () => {
-		const decision = decideRestore(entry(), observation({ resourceAlive: undefined }));
-		expect(decision.action).toBe("defer");
+	it("archives leftover active rows as orphan-stopped — never re-adopts (ADR 0007)", () => {
+		expect(decideRestore(entry(), observation())).toEqual({ action: "orphan-stopped" });
 	});
 
 	it("uses a settled child RPC outcome before launcher liveness", () => {
 		expect(
-			decideRestore(
-				entry(),
-				observation({
-					completion: { finished: true, outcome: "completed", result: "done" },
-					resourceAlive: false,
-				}),
-			),
+			decideRestore(entry(), observation({ completion: { finished: true, outcome: "completed", result: "done" } })),
 		).toEqual({ action: "completed", outcome: "completed" });
 	});
 
@@ -120,12 +116,6 @@ describe("decideRestore for process children", () => {
 		});
 	});
 
-	it("does not infer a successful completion from missing session files or dead launcher state", () => {
-		expect(decideRestore(entry(), observation({ sessionPresent: false, resourceAlive: false }))).toMatchObject({
-			action: "failed",
-		});
-	});
-
 	it("defers rows without a process control identity", () => {
 		expect(decideRestore(entry({ handle: undefined }), observation())).toEqual({
 			action: "defer",
@@ -134,7 +124,7 @@ describe("decideRestore for process children", () => {
 	});
 
 	it("recovers persisted terminal rows after an interrupted history write", () => {
-		expect(decideRestore(entry({ status: "completed" }), observation({ completion: { finished: false } }))).toEqual({
+		expect(decideRestore(entry({ status: "completed" }), observation())).toEqual({
 			action: "recover-terminal",
 		});
 	});
@@ -167,29 +157,45 @@ describe("restoreRegisteredRuns process reconciliation", () => {
 		expect(harness.persists.at(-1)).toEqual([row]);
 	});
 
-	it("retains active rows when the authenticated endpoint is unavailable", async () => {
+	it("archives leftover active rows stopped with verified disposal, without re-adopting", async () => {
 		const row = entry();
 		const harness = makeDeps({ resourceAlive: undefined });
 
 		const summary = await restoreRegisteredRuns([row], harness.deps);
 
-		expect(summary.deferred).toEqual(["run-1"]);
-		expect(harness.history).toEqual([]);
-		expect(harness.persists.at(-1)).toEqual([row]);
+		expect(summary.orphaned).toEqual(["run-1"]);
+		expect(harness.disposals).toEqual(["run-1"]);
+		expect(harness.reconnects).toEqual([]);
+		expect(harness.history).toMatchObject([{ id: "run-1", status: "stopped", completedAt: 5000 }]);
+		expect(harness.history[0]?.recoveryError).toMatch(/never re-adopted/);
+		expect(harness.history[0]).not.toHaveProperty("handle");
+		expect(harness.persists.at(-1)).toEqual([]);
 	});
 
-	it("marks an unreachable process failed rather than inferring success without an RPC outcome", async () => {
+	it("archives a dead leftover process stopped instead of inventing an error outcome", async () => {
 		const row = entry();
 		const harness = makeDeps({ resourceAlive: false });
 
 		const summary = await restoreRegisteredRuns([row], harness.deps);
 
-		expect(summary.failed).toEqual(["run-1"]);
-		expect(harness.history).toMatchObject([{ id: "run-1", status: "error" }]);
+		expect(summary.orphaned).toEqual(["run-1"]);
+		expect(harness.history).toMatchObject([{ id: "run-1", status: "stopped" }]);
 		expect(harness.persists.at(-1)).toEqual([]);
 	});
 
-	it("keeps settled process rows when rememberAgents is disabled", async () => {
+	it("retains the resource receipt when verified disposal fails", async () => {
+		const row = entry();
+		const harness = makeDeps({ disposalResult: new Error("identity mismatch") });
+
+		const summary = await restoreRegisteredRuns([row], harness.deps);
+
+		expect(summary.orphaned).toEqual(["run-1"]);
+		expect(summary.deferred).toEqual(["run-1"]);
+		expect(harness.history[0]?.recoveryError).toMatch(/verified disposal failed: identity mismatch/);
+		expect(harness.persists.at(-1)).toEqual([row]);
+	});
+
+	it("keeps settled process rows when rememberAgents is disabled; active rows still archive stopped", async () => {
 		const completedRow = entry({ id: "done-row", status: "completed" });
 		const activeRow = entry({ id: "live-row" });
 		const harness = makeDeps();
@@ -198,8 +204,8 @@ describe("restoreRegisteredRuns process reconciliation", () => {
 		const summary = await restoreRegisteredRuns([completedRow, activeRow], harness.deps);
 
 		expect(summary.skippedByRememberAgents).toEqual(["done-row"]);
-		expect(summary.reconnected).toEqual(["live-row"]);
-		expect(harness.persists.at(-1)).toEqual([completedRow, activeRow]);
+		expect(summary.orphaned).toEqual(["live-row"]);
+		expect(harness.persists.at(-1)).toEqual([completedRow]);
 	});
 });
 

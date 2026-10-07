@@ -106,6 +106,7 @@ Launchers never paste steer messages, press Enter for control, infer settlement 
 - Newly created private directories use `0700`; bootstrap/socket files use `0600`. Short OS-temp socket paths avoid Unix pathname limits.
 - Frames are bounded to 1 MiB. Transcript previews carry absolute cursor/offset and truncation metadata; full history remains in native JSONL.
 - At settlement the bridge writes the complete final assistant text to `sessions/<child-id>/result.md` (0600; last settled run wins) and attaches its path as `ChildOutcome.resultFile` — the full-result channel. The inline outcome copy stays 8 KiB-bounded for parent context economy; write failure degrades to the inline copy, never blocks settlement.
+- Orphan self-termination (ADR 0007 §1): the socket server arms a control-loss watch when the last client disconnects; a silent window past the reconnect grace means the parent died. The runtime aborts the active run through the native path, gives settlement a bounded window to persist the annotated partial result, then stops the host process.
 - Sequenced focus state carries native cwd/model/thinking/context/capabilities. Stable transcript IDs/revisions permit partial upserts; stale/wrong-run projections cannot rewind focus.
 - Replay/deduplication prevents duplicate prompt admission and request-ID reuse with different contents.
 - Native `agent_settled`, not `agent_end`, final text, pane disappearance or a sentinel, owns settlement. A natural final answer at the turn limit completes; continuing tool loops obey soft/grace/hard limits.
@@ -133,9 +134,11 @@ Registry/history live under the nearest original-project `.pi/teams/`; bootstrap
 
 Restore validates bootstrap identity, authenticates RPC and reconciles native outcomes. Stored terminal results stay authoritative even if their process later disappears. Verified child loss sets `BackendStatus.outcomeUnavailable`: it fails an active execution but cannot overwrite a saved terminal result/error.
 
+Session-bound lifetime (ADR 0007): startup never re-adopts an active row. Leftover active rows archive `stopped` with an honest recovery note while a settled child outcome observed first stays authoritative; their resources go through verified disposal (the budget-enforcement path), and a row whose disposal cannot be verified retains its receipt for an explicit release retry. Worktree checkouts, preserved branches, history and result files survive sessions.
+
 An authenticated PID mismatch against a non-tmux launcher identity quarantines control: disconnect/unwatch, stop reconnect attempts, reject steer/abort/resume/attach, and retain the resource receipt.
 
-Disposal requires an authenticated idle snapshot plus verified launcher termination, or `ProcessLauncher.cleanupExited` proof that the original process/group is absent and the saved terminal endpoint remains owned. `alive(false)` or missing RPC alone is insufficient: it may mean identity mismatch or transport uncertainty. Missing owned resources are idempotent success; foreign/replacement/live-disconnected resources retain a visible cleanup error and receipt. Startup retries this verified disposal for saved terminal rows; active rows without RPC remain deferred.
+Disposal requires an authenticated idle snapshot plus verified launcher termination, or `ProcessLauncher.cleanupExited` proof that the original process/group is absent and the saved terminal endpoint remains owned. `alive(false)` or missing RPC alone is insufficient: it may mean identity mismatch or transport uncertainty. Missing owned resources are idempotent success; foreign/replacement/live-disconnected resources retain a visible cleanup error and receipt. Startup retries this verified disposal for saved terminal rows.
 
 Settled headless termination verifies identity before SIGTERM and waits for confirmed process/group exit. Its native signal handler flushes/disposes the SDK session; unconfirmed exit retains the receipt. RPC shutdown is not used first, avoiding an ownership-check race against an exiting process.
 
@@ -189,8 +192,9 @@ Preservation failure retains the checkout with `recoveryError`. Release is non-f
 
 ## 17. Lifecycle and explicit cleanup
 
-- `session_start`: load configuration, restore handles, install UI projection, announce ready.
-- Session switch/shutdown: detach clients and persist receipts; active children and review checkouts remain independent.
+- `session_start`: load configuration, restore handles (terminal recovery only — leftover active rows archive stopped with verified disposal), install UI projection, announce ready.
+- Session switch/end/shutdown: teardown every child (ADR 0007 §1) — abort request, bounded cooperative grace (15s), then verified force-termination through the budget-enforcement path — then detach clients and persist receipts. Worktrees and result artifacts survive.
+- Child-side orphan detection: the authenticated control socket staying silent past a short reconnect grace aborts the current turn natively, preserves the annotated partial `result.md` ("stopped: parent control lost") and stops the child process (headless exit / TUI pane close). A hung parent that keeps its socket changes nothing.
 - `stop`: acknowledge native abort; authoritative settlement preserves artifacts and closes owned child/pane.
 - `/agents release <id>` or RPC `release`: retry retained verified child-resource cleanup; retain checkout.
 - `/agents release <id> --worktree` or `cleanupWorktree: true`: also remove clean preserved checkout after review/integration.

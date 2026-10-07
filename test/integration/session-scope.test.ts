@@ -104,15 +104,20 @@ async function makeApp(options: {
 }
 
 describe("session-scoped restore", () => {
-	it("adopts only rows owned by the current session; foreign live rows are retained untouched", async () => {
+	it("archives own leftover active rows stopped (no re-adoption); foreign live rows are retained untouched", async () => {
 		const own = row("own-run");
 		const foreign = row("foreign-run", { owner: { kind: "conversation", sessionId: "session-b" } });
-		const { app, registry } = await makeApp({ sessionId: "session-a", entries: [own, foreign] });
+		const { app, registry, history } = await makeApp({ sessionId: "session-a", entries: [own, foreign] });
 
-		expect(app.manager.get("own-run")).toBeDefined();
+		// Session-bound lifetime (ADR 0007): an active own row is never
+		// re-adopted — it archives stopped with an honest note and verified
+		// disposal of its resource.
+		expect(app.manager.get("own-run")).toBeUndefined();
 		expect(app.manager.get("foreign-run")).toBeUndefined();
+		expect(history).toMatchObject([{ id: "own-run", status: "stopped" }]);
+		expect(history[0]?.recoveryError).toMatch(/never re-adopted/);
 		expect(registry.some((entry) => "id" in entry && entry.id === "foreign-run")).toBe(true);
-		expect(app.manager.list().map((record) => record.id)).toEqual(["own-run"]);
+		expect(app.manager.list().map((record) => record.id)).toEqual([]);
 	});
 
 	it("archives a settled foreign row to history and drops it from the registry", async () => {

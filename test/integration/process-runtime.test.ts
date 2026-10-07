@@ -512,22 +512,22 @@ function observedHeadlessLauncher(): {
 
 describe("real process runtime", () => {
 	for (const live of [false, true]) {
-		it(`restores a settled unavailable-RPC receipt without ${live ? "killing a live child" : "retaining a verified dead child"}`, async () => {
+		it(`restores a settled unavailable-RPC receipt after ${live ? "control-loss self-termination" : "verified child death"}`, async () => {
 			const provider = await localProvider({ holdFirst: true });
 			const { launcher, exited } = observedHeadlessLauncher();
 			const original = new ProcessAgentExecutionBackend({ launchers: [launcher], connectTimeoutMs: 15_000 });
 			const restored = new ProcessAgentExecutionBackend({ launchers: [launcher] });
-			const id = `settled-disconnected-${live ? "live" : "dead"}`;
+			const id = `settled-disconnected-${live ? "selfstop" : "dead"}`;
 			const handle = await original.launch(launchInput(id, provider.cwd));
 			await provider.firstRequest;
 			const serialized = original.serializeHandle(handle);
 			if (!serialized?.launcher.pid) throw new Error("Native child identity is unavailable");
 			original.detach(handle);
 			await rm(serialized.socketPath, { force: true });
-			if (!live) {
-				process.kill(serialized.launcher.pid, "SIGKILL");
-				await exited;
-			}
+			if (!live) process.kill(serialized.launcher.pid, "SIGKILL");
+			// Session-bound lifetime: a detached live child sees control-socket
+			// loss and stops itself; both variants end with a verified exit.
+			await exited;
 			const store = createSubagentRunStore(provider.cwd);
 			store.writeRegistry([
 				{
@@ -567,24 +567,13 @@ describe("real process runtime", () => {
 				await app.sessionStart();
 				expect(app.manager.get(id)?.status).toBe("error");
 				expect(app.manager.get(id)?.error).toBe("Preserved provider failure");
-				if (live) {
-					expect(app.manager.get(id)?.handle).toBeDefined();
-					expect(app.manager.get(id)?.recoveryError).toBeDefined();
-					expect(store.readRegistry()).toMatchObject([{ id, handle: serialized }]);
-					expect(process.kill(serialized.launcher.pid ?? 0, 0)).toBe(true);
-				} else {
-					expect(app.manager.get(id)?.handle).toBeUndefined();
-					expect(store.readRegistry()).toEqual([]);
-					expect(() => process.kill(serialized.launcher.pid ?? 0, 0)).toThrow(/ESRCH/);
-				}
+				expect(app.manager.get(id)?.handle).toBeUndefined();
+				expect(store.readRegistry()).toEqual([]);
+				expect(() => process.kill(serialized.launcher.pid ?? 0, 0)).toThrow(/ESRCH/);
 				expect(store.readHistory()).toMatchObject([{ id, status: "error", error: "Preserved provider failure" }]);
 			} finally {
 				await app.sessionShutdown();
 				provider.releaseFirst();
-				if (live) {
-					await launcher.terminate(serialized.launcher);
-					await exited;
-				}
 			}
 		}, 60_000);
 	}
@@ -730,22 +719,25 @@ describe("real process runtime", () => {
 			if (originalHandle) await original.dispose(originalHandle);
 		}
 	}, 60_000);
-	it("retains a live disconnected child handle when its socket is unavailable", async () => {
+	it("self-terminates a detached child through control-socket loss (ADR 0007)", async () => {
 		const provider = await localProvider({ holdFirst: true });
 		const { launcher, exited } = observedHeadlessLauncher();
 		const backend = new ProcessAgentExecutionBackend({ launchers: [launcher], connectTimeoutMs: 15_000 });
 		let handle: AgentBackendHandle | undefined;
 		let serialized: SerializableBackendHandle | undefined;
 		try {
-			handle = await backend.launch(launchInput("live-disconnected", provider.cwd));
+			handle = await backend.launch(launchInput("control-loss-selfstop", provider.cwd));
 			await provider.firstRequest;
 			serialized = backend.serializeHandle(handle);
 			if (!serialized?.launcher.pid) throw new Error("Fixture launcher identity was not serializable");
 			backend.detach(handle);
-			await rm(serialized.socketPath, { force: true });
-			await expect(backend.dispose(handle)).rejects.toThrow();
-			expect(backend.serializeHandle(handle)).toBeDefined();
-			expect(await launcher.cleanupExited(serialized.launcher)).toBe(false);
+			// Detaching drops the control connection: the child must abort its
+			// held run, persist the annotated partial artifact and exit itself.
+			await exited;
+			const artifact = readFileSync(join(serialized.runDir, "result.md"), "utf8");
+			expect(artifact.startsWith("stopped: parent control lost")).toBe(true);
+			await backend.dispose(handle);
+			expect(backend.serializeHandle(handle)).toBeUndefined();
 		} finally {
 			provider.releaseFirst();
 			if (serialized) {

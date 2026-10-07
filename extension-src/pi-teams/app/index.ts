@@ -199,6 +199,7 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 			const summary = await restoreRegisteredRuns([...incompatible, ...owned], {
 				...observers,
 				reconnect: (entry) => manager.restoreReconnectedRun(entry),
+				disposeOrphan: (entry) => manager.disposeOrphanedRun(entry),
 				recordCompleted: (entry) => store.recordCompleted(entry),
 				persist: (kept) => store.writeRegistry([...kept, ...retainedForeign]),
 				rememberAgents: options.settings.rememberAgents,
@@ -209,8 +210,9 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 		},
 
 		async sessionShutdown() {
-			// Detach child clients, not delivery: /new, /resume and /fork reuse this app.
-			// Delivery reads the current host context and remains subscribed for the app lifetime.
+			// Session-bound lifetime (ADR 0007): teardown every child. Delivery
+			// stays subscribed for the app lifetime — /new, /resume and /fork
+			// reuse this app and its host reads the latest context dynamically.
 			await manager.shutdownSession();
 		},
 
