@@ -48,6 +48,12 @@ const agentParameters = Type.Object({
 		description:
 			"Use the exact canonical spelling from the Available agent types listed in this tool's description. Do not invent aliases.",
 	}),
+	name: Type.Optional(
+		Type.String({
+			description:
+				'Optional teammate name (letters, digits, ".", "_", "-", 1-64 chars). Names the run as a teammate of this session\'s team: it becomes the address for messaging, the task board and @mentions. A name is refused while that teammate is still working; reusing a settled name gives that teammate a new assignment.',
+		}),
+	),
 	model: Type.Optional(
 		Type.String({
 			description:
@@ -137,6 +143,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const base = {
 				type: params.subagent_type as string,
+				...(typeof params.name === "string" && params.name.length > 0 ? { name: params.name } : {}),
 				prompt: params.prompt as string,
 				description: params.description as string,
 				model: params.model as string | undefined,
@@ -193,13 +200,19 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 				const record = await manager.spawn(request);
 
 				if (record.isBackground === true) {
-					return textResult(`{agent:${record.id} started}`, {
-						agentId: record.id,
-						status: record.status,
-						background: true,
-						model: record.model,
-						modelFallback: record.modelFallback,
-					});
+					return textResult(
+						record.teammateName !== undefined
+							? `{agent:${record.id} started as @${record.teammateName}}`
+							: `{agent:${record.id} started}`,
+						{
+							agentId: record.id,
+							...(record.teammateName !== undefined ? { teammateName: record.teammateName } : {}),
+							status: record.status,
+							background: true,
+							model: record.model,
+							modelFallback: record.modelFallback,
+						},
+					);
 				}
 
 				// Foreground: the caller blocks on this tool call — await inline.

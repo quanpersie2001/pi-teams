@@ -48,6 +48,8 @@ export type DeliveryOutcome = "completed" | "failed" | "stopped";
 
 export interface CompletionNotification {
 	agentId: string;
+	/** Teammate address the run was spawned under; the header uses @name when present. */
+	teammateName?: string;
 	agentType: string;
 	description: string;
 	status: AgentRunStatus;
@@ -311,6 +313,7 @@ export class DeliveryService {
 		});
 		const notification: CompletionNotification = {
 			agentId: event.agentId,
+			...(event.teammateName !== undefined ? { teammateName: event.teammateName } : {}),
 			agentType: event.type,
 			description: event.description,
 			status: event.status,

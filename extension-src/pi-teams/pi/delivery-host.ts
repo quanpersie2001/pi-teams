@@ -87,9 +87,9 @@ export function createPiDeliveryHost(pi: ExtensionAPI, getContext: () => Extensi
 		// renderer for the customType; without one this text displays verbatim.
 		const verb =
 			notification.outcome === "completed" ? "finished" : notification.outcome === "failed" ? "failed" : "stopped";
+		const who = notification.teammateName !== undefined ? `@${notification.teammateName}` : notification.agentId;
 		const header =
-			`Teammate ${notification.agentId} ${verb}` +
-			` (${notification.agentType}, ${formatDuration(notification.durationMs)})`;
+			`Teammate ${who} ${verb}` + ` (${notification.agentType}, ${formatDuration(notification.durationMs)})`;
 		const preview = notification.preview.trim();
 		const lines = [header, "", preview.length > 0 ? preview : "(no output)"];
 		if (notification.resultFile !== undefined) lines.push("", `full result: ${notification.resultFile}`);
@@ -101,7 +101,7 @@ export function createPiDeliveryHost(pi: ExtensionAPI, getContext: () => Extensi
 					display: true,
 					details: {
 						agentId: notification.agentId,
-						type: notification.agentType,
+						...(notification.teammateName !== undefined ? { teammateName: notification.teammateName } : {}),
 						description: notification.description,
 						status: notification.status,
 						outcome: notification.outcome,

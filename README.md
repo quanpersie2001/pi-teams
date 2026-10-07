@@ -117,7 +117,7 @@ HerdR/tmux keep Main on the left and stack at most three children per right-hand
 
 | Tool | Purpose |
 |---|---|
-| `Agent` | Launch a specialist with an explicit assignment, or resume a settled run by `resume` run ID |
+| `Agent` | Launch a specialist with an explicit assignment — optionally `name:` it a teammate of this session's team (`@name` becomes its messaging/board address; a name is refused while that teammate is still working, and a settled name means a new assignment for the same teammate) — or resume a settled run by `resume` run ID |
 | `get_subagent_result` | Inspect a run's status and read its full result — durable, re-readable from the run's `result.md` artifact on every call; `wait: true` blocks until the run settles |
 | `steer_subagent` | Send guidance to an active run |
 | `send_inbox_message`, `read_inbox`, `consume_inbox_message` | Scoped parent/child/sibling messaging |

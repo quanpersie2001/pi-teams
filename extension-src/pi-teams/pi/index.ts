@@ -16,6 +16,7 @@ import { createPiDeliveryHost, createPiInboxDelivery } from "./delivery-host.js"
 import { ProcessAgentExecutionBackend, resolveLauncherHint, resolveSessionLauncherHint } from "./process-backend.js";
 import { createSubagentRunStore } from "./registry-host.js";
 import { type SubagentsRpcWiring, wireSubagentsRpc } from "./rpc.js";
+import { createPiTeamStore } from "./teams-host.js";
 import { registerInboxTools, registerParentMessageInspectionTool, registerSubagentTools } from "./tools.js";
 import { createPiTranscriptSource } from "./transcript-host.js";
 import { installSubagentsUi, type SubagentsUiHandle } from "./ui-host.js";
@@ -75,6 +76,7 @@ export default function (pi: ExtensionAPI): void {
 		restoreObservers: restoreObservers(backend),
 		deliveryHost: createPiDeliveryHost(pi, () => latestCtx),
 		sendToParent: createPiInboxDelivery(pi, () => latestCtx),
+		createTeamStore: (sessionId) => createPiTeamStore(configCwd, sessionId),
 	});
 	const transcripts = createPiTranscriptSource({ backends: [backend] });
 	let uiHandle: SubagentsUiHandle | undefined;

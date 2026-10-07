@@ -39,6 +39,8 @@ export interface AgentRun {
 	type: string;
 	description: string;
 	status: AgentRunStatus;
+	/** Teammate address this run was spawned under (ADR 0007 §2); unset for anonymous runs. */
+	teammateName?: string;
 
 	backend: AgentRunBackend;
 	handle?: AgentBackendHandle;

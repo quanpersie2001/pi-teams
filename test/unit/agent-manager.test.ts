@@ -670,6 +670,60 @@ describe("session teardown (ADR 0007 §1)", () => {
 	});
 });
 
+describe("teammate names (ADR 0007 §2)", () => {
+	it("records the teammate name and persists it through history", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+
+		const named = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "scout",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		expect(fixture.manager.get(named.id)?.teammateName).toBe("scout");
+
+		fixture.backend.complete(named.id, "done");
+		await fixture.manager.whenSettled(named.id);
+		expect(fixture.store.history.find((entry) => entry.id === named.id)?.teammateName).toBe("scout");
+	});
+
+	it("rejects invalid or reserved names and busy teammates; settled names are claimable again", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+
+		await expect(
+			fixture.manager.spawn({ type: "general-purpose", name: "lead", prompt: "x", run_in_background: true }),
+		).rejects.toThrow(/reserved/);
+		await expect(
+			fixture.manager.spawn({ type: "general-purpose", name: "bad name!", prompt: "x", run_in_background: true }),
+		).rejects.toThrow(/Invalid teammate name/);
+
+		const active = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "scout",
+			prompt: "x",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		await expect(
+			fixture.manager.spawn({ type: "general-purpose", name: "scout", prompt: "y", run_in_background: true }),
+		).rejects.toThrow(/already working on run/);
+
+		// Teammates persist across assignments: a settled name gains a new run.
+		fixture.backend.complete(active.id, "done");
+		await fixture.manager.whenSettled(active.id);
+		const next = await fixture.manager.spawn({
+			type: "explore",
+			name: "scout",
+			prompt: "next assignment",
+			run_in_background: true,
+		});
+		expect(fixture.manager.get(next.id)?.teammateName).toBe("scout");
+	});
+});
+
 describe("AgentManager dispose", () => {
 	it("stops everything and disposes backend handles", async () => {
 		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 2 } });

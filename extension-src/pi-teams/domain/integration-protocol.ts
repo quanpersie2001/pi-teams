@@ -19,6 +19,8 @@ export interface AgentRunSnapshot {
 	id: string;
 	type: string;
 	description: string;
+	/** Teammate address this run was spawned under; additive optional (protocol v3 unchanged). */
+	teammateName?: string;
 	status: AgentRunStatus;
 	backend: "process";
 	model?: string;
@@ -61,6 +63,7 @@ export function toRunSnapshot(run: AgentRun): AgentRunSnapshot {
 		owner: { ...run.owner },
 		delivery: run.delivery,
 	};
+	if (run.teammateName !== undefined) snapshot.teammateName = run.teammateName;
 	if (run.model !== undefined) snapshot.model = run.model;
 	if (run.modelFallback !== undefined) snapshot.modelFallback = run.modelFallback;
 	if (run.sessionFile !== undefined) snapshot.sessionFile = run.sessionFile;
@@ -91,6 +94,8 @@ export interface AgentLifecycleEvent {
 	type: string;
 	description: string;
 	status: AgentRunStatus;
+	/** Teammate address this run was spawned under; additive optional (protocol v3 unchanged). */
+	teammateName?: string;
 	model?: string;
 	modelFallback?: string;
 	owner: AgentOwner;

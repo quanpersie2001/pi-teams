@@ -204,7 +204,11 @@ The parent renderer owns the inline panel, Agents Hub and remote-focus overlay, 
 
 `app/message-service.ts` owns scoped bounded process-local inbox receipts with distinct delivered/consumed timestamps. Messages are separate from composer steer and completion delivery. Closed recipients wait for cold continuation with stable message IDs; reload/restart clears memory. See [Integration messaging](./INTEGRATION.md#scoped-inbox-messaging) for tools, limits and trusted sender/session rules.
 
-## 18. Exclusions and runtime boundary
+## 18. Team roster (ADR 0007 §2)
+
+One team per session, created at `session_start`; the team id derives from the session id and lives under `.pi/teams/t/<team-id>/` (`config.json`, owner-only, atomic writes). `Agent(name:)` claims a teammate address for the run — uniqueness is enforced against active runs only: **teammates persist across assignments until the session ends**, so a settled name claims a new assignment and a resumed run keeps its teammate. The roster records members (name, specialist type, latest run) through the app-layer `TeamService` over an injected store; the completion notification header addresses named runs as `Teammate @<name>`; `lead` is reserved.
+
+## 19. Exclusions and runtime boundary
 
 No Task/DAG workflow, nested delegation, scheduling, semantic memory, group joins, automatic integration, parent SDK fallback, terminal-input task steering or process security sandbox. See [ADR 0003](./decisions/0003-deliberate-feature-scope.md).
 

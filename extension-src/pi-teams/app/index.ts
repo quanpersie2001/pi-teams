@@ -21,6 +21,7 @@ import type {
 	RestoreObservers,
 	SubagentRunStore,
 } from "./run-registry.js";
+import { TeamService, type TeamStore } from "./team-service.js";
 import type { WorktreeService } from "./worktree-service.js";
 
 export interface PiSubagentsAppOptions {
@@ -57,6 +58,12 @@ export interface PiSubagentsAppOptions {
 	sendToParent?(message: InboxMessage): Promise<boolean>;
 	/** Managed worktree service. Checkouts remain until explicit release. */
 	worktreeService?: WorktreeService;
+	/**
+	 * Team roster store factory (pi/teams-host.ts); receives the live session
+	 * id at each session_start (one team per session, ADR 0007 §2). When
+	 * omitted no roster is kept.
+	 */
+	createTeamStore?: (sessionId: string) => TeamStore;
 }
 
 export interface PiSubagentsApp {
@@ -75,6 +82,8 @@ export interface PiSubagentsApp {
 	readonly messages: MessageService;
 	/** Owner-aware conversation delivery; present only with a deliveryHost. */
 	readonly delivery?: DeliveryService;
+	/** Session's team service (roster); present only with a team store factory. */
+	readonly teams: TeamService | undefined;
 	/** Summary of the last session_start restore pass, when one ran. */
 	lastRestoreSummary?: Awaited<ReturnType<typeof restoreRegisteredRuns>>;
 	/**
@@ -110,6 +119,15 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 	});
 	manager.setMessageService(messages);
 
+	// One team per session (ADR 0007 §2): the roster records every admitted
+	// assignment under a teammate name. Rebuilt at each session_start from the
+	// live session id; when no store factory is provided no roster is kept.
+	let teams: TeamService | undefined;
+	manager.subscribe((event) => {
+		if (event.event !== "started" || event.teammateName === undefined) return;
+		teams?.recordAssignment({ name: event.teammateName, type: event.type, runId: event.agentId });
+	});
+
 	// Owner-aware completion delivery. Subscribes to the same
 	// lifecycle event stream the pi host forwards onto pi.events.
 	const delivery = options.deliveryHost ? new DeliveryService(manager, options.deliveryHost) : undefined;
@@ -119,6 +137,9 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 		manager,
 		messages,
 		...(delivery !== undefined ? { delivery } : {}),
+		get teams() {
+			return teams;
+		},
 
 		updateSettings(settings) {
 			options.settings = settings;
@@ -133,6 +154,13 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 			await registry.load();
 			manager.updateSettings(options.settings);
 			options.worktreeService?.updateSettings(options.settings);
+			if (options.createTeamStore !== undefined) {
+				teams = new TeamService({
+					sessionId: options.getSessionId?.() ?? "unknown-session",
+					store: options.createTeamStore(options.getSessionId?.() ?? "unknown-session"),
+				});
+				teams.sessionStart();
+			}
 
 			const store = options.runStore;
 			const observers = options.restoreObservers;

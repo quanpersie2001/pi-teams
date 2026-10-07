@@ -36,6 +36,8 @@ export interface AgentRegistryEntry {
 	id: string;
 	type: string;
 	description: string;
+	/** Teammate address this run was spawned under (ADR 0007 §2). */
+	teammateName?: string;
 	status: AgentRunStatus;
 	backend: "process";
 	handle?: SerializableBackendHandle;
@@ -165,6 +167,7 @@ export function toRegistryEntry(
 		usage: { ...record.usage },
 		isBackground: record.isBackground === true,
 	};
+	if (record.teammateName !== undefined) entry.teammateName = record.teammateName;
 	if (record.handle !== undefined) {
 		const serialized = project?.(record.handle, record.sessionFile);
 		if (serialized !== undefined) entry.handle = serialized;

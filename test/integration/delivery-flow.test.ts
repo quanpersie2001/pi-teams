@@ -128,6 +128,24 @@ describe("delivery host integration", () => {
 		});
 	});
 
+	it("addresses the completion notification by teammate name", async () => {
+		const fixture = await makeFixture({ sessionId: "session-a" });
+		const record = await fixture.app.manager.spawn({
+			type: "general-purpose",
+			name: "scout",
+			prompt: "find auth files",
+			run_in_background: true,
+		});
+		await settle(20);
+		fixture.backend.complete(record.id, "Found the files.");
+		await settle();
+
+		const sent = fixture.host.sentMessages[0];
+		expect(sent).toBeDefined();
+		expect(String(sent?.message.content)).toMatch(/^Teammate @scout finished \(general-purpose, \d+s\)/);
+		expect(sent?.message.details).toMatchObject({ teammateName: "scout", agentId: record.id });
+	});
+
 	it("extension-owned runs emit pi.events but never inject a conversation message", async () => {
 		const fixture = await makeFixture({ sessionId: "session-a" });
 		const record = await fixture.app.manager.spawn({

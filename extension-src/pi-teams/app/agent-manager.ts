@@ -33,6 +33,7 @@ import {
 	toRunSnapshot,
 } from "../domain/integration-protocol.js";
 import type { InboxMessage } from "../domain/message.js";
+import { teammateNameProblem } from "../domain/team.js";
 import type { WorktreeInfo } from "../domain/worktree.js";
 import type { AgentRegistry } from "./agent-registry.js";
 import { resolveBackend } from "./backend-selector.js";
@@ -58,6 +59,8 @@ import type { WorktreeService } from "./worktree-service.js";
 /** Spawn request accepted by the manager (tool/RPC-neutral shape). */
 export interface SpawnRequest {
 	type: string;
+	/** Teammate address for this assignment (ADR 0007 §2); uniqueness is enforced against active runs. */
+	name?: string;
 	prompt: string;
 	description?: string | undefined;
 	/** Explicit detached flag; omitted → the resolved definition's defaultBackground. */
@@ -323,6 +326,7 @@ export class AgentManager {
 			type: snapshot.type,
 			description: snapshot.description,
 			status: snapshot.status,
+			...(snapshot.teammateName !== undefined ? { teammateName: snapshot.teammateName } : {}),
 			owner: snapshot.owner,
 			delivery: snapshot.delivery,
 			usage: snapshot.usage,
@@ -388,6 +392,23 @@ export class AgentManager {
 	}
 
 	/**
+	 * Teammate names are the team's address space (ADR 0007 §2): a valid name
+	 * is claimable while its previous assignment is settled — teammates
+	 * persist across assignments until the session ends — and rejected while
+	 * an active run still carries it.
+	 */
+	private assertTeammateNameAvailable(name: string): void {
+		const problem = teammateNameProblem(name);
+		if (problem !== undefined) throw new Error(`Invalid teammate name "${name}": ${problem}.`);
+		for (const internal of this.runs.values()) {
+			if (internal.record.teammateName !== name || !isActiveStatus(internal.record.status)) continue;
+			throw new Error(
+				`Teammate "@${name}" is already working on run "${internal.record.id}" — wait for it to settle or steer it instead.`,
+			);
+		}
+	}
+
+	/**
 	 * Foreground spawn: shares the concurrency queue and awaits settlement.
 	 */
 	async spawnAndWait(
@@ -406,6 +427,7 @@ export class AgentManager {
 	private async allocate(request: SpawnRequest, plan: LaunchPlan, worktree?: WorktreeInfo): Promise<AgentRun> {
 		if (this.disposed) throw new Error("AgentManager is disposed");
 		if (this.shuttingDown) throw new Error("AgentManager is shutting down");
+		if (request.name !== undefined) this.assertTeammateNameAvailable(request.name);
 		const epoch = this.admissionEpoch;
 
 		const overrides: {
@@ -452,6 +474,7 @@ export class AgentManager {
 			type: snapshot.resolved.type,
 			description: request.description ?? snapshot.resolved.description,
 			status: "queued",
+			...(request.name !== undefined ? { teammateName: request.name } : {}),
 			backend: "process",
 			model: admission.model,
 			...(admission.fallback !== undefined ? { modelFallback: admission.fallback } : {}),
@@ -954,6 +977,8 @@ export class AgentManager {
 		};
 		const spawnRequest: SpawnRequest = {
 			type: source.type,
+			// A resumed run is the same teammate's next assignment.
+			...(source.teammateName !== undefined ? { name: source.teammateName } : {}),
 			prompt,
 			description: source.description,
 			run_in_background: background,
@@ -1215,6 +1240,7 @@ export class AgentManager {
 			type: entry.type,
 			description: entry.description,
 			status: entry.status,
+			...(entry.teammateName !== undefined ? { teammateName: entry.teammateName } : {}),
 			backend: "process",
 			handle,
 			...(entry.model !== undefined ? { model: entry.model } : {}),
@@ -1820,6 +1846,7 @@ export class AgentManager {
 		const duration = record.completedAt !== undefined ? Math.max(0, record.completedAt - record.startedAt) : undefined;
 		const head =
 			`Agent: ${record.id}\n` +
+			(record.teammateName !== undefined ? `Teammate: @${record.teammateName}\n` : "") +
 			`Type: ${record.type} | Status: ${record.status}\n` +
 			`Description: ${record.description}\n` +
 			(record.model !== undefined ? `Model: ${record.model}\n` : "") +
@@ -1908,6 +1935,7 @@ function historyToRun(entry: CompletedRunHistoryEntry): AgentRun {
 		type: entry.type,
 		description: entry.description,
 		status: entry.status,
+		...(entry.teammateName !== undefined ? { teammateName: entry.teammateName } : {}),
 		backend: entry.backend,
 		...(entry.model !== undefined ? { model: entry.model } : {}),
 		...(entry.modelFallback !== undefined ? { modelFallback: entry.modelFallback } : {}),

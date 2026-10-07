@@ -237,6 +237,29 @@ describe("Agent tool", () => {
 		expect(result.details.background).toBe(true);
 	});
 
+	it("names a background run as a teammate", async () => {
+		const fixture = await makeFixture();
+		const agent = fixture.tools.get("Agent");
+
+		const result = await agent.execute(
+			"call-2b",
+			{
+				prompt: "long work",
+				description: "detached",
+				subagent_type: "general-purpose",
+				name: "scout",
+				run_in_background: true,
+			},
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+
+		expect(textOf(result)).toMatch(/^\{agent:run-\d+ started as @scout\}$/);
+		expect(result.details.teammateName).toBe("scout");
+		expect(fixture.app.manager.get(String(result.details.agentId))?.teammateName).toBe("scout");
+	});
+
 	it("returns a readable error for an unresolvable subagent_type", async () => {
 		const fixture = await makeFixture();
 		const agent = fixture.tools.get("Agent");
