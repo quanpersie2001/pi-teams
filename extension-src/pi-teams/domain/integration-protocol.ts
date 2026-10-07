@@ -24,6 +24,8 @@ export interface AgentRunSnapshot {
 	model?: string;
 	modelFallback?: string;
 	sessionFile?: string;
+	/** Absolute path of the run's full-result artifact; additive optional (protocol v3 unchanged). */
+	resultFile?: string;
 	result?: string;
 	error?: string;
 	recoveryError?: string;
@@ -62,6 +64,7 @@ export function toRunSnapshot(run: AgentRun): AgentRunSnapshot {
 	if (run.model !== undefined) snapshot.model = run.model;
 	if (run.modelFallback !== undefined) snapshot.modelFallback = run.modelFallback;
 	if (run.sessionFile !== undefined) snapshot.sessionFile = run.sessionFile;
+	if (run.resultFile !== undefined) snapshot.resultFile = run.resultFile;
 	if (run.result !== undefined) snapshot.result = run.result;
 	if (run.error !== undefined) snapshot.error = run.error;
 	if (run.recoveryError !== undefined) snapshot.recoveryError = run.recoveryError;
@@ -98,6 +101,8 @@ export interface AgentLifecycleEvent {
 	worktreeReleased?: boolean;
 	parentSession?: ParentSessionRef;
 	sessionFile?: string;
+	/** Absolute path of the run's full-result artifact; additive optional (protocol v3 unchanged). */
+	resultFile?: string;
 	worktree?: WorktreeInfo;
 	worktreeResult?: WorktreeResult;
 	usage: UsageSummary;

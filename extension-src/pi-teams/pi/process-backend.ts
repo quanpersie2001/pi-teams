@@ -485,6 +485,9 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				state: outcome.status,
 				...meta,
 				...(outcome.result !== undefined ? { result: outcome.result } : {}),
+				...(outcome.resultFile !== undefined ? { resultFile: outcome.resultFile } : {}),
+				...(outcome.resultTruncated !== undefined ? { resultTruncated: outcome.resultTruncated } : {}),
+				...(outcome.resultOriginalLength !== undefined ? { resultOriginalLength: outcome.resultOriginalLength } : {}),
 				...(outcome.error !== undefined ? { error: outcome.error } : {}),
 			});
 		} else if (!run.child.connected)

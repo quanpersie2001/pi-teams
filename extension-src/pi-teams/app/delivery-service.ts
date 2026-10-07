@@ -54,6 +54,12 @@ export interface CompletionNotification {
 	outcome: DeliveryOutcome;
 	/** Truncated result preview ("completed") or error text ("failed"). */
 	preview: string;
+	/** Absolute path of the full-result artifact; absent when the child wrote none. */
+	resultFile?: string;
+	/** Wall-clock run duration; absent while unknown. */
+	durationMs?: number;
+	/** totalTokens at settlement (cacheRead excluded), when usage was observed. */
+	totalTokens?: number;
 }
 
 /**
@@ -310,6 +316,9 @@ export class DeliveryService {
 			status: event.status,
 			outcome: outcomeOf(event.event),
 			preview: budgetNote !== undefined ? (preview.length > 0 ? `${preview}\n${budgetNote}` : budgetNote) : preview,
+			...(event.resultFile !== undefined ? { resultFile: event.resultFile } : {}),
+			...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+			...(event.usage !== undefined ? { totalTokens: event.usage.totalTokens } : {}),
 		};
 		try {
 			this.host.sendNotification(notification);

@@ -60,6 +60,7 @@ export class FakeBackend implements AgentExecutionBackend {
 	private readonly focusListeners = new Map<string, Set<(state: ChildState) => void>>();
 	private readonly focusSeqByRun = new Map<string, number>();
 	private nextHandle = 0;
+	private readonly launchWaiters: Array<PromiseWithResolvers<AgentLaunchInput>> = [];
 
 	async available(): Promise<boolean> {
 		return this.availableResult;
@@ -80,7 +81,20 @@ export class FakeBackend implements AgentExecutionBackend {
 		const handle: AgentBackendHandle = { kind: "process", handle: `fake-handle-${this.nextHandle}` };
 		this.runByHandle.set(handle.handle, input.runId);
 		if (this.statuses.get(input.runId)?.state === "starting") this.setStatus(input.runId, { state: "running" });
+		for (const waiter of this.launchWaiters.splice(0)) waiter.resolve(input);
 		return handle;
+	}
+
+	/**
+	 * Deterministic signal for the next launch()/resume() call — resolves with
+	 * the launch input once the stored status already reads "running", so a
+	 * test's setStatus/complete can never be overwritten by the launch itself
+	 * and the manager's post-subscribe status probe observes it.
+	 */
+	nextLaunch(): Promise<AgentLaunchInput> {
+		const waiter = Promise.withResolvers<AgentLaunchInput>();
+		this.launchWaiters.push(waiter);
+		return waiter.promise;
 	}
 
 	async resume(input: AgentResumeInput): Promise<AgentBackendHandle> {
@@ -206,8 +220,18 @@ export class FakeBackend implements AgentExecutionBackend {
 		for (const listener of [...(this.focusListeners.get(runId) ?? [])]) listener(state);
 	}
 
-	complete(runId: string, result: string, sessionFile?: string): void {
-		this.setStatus(runId, { state: "completed", result, ...(sessionFile !== undefined ? { sessionFile } : {}) });
+	complete(
+		runId: string,
+		result: string,
+		sessionFile?: string,
+		extra?: Pick<BackendStatus, "resultFile" | "resultTruncated" | "resultOriginalLength">,
+	): void {
+		this.setStatus(runId, {
+			state: "completed",
+			result,
+			...(sessionFile !== undefined ? { sessionFile } : {}),
+			...extra,
+		});
 	}
 
 	fail(runId: string, error: string): void {

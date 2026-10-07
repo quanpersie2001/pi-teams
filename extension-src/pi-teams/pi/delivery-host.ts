@@ -18,8 +18,8 @@
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CompletionNotification, DeliveryHost, SessionSnapshot } from "../app/delivery-service.js";
+import { TEAMMATE_NOTIFICATION_TYPE } from "../domain/delivery.js";
 import type { InboxMessage } from "../domain/message.js";
-import { TEAMMATE_NOTIFICATION_TYPE } from "../features/notifications/index.js";
 import { ignoreStaleExtensionCtx } from "../shared/stale-context.js";
 
 interface SessionManagerView {
@@ -28,26 +28,16 @@ interface SessionManagerView {
 	getBranch?: () => Array<{ id: string }>;
 }
 
-function outcomeIcon(outcome: CompletionNotification["outcome"]): string {
-	switch (outcome) {
-		case "completed":
-			return "✓";
-		case "failed":
-			return "✗";
-		default:
-			return "■"; // stopped
-	}
-}
-
-function outcomeLabel(outcome: CompletionNotification["outcome"]): string {
-	switch (outcome) {
-		case "completed":
-			return "completed";
-		case "failed":
-			return "failed";
-		default:
-			return "stopped";
-	}
+/** Human-readable duration for the notification header, e.g. "42s", "1m 03s". */
+function formatDuration(durationMs: number | undefined): string {
+	if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 0) return "unknown duration";
+	const seconds = Math.round(durationMs / 1000);
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	const remainder = seconds % 60;
+	if (minutes < 60) return `${minutes}m ${String(remainder).padStart(2, "0")}s`;
+	const hours = Math.floor(minutes / 60);
+	return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 /**
@@ -90,19 +80,24 @@ export function createPiDeliveryHost(pi: ExtensionAPI, getContext: () => Extensi
 	}
 
 	function sendNotification(notification: CompletionNotification): void {
-		const label = outcomeLabel(notification.outcome);
-		const preview = notification.preview.trimEnd();
-		const content =
-			`${outcomeIcon(notification.outcome)} ${notification.agentType} ${label}` +
-			` (${notification.description})\n\n${preview || "(no output)"}`;
-		// Styled rendering happens through the registered message renderer
-		// (features/notifications); content remains a readable plain-text
-		// fallback for hosts without custom message renderers (RPC/print).
+		// Renderer contract (docs/INTEGRATION.md): structured plain text is the
+		// canonical presentation — first line identifies the teammate and
+		// outcome, the body is the bounded preview, the last line points at the
+		// durable full-result artifact. A pi-style companion may register a
+		// renderer for the customType; without one this text displays verbatim.
+		const verb =
+			notification.outcome === "completed" ? "finished" : notification.outcome === "failed" ? "failed" : "stopped";
+		const header =
+			`Teammate ${notification.agentId} ${verb}` +
+			` (${notification.agentType}, ${formatDuration(notification.durationMs)})`;
+		const preview = notification.preview.trim();
+		const lines = [header, "", preview.length > 0 ? preview : "(no output)"];
+		if (notification.resultFile !== undefined) lines.push("", `full result: ${notification.resultFile}`);
 		ignoreStaleExtensionCtx(() => {
 			pi.sendMessage(
 				{
 					customType: TEAMMATE_NOTIFICATION_TYPE,
-					content,
+					content: lines.join("\n"),
 					display: true,
 					details: {
 						agentId: notification.agentId,
@@ -110,6 +105,9 @@ export function createPiDeliveryHost(pi: ExtensionAPI, getContext: () => Extensi
 						description: notification.description,
 						status: notification.status,
 						outcome: notification.outcome,
+						...(notification.resultFile !== undefined ? { resultFile: notification.resultFile } : {}),
+						...(notification.durationMs !== undefined ? { durationMs: notification.durationMs } : {}),
+						...(notification.totalTokens !== undefined ? { totalTokens: notification.totalTokens } : {}),
 					},
 				},
 				{ deliverAs: "followUp", triggerTurn: true },

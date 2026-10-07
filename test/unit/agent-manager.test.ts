@@ -3,6 +3,9 @@
 // defaults and result-consumption semantics. All runs use the deterministic
 // process FakeBackend — no external model calls.
 
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
 import { AgentRegistry, type LoadedAgentFile } from "../../extension-src/pi-teams/app/agent-registry.js";
@@ -528,20 +531,75 @@ describe("AgentManager restored terminal cleanup", () => {
 	});
 });
 
-describe("get_subagent_result controller semantics", () => {
-	it("returns the result once, then reports double consumption as an error", async () => {
+describe("get_subagent_result full-result channel", () => {
+	let tempDir: string | undefined;
+
+	afterEach(() => {
+		if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+		tempDir = undefined;
+	});
+
+	it("re-reads the full result file on every call; consume only suppresses the notification", async () => {
 		const fixture = makeManager();
 		await load(fixture);
+		tempDir = mkdtempSync(join(tmpdir(), "teams-result-"));
+		const resultFile = join(tempDir, "result.md");
+		const fullAnswer = "the full answer ".repeat(1_000);
+		writeFileSync(resultFile, fullAnswer);
 
 		const record = await spawnBg(fixture.manager);
 		await settle(fixture.manager, 20);
-		fixture.backend.complete(record.id, "the answer");
+		fixture.backend.complete(record.id, "the full answer ".repeat(1_000).slice(0, 8_000), undefined, {
+			resultFile,
+			resultTruncated: true,
+			resultOriginalLength: fullAnswer.length,
+		});
 		await fixture.manager.whenSettled(record.id);
 
 		const first = await fixture.manager.getResult(record.id);
-		expect(first).toContain("the answer");
+		expect(first).toContain(fullAnswer.trim());
+		expect(first).toContain(`full result: ${resultFile}`);
 		const second = await fixture.manager.getResult(record.id);
-		expect(second).toMatch(/already consumed by a previous call/);
+		expect(second).toContain(fullAnswer.trim());
+		expect(fixture.manager.get(record.id)?.resultConsumed).toBe(true);
+	});
+
+	it("falls back to the inline copy with an honest note when the result file is unreadable", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		tempDir = mkdtempSync(join(tmpdir(), "teams-result-"));
+
+		const record = await spawnBg(fixture.manager);
+		await settle(fixture.manager, 20);
+		const inline = "the inline answer";
+		fixture.backend.complete(record.id, inline, undefined, { resultFile: join(tempDir, "missing.md") });
+		await fixture.manager.whenSettled(record.id);
+
+		const text = await fixture.manager.getResult(record.id);
+		expect(text).toContain(inline);
+		expect(text).toMatch(/unreadable/);
+	});
+
+	it("labels the inline copy as truncated with the full-result pointer when no file was re-read", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		tempDir = mkdtempSync(join(tmpdir(), "teams-result-"));
+		const resultFile = join(tempDir, "result.md");
+		writeFileSync(resultFile, "");
+
+		const record = await spawnBg(fixture.manager);
+		await settle(fixture.manager, 20);
+		const inline = "x".repeat(8_193); // 8192 chars + truncation ellipsis
+		fixture.backend.complete(record.id, inline, undefined, {
+			resultFile,
+			resultTruncated: true,
+			resultOriginalLength: 20_000,
+		});
+		await fixture.manager.whenSettled(record.id);
+
+		const text = await fixture.manager.getResult(record.id);
+		// Empty file → not "showingFull" → inline copy + truncation note path.
+		expect(text).toMatch(new RegExp(`Result truncated at 8192/20000 chars — full: ${escapeRegExp(resultFile)}`));
 	});
 
 	it("wait: true blocks until settlement; aborting keeps the result unconsumed", async () => {
@@ -572,6 +630,10 @@ describe("get_subagent_result controller semantics", () => {
 		expect(await fixture.manager.getResult("ghost")).toMatch(/Agent not found/);
 	});
 });
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 describe("AgentManager dispose", () => {
 	it("stops everything and disposes backend handles", async () => {

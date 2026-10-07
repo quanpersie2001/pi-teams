@@ -105,7 +105,7 @@ Launchers never paste steer messages, press Enter for control, infer settlement 
 - Authenticated Unix socket with NDJSON requests/replies/events, child ID and random token.
 - Newly created private directories use `0700`; bootstrap/socket files use `0600`. Short OS-temp socket paths avoid Unix pathname limits.
 - Frames are bounded to 1 MiB. Transcript previews carry absolute cursor/offset and truncation metadata; full history remains in native JSONL.
-- Native prompt, steer, abort, state, focus controls, messaging and shutdown are independent of terminal input.
+- At settlement the bridge writes the complete final assistant text to `sessions/<child-id>/result.md` (0600; last settled run wins) and attaches its path as `ChildOutcome.resultFile` — the full-result channel. The inline outcome copy stays 8 KiB-bounded for parent context economy; write failure degrades to the inline copy, never blocks settlement.
 - Sequenced focus state carries native cwd/model/thinking/context/capabilities. Stable transcript IDs/revisions permit partial upserts; stale/wrong-run projections cannot rewind focus.
 - Replay/deduplication prevents duplicate prompt admission and request-ID reuse with different contents.
 - Native `agent_settled`, not `agent_end`, final text, pane disappearance or a sentinel, owns settlement. A natural final answer at the turn limit completes; continuing tool loops obey soft/grace/hard limits.
@@ -145,7 +145,7 @@ Resume is always cold: validate saved bootstrap, admit its model, open persisted
 
 Parent orchestration tools are `Agent`, `get_subagent_result`, `steer_subagent`; stop/release use UI, commands or integration. Children set `PI_TEAMS_CHILD=1`, omit the parent orchestration extension and exclude these tools.
 
-`Agent` accepts only implemented inputs. Instance `name`, `inherit_context` and invocation `isolation` are unsupported; supply context in the prompt and configure isolation on the specialist/master switch.
+`get_subagent_result` is repeatable (roadmap 1.1b): it re-reads the durable `result.md` artifact on every call, prints a truncation note with the file path when only the bounded inline copy is available, and degrades to the inline copy with an explicit note when the file is unreadable. Reading marks `resultConsumed`, which only suppresses the duplicate completion notification.
 
 ## 12. Integration
 
@@ -154,6 +154,8 @@ The public boundary is `pi.events` RPC **v3**: `ping`, `spawn`, `status`, `steer
 ## 13. Ownership and delivery
 
 Conversation-owned runs notify their owning conversation. Extension-owned runs emit lifecycle events; the consumer decides Task transitions/review notifications. Owner metadata does not introduce a Task domain. See [ADR 0005](./decisions/0005-separate-task-and-agent-domains.md).
+
+The completion notification is runtime-authored and lead-only: a `teammate-notification` custom message (`followUp`, `triggerTurn: true`) whose plain-text `content` is the canonical presentation — teammate/outcome header line, 400-char preview, `full result: <path>` footer — and whose `details` (`agentId`, `type`, `description`, `status`, `outcome`, optional `resultFile`/`durationMs`/`totalTokens`) plus the customType form the exported renderer contract ([Integration](./INTEGRATION.md)). The runtime ships no custom message renderer; hosts without one display the content verbatim.
 
 ## 14. Delivery guard
 

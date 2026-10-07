@@ -100,3 +100,4 @@ Release without `--worktree` retains checkout. With it, cleanup is only appropri
 
 Direct conversation runs produce guarded completion notifications. `delivery: event` runs update panel/lifecycle without duplicate conversation completion; `pi-tasks` decides review presentation. Delivery remains functional after native `/new`/resume lifecycle transitions.
 
+Notifications are plain custom messages (`customType: teammate-notification`) with structured plain-text content; the runtime registers no message renderer (the former §7 notification box renderer was removed with roadmap 1.1b — the customType plus `details` schema is the exported contract, see `docs/INTEGRATION.md`). The panel and transcript surfaces are unaffected.

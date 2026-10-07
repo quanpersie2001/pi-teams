@@ -14,7 +14,6 @@ import {
 	createAgentTranscriptPane,
 	createAgentViewOverlay,
 } from "../../extension-src/pi-teams/features/agent-view/index.js";
-import { createSubagentNotificationRenderer } from "../../extension-src/pi-teams/features/notifications/index.js";
 import { bindThemeFg } from "../../extension-src/pi-teams/shared/theme.js";
 
 /**
@@ -144,7 +143,7 @@ describe("component factories with a method-style theme (regression: detached fg
 		component.dispose();
 	});
 
-	it("notification renderer degrades instead of throwing on a broken theme", () => {
+	it("bindThemeFg degrades instead of throwing on a broken theme", () => {
 		// A theme whose fg THROWS on every call: bindThemeFg must swallow it.
 		const broken = {
 			fg: () => {
@@ -154,18 +153,5 @@ describe("component factories with a method-style theme (regression: detached fg
 		// bindThemeFg itself never throws.
 		const safe = bindThemeFg(broken);
 		expect(safe("dim", "x")).toBe("x");
-
-		const renderer = createSubagentNotificationRenderer();
-		const component = renderer(
-			{
-				customType: "teammate-notification",
-				content: [{ type: "text", text: "done" }],
-				display: "done",
-				details: { id: "run-1", type: "explore", result: "ok" },
-			},
-			{ width: 80 },
-			broken as never,
-		);
-		expect(() => component.render(80)).not.toThrow();
 	});
 });

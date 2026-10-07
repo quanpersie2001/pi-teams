@@ -211,9 +211,14 @@ describe("Agent tool", () => {
 		expect(textOf(result)).toBe("foreground answer");
 		expect(result.details.agentId).toBe(launch.runId);
 		expect(result.details).toMatchObject({ model: "fake/fallback", modelFallback: "Primary unavailable" });
-		// Foreground results are consumed inline: get_subagent_result must not
-		// re-deliver them.
-		expect(await fixture.app.manager.getResult(launch.runId)).toMatch(/already consumed/);
+		// Foreground results are consumed inline (suppressing the completion
+		// notification); get_subagent_result still re-reads them on demand.
+		const reread = textOf(
+			await fixture.tools
+				.get("get_subagent_result")
+				?.execute("call-1b", { agent_id: launch.runId }, NO_SIGNAL, undefined, undefined),
+		);
+		expect(reread).toContain("foreground answer");
 	});
 
 	it("background call returns a started handle immediately", async () => {
@@ -247,8 +252,9 @@ describe("Agent tool", () => {
 });
 
 describe("get_subagent_result tool", () => {
-	it("waits for completion, delivers once, then errors on double consumption", async () => {
+	it("waits for completion and re-reads the result on every call", async () => {
 		const fixture = await makeFixture();
+		const launched = fixture.backend.nextLaunch();
 		const record = await fixture.app.manager.spawn({
 			type: "general-purpose",
 			prompt: "work",
@@ -257,19 +263,14 @@ describe("get_subagent_result tool", () => {
 
 		const getResult = fixture.tools.get("get_subagent_result");
 		const pending = getResult.execute("call-4", { agent_id: record.id, wait: true }, NO_SIGNAL, undefined, undefined);
-		await new Promise<void>((resolve) => {
-			const poll = (): void => {
-				if (fixture.backend.launches.length > 0) resolve();
-				else setTimeout(poll, 5);
-			};
-			poll();
-		});
+		await launched;
 		fixture.backend.complete(record.id, "the full result");
 		const first = textOf(await pending);
 		expect(first).toContain("the full result");
 
 		const second = textOf(await getResult.execute("call-5", { agent_id: record.id }, NO_SIGNAL, undefined, undefined));
-		expect(second).toMatch(/already consumed by a previous call/);
+		expect(second).toContain("the full result");
+		expect(fixture.app.manager.get(record.id)?.resultConsumed).toBe(true);
 	});
 
 	it("reports still-running state without consuming", async () => {

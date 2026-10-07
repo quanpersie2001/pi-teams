@@ -5,6 +5,7 @@
 // policy never changes admission or execution authority.
 
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { AgentDefinitionSnapshot, ThinkingLevel } from "../domain/agent-definition.js";
 import {
 	type AgentRun,
@@ -319,6 +320,7 @@ export class AgentManager {
 			...(snapshot.result !== undefined ? { result: snapshot.result } : {}),
 			...(snapshot.error !== undefined ? { error: snapshot.error } : {}),
 			...(snapshot.sessionFile !== undefined ? { sessionFile: snapshot.sessionFile } : {}),
+			...(snapshot.resultFile !== undefined ? { resultFile: snapshot.resultFile } : {}),
 			...(snapshot.parentSession !== undefined ? { parentSession: snapshot.parentSession } : {}),
 			...(snapshot.completedAt !== undefined ? { completedAt: snapshot.completedAt } : {}),
 			...(snapshot.durationMs !== undefined ? { durationMs: snapshot.durationMs } : {}),
@@ -962,9 +964,9 @@ export class AgentManager {
 
 	/**
 	 * Controller logic behind get_subagent_result: optionally waits
-	 * (abortably), reports status/result, and marks the result consumed exactly
-	 * once. A second read of a consumed result returns a clear error instead of
-	 * silently duplicating delivery.
+	 * (abortably), then reports status/result. Reads are repeatable (roadmap
+	 * 1.1b): the durable result.md artifact is re-read on every call and
+	 * `resultConsumed` only suppresses the duplicate completion notification.
 	 */
 	async getResult(agentId: string, options: GetResultOptions = {}): Promise<string> {
 		const internal = this.runs.get(agentId);
@@ -973,12 +975,11 @@ export class AgentManager {
 		const signal = options.signal;
 		const abortedBeforeWait = signal?.aborted === true;
 		if (options.wait === true && !abortedBeforeWait && isActiveStatus(internal.record.status)) {
-			const abortRace: Promise<"aborted"> = new Promise((resolve) => {
-				signal?.addEventListener("abort", () => resolve("aborted"), { once: true });
-			});
+			const abortRace = Promise.withResolvers<"aborted">();
+			signal?.addEventListener("abort", () => abortRace.resolve("aborted"), { once: true });
 			const outcome = await Promise.race([
 				internal.settle.then(() => "settled" as const),
-				...(signal !== undefined ? [abortRace] : []),
+				...(signal !== undefined ? [abortRace.promise] : []),
 			]);
 			if (outcome === "aborted") {
 				// Cancellation stops only this wait; the run keeps going and its
@@ -988,14 +989,25 @@ export class AgentManager {
 		}
 
 		if (isActiveStatus(internal.record.status)) return this.formatRecord(internal);
-		if (internal.record.resultConsumed === true) {
-			return (
-				`Error: result for agent "${agentId}" was already consumed by a previous call. ` +
-				"The completion notification carries the authoritative copy."
-			);
-		}
 		internal.record.resultConsumed = true;
-		return this.formatRecord(internal);
+		return this.formatRecord(internal, this.readFullResult(internal.record));
+	}
+
+	/**
+	 * Full-result channel: re-read the durable artifact when present. A
+	 * missing or unreadable file degrades to the inline copy with an explicit
+	 * note — never to a fabricated full result.
+	 */
+	private readFullResult(record: AgentRun): { text?: string; note?: string } {
+		if (record.status !== "completed" && record.status !== "stopped") return {};
+		if (record.resultFile === undefined) return {};
+		try {
+			return { text: readFileSync(record.resultFile, "utf8") };
+		} catch (error) {
+			return {
+				note: `Full result file ${record.resultFile} is unreadable (${errorText(error)}); showing the inline copy.`,
+			};
+		}
 	}
 
 	/**
@@ -1187,6 +1199,9 @@ export class AgentManager {
 			...(entry.modelFallback !== undefined ? { modelFallback: entry.modelFallback } : {}),
 			...(entry.sessionFile !== undefined ? { sessionFile: entry.sessionFile } : {}),
 			...(entry.result !== undefined ? { result: entry.result } : {}),
+			...(entry.resultFile !== undefined ? { resultFile: entry.resultFile } : {}),
+			...(entry.resultTruncated !== undefined ? { resultTruncated: entry.resultTruncated } : {}),
+			...(entry.resultOriginalLength !== undefined ? { resultOriginalLength: entry.resultOriginalLength } : {}),
 			...(entry.error !== undefined ? { error: entry.error } : {}),
 			...(entry.recoveryError !== undefined ? { recoveryError: entry.recoveryError } : {}),
 			...(entry.completedAt !== undefined ? { completedAt: entry.completedAt } : {}),
@@ -1303,7 +1318,15 @@ export class AgentManager {
 			return;
 		}
 		record.status = next;
-		if (event.type === "complete") record.result = event.result ?? "";
+		if (event.type === "complete") {
+			record.result = event.result ?? "";
+			if (event.resultFile !== undefined) record.resultFile = event.resultFile;
+			else delete record.resultFile;
+			if (event.resultTruncated !== undefined) record.resultTruncated = event.resultTruncated;
+			else delete record.resultTruncated;
+			if (event.resultOriginalLength !== undefined) record.resultOriginalLength = event.resultOriginalLength;
+			else delete record.resultOriginalLength;
+		}
 		if (event.type === "fail") record.error = event.error ?? "unknown failure";
 		if (!isTerminalStatus(next)) return;
 
@@ -1464,10 +1487,16 @@ export class AgentManager {
 				if (status.toolUses !== undefined) record.toolUses = status.toolUses;
 				delete record.result;
 				delete record.error;
+				delete record.resultFile;
+				delete record.resultTruncated;
+				delete record.resultOriginalLength;
 				switch (status.state) {
 					case "completed":
 						record.status = "completed";
 						record.result = status.result ?? "";
+						if (status.resultFile !== undefined) record.resultFile = status.resultFile;
+						if (status.resultTruncated !== undefined) record.resultTruncated = status.resultTruncated;
+						if (status.resultOriginalLength !== undefined) record.resultOriginalLength = status.resultOriginalLength;
 						delete record.budgetExhausted;
 						delete record.budgetSeconds;
 						break;
@@ -1529,7 +1558,13 @@ export class AgentManager {
 			await this.preserveWorktree(internal);
 			switch (status.state) {
 				case "completed":
-					this.applyEvent(internal, { type: "complete", result: status.result ?? "" });
+					this.applyEvent(internal, {
+						type: "complete",
+						result: status.result ?? "",
+						...(status.resultFile !== undefined ? { resultFile: status.resultFile } : {}),
+						...(status.resultTruncated !== undefined ? { resultTruncated: status.resultTruncated } : {}),
+						...(status.resultOriginalLength !== undefined ? { resultOriginalLength: status.resultOriginalLength } : {}),
+					});
 					break;
 				case "stopped":
 					this.applyEvent(internal, { type: "stop" });
@@ -1721,7 +1756,7 @@ export class AgentManager {
 		if (typeof restorable.serializeHandle !== "function") return undefined;
 		return (handle, sessionFile) => restorable.serializeHandle?.(handle, sessionFile);
 	}
-	private formatRecord(internal: RunInternals): string {
+	private formatRecord(internal: RunInternals, fullResult?: { text?: string; note?: string }): string {
 		const record = internal.record;
 		const duration = record.completedAt !== undefined ? Math.max(0, record.completedAt - record.startedAt) : undefined;
 		const head =
@@ -1739,9 +1774,24 @@ export class AgentManager {
 			return `${head}\n\nError: ${record.error ?? "unknown failure"}${record.recoveryError ? `\nRecovery: ${record.recoveryError}` : ""}`;
 		}
 		const budgetNote = budgetStopNote(record);
+		// Full-result channel: prefer the re-read artifact; the inline copy is
+		// the fallback and is labeled when it is a truncation.
+		const showingFull = (fullResult?.text ?? "").trim().length > 0;
+		const body = showingFull ? (fullResult?.text ?? "") : record.result?.trim() || "No output.";
+		const inlineChars = record.result !== undefined ? Math.max(0, record.result.length - 1) : 0;
+		const truncationNote =
+			!showingFull && record.resultTruncated === true
+				? record.resultFile !== undefined
+					? `Result truncated at ${inlineChars}/${record.resultOriginalLength ?? "?"} chars — full: ${record.resultFile}`
+					: `Result truncated at ${inlineChars}/${record.resultOriginalLength ?? "?"} chars.`
+				: undefined;
+		const pointer = showingFull && record.resultFile !== undefined ? `full result: ${record.resultFile}` : undefined;
 		return (
-			`${head}\n\n${record.result?.trim() || "No output."}` +
+			`${head}\n\n${body}` +
+			(truncationNote !== undefined ? `\n\n${truncationNote}` : "") +
+			(pointer !== undefined ? `\n${pointer}` : "") +
 			(budgetNote !== undefined ? `\n\n${budgetNote}` : "") +
+			(fullResult?.note !== undefined ? `\n\n${fullResult.note}` : "") +
 			(record.recoveryError ? `\nRecovery: ${record.recoveryError}` : "")
 		);
 	}
@@ -1804,6 +1854,9 @@ function historyToRun(entry: CompletedRunHistoryEntry): AgentRun {
 		...(entry.modelFallback !== undefined ? { modelFallback: entry.modelFallback } : {}),
 		...(entry.sessionFile !== undefined ? { sessionFile: entry.sessionFile } : {}),
 		...(entry.result !== undefined ? { result: entry.result } : {}),
+		...(entry.resultFile !== undefined ? { resultFile: entry.resultFile } : {}),
+		...(entry.resultTruncated !== undefined ? { resultTruncated: entry.resultTruncated } : {}),
+		...(entry.resultOriginalLength !== undefined ? { resultOriginalLength: entry.resultOriginalLength } : {}),
 		...(entry.error !== undefined ? { error: entry.error } : {}),
 		...(entry.recoveryError !== undefined ? { recoveryError: entry.recoveryError } : {}),
 		...(entry.budgetTimeout !== undefined ? { budgetTimeout: entry.budgetTimeout } : {}),

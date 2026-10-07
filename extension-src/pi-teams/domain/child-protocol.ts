@@ -52,6 +52,8 @@ export interface ChildOutcome {
 	result?: string;
 	resultTruncated?: boolean;
 	resultOriginalLength?: number;
+	/** Absolute path of the full-result artifact (result.md) written at settlement; additive (protocol v2 unchanged). */
+	resultFile?: string;
 	error?: string;
 	errorTruncated?: boolean;
 	errorOriginalLength?: number;

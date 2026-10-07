@@ -47,7 +47,7 @@ Reply envelopes:
 
 Steer/stop/release await the runtime operation; failures return an error envelope. Steer queues for a `queued`/`starting` run. Stop success acknowledges the abort request, not settlement or process exit; a queued run can stop without launching. Native settlement preserves artifacts and automatically closes owned child/pane resources. Resume opens materialized native JSONL in a new independent child/run; pending cleanup must resolve first. Release requires settled related runs; it is not abort.
 
-Status snapshots contain identity/type/description/status, `backend: "process"`, per-run turns/tools/usage, owner/delivery, start time and optional model/fallback, completion time/duration, session/result/error/recovery and worktree metadata. Additive optional `budgetExhausted` (`"timeout"` or `"idle_timeout"`) and `budgetSeconds` appear when a run was stopped by its time budget. Unknown run IDs return `null`. Control credentials/serialized launcher handles are **not** in this public snapshot. Connection loss does not manufacture completion; `recoveryError` exposes preservation/cleanup failures and uncertain-resource receipts remain durable.
+Status snapshots contain identity/type/description/status, `backend: "process"`, per-run turns/tools/usage, owner/delivery, start time and optional model/fallback, completion time/duration, session/result/error/recovery and worktree metadata. Additive optional `resultFile` carries the absolute path of the run's full-result artifact (`sessions/<child-id>/result.md`, written by the child at settlement) whenever one exists; the inline `result` stays preview-bounded and `resultTruncated`/`resultOriginalLength` mark truncation. Additive optional `budgetExhausted` (`"timeout"` or `"idle_timeout"`) and `budgetSeconds` appear when a run was stopped by its time budget. Unknown run IDs return `null`. Control credentials/serialized launcher handles are **not** in this public snapshot. Connection loss does not manufacture completion; `recoveryError` exposes preservation/cleanup failures and uncertain-resource receipts remain durable.
 
 `model` is the canonical model actually admitted; optional `modelFallback` explains the unavailable primary and selected fallback. These additive v3 fields appear in spawn replies, status and lifecycle/history where known. Older historical runs may omit them. Queue-time revalidation can change the model before launching; subsequent status/lifecycle reflects that selection. Model/auth admission does not validate remote key acceptance, quota or provider availability.
 
@@ -61,7 +61,7 @@ Broadcasts: `subagents:started`, `subagents:completed`, `subagents:failed`, `sub
 
 `subagents:stopped` and terminal lifecycle events carry the same additive optional `budgetExhausted`/`budgetSeconds` fields as status snapshots when a time budget stopped the run.
 
-Each broadcast carries `protocolVersion: 3`, `event`, `agentId`, `id` (`id === agentId`), type/description/status, owner/delivery, usage and start time. Model/fallback, parent session, session file, result/error/recoveryError, completion time/duration and worktree/release metadata are included when present. The field is **protocolVersion**, not `version` (only `ping` replies use `version`). `id` is a broadcast alias, not a second domain identity. Consumers check owner and store Task → run mapping before updating their workflow.
+Each broadcast carries `protocolVersion: 3`, `event`, `agentId`, `id` (`id === agentId`), type/description/status, owner/delivery, usage and start time. Model/fallback, parent session, session file, `resultFile`, result/error/recoveryError, completion time/duration and worktree/release metadata are included when present. The field is **protocolVersion**, not `version` (only `ping` replies use `version`). `id` is a broadcast alias, not a second domain identity. Consumers check owner and store Task → run mapping before updating their workflow.
 
 Suggested consumer mapping (not runtime policy):
 
@@ -85,6 +85,25 @@ RPC spawn defaults to `{ kind: "extension", id: "pi-tasks" }` with `delivery: "e
 | `none` | caller obtains result/status explicitly |
 
 Conversation delivery checks the spawning session/branch context. Extension-owned events remain observable after conversation switches. `/new`/resume lifecycle detaches control connections without killing children or permanently disposing delivery; subsequent session starts reconnect and retain functioning completion routing.
+
+## Completion notification contract (renderer)
+
+Conversation delivery injects a `pi.sendMessage` custom message when a run settles. The runtime ships **no message renderer** — this payload is the stable contract a pi-style companion visual extension may target by registering a renderer for the customType; without one the plain-text `content` displays verbatim.
+
+- **customType:** `teammate-notification` (constant exported as `TEAMMATE_NOTIFICATION_TYPE` from `domain/delivery.ts`)
+- **delivery:** `followUp` with `triggerTurn: true` — runtime-authored, lead-only, never sent to teammates
+- **content** (structured plain text, canonical presentation):
+
+```text
+Teammate <id> finished|failed|stopped (<type>, <duration>)
+
+<preview — result or error text, bounded to 400 chars>
+full result: <absolute resultFile path>   ← last line, only when resultFile exists
+```
+
+- **details** (machine-readable schema): `agentId`, `type`, `description`, `status`, `outcome` (`completed | failed | stopped`), optional `resultFile`, `durationMs`, `totalTokens`.
+
+The full result is durable and re-readable: `get_subagent_result` returns it on every call (re-reading `resultFile`), and consumers may page the file directly.
 
 ## Worktree review
 

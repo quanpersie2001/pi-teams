@@ -1,7 +1,8 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { decideTurnEvent, SOFT_STEER_MESSAGE } from "../app/turn-policy.js";
 import { EMPTY_USAGE, type UsageSummary } from "../domain/agent-run.js";
@@ -285,6 +286,21 @@ function previewJson(value: unknown): { value: unknown; truncated: boolean } {
 	const budget: JsonBudget = { nodes: 0, bytes: 0, truncated: false };
 	const safe = jsonSafe(value, 0, budget);
 	return { value: safe, truncated: budget.truncated };
+}
+
+/**
+ * Full, uncapped text of a message's text parts (full-result channel,
+ * roadmap 1.1b). The inline outcome copy stays bounded by MAX_TEXT_CHARS;
+ * this extraction feeds the durable result.md artifact.
+ */
+function fullTextOf(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const part of content) {
+		if (isRecord(part) && typeof part.text === "string") parts.push(part.text);
+	}
+	return parts.join("\n");
 }
 
 function extractText(content: unknown): string {
@@ -884,6 +900,27 @@ class ChildRuntime {
 		this.emit("usage", this.activeRun.runId, { usage: { ...this.usage }, turns: this.turns, toolUses: this.toolUses });
 	}
 
+	/**
+	 * Full-result channel (roadmap 1.1b): the complete final answer is
+	 * persisted to <sessionDir>/result.md before the outcome leaves the
+	 * child. The inline outcome copy stays MAX_TEXT_CHARS-bounded for the
+	 * parent's context economy; the file is the authoritative full copy the
+	 * parent re-reads at will. Write failure never blocks settlement — the
+	 * outcome degrades to the inline copy without a resultFile pointer.
+	 * Last settled run wins when a child settles multiple runs.
+	 */
+	private persistFullResult(text: string): string | undefined {
+		if (text.length === 0) return undefined;
+		const file = join(this.bootstrap.sessionDir, "result.md");
+		try {
+			mkdirSync(this.bootstrap.sessionDir, { recursive: true, mode: 0o700 });
+			writeFileSync(file, text, { mode: 0o600 });
+			return file;
+		} catch {
+			return undefined;
+		}
+	}
+
 	private settleActiveRun(): void {
 		const run = this.activeRun;
 		if (!run) return;
@@ -893,15 +930,20 @@ class ChildRuntime {
 			typeof assistant?.errorMessage === "string" && assistant.errorMessage.length > 0
 				? assistant.errorMessage
 				: undefined;
+		const resultFile = this.persistFullResult(assistant ? fullTextOf(assistant.content) : "");
 		let outcome: ChildOutcome;
-		if (run.abortRequested || stopReason === "aborted") outcome = { runId: run.runId, status: "stopped" };
-		else if (stopReason === "error" || rawError) {
+		if (run.abortRequested || stopReason === "aborted") {
+			// A stopped run keeps whatever partial answer exists in result.md
+			// (ADR 0007 partial-result preservation) but no inline result.
+			outcome = { runId: run.runId, status: "stopped", ...(resultFile ? { resultFile } : {}) };
+		} else if (stopReason === "error" || rawError) {
 			const error = previewError(new Error(rawError ?? "Pi agent run failed"), this.bootstrap.token);
 			outcome = {
 				runId: run.runId,
 				status: "failed",
 				error: error.text,
 				...(error.truncated ? { errorTruncated: true, errorOriginalLength: error.originalLength } : {}),
+				...(resultFile ? { resultFile } : {}),
 			};
 		} else {
 			const result = assistant ? previewContent(assistant.content) : { text: "", truncated: false, originalLength: 0 };
@@ -910,6 +952,7 @@ class ChildRuntime {
 				status: "completed",
 				...(result.text.length > 0 ? { result: result.text } : {}),
 				...(result.truncated ? { resultTruncated: true, resultOriginalLength: result.originalLength } : {}),
+				...(resultFile ? { resultFile } : {}),
 			};
 		}
 		this.finish(run.runId, outcome);

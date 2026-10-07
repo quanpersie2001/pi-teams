@@ -42,7 +42,12 @@ export interface AgentRegistryEntry {
 	model?: string;
 	modelFallback?: string;
 	sessionFile?: string;
+	/** Absolute path of the run's full-result artifact (result.md). */
+	resultFile?: string;
+	/** Inline result copy; preview-bounded when resultTruncated is true. */
 	result?: string;
+	resultTruncated?: boolean;
+	resultOriginalLength?: number;
 	error?: string;
 	recoveryError?: string;
 	cwd: string;
@@ -167,7 +172,10 @@ export function toRegistryEntry(
 	if (record.model !== undefined) entry.model = record.model;
 	if (record.modelFallback !== undefined) entry.modelFallback = record.modelFallback;
 	if (record.sessionFile !== undefined) entry.sessionFile = record.sessionFile;
+	if (record.resultFile !== undefined) entry.resultFile = record.resultFile;
 	if (record.result !== undefined) entry.result = record.result;
+	if (record.resultTruncated !== undefined) entry.resultTruncated = record.resultTruncated;
+	if (record.resultOriginalLength !== undefined) entry.resultOriginalLength = record.resultOriginalLength;
 	if (record.error !== undefined) entry.error = record.error;
 	if (record.recoveryError !== undefined) entry.recoveryError = record.recoveryError;
 	if (record.completedAt !== undefined) entry.completedAt = record.completedAt;

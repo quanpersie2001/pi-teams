@@ -32,3 +32,14 @@ export function isConversationOwner(owner: AgentOwner): owner is Extract<AgentOw
 export function isExtensionOwner(owner: AgentOwner): owner is Extract<AgentOwner, { kind: "extension" }> {
 	return owner.kind === "extension";
 }
+
+/**
+ * pi.sendMessage customType for runtime-authored teammate completion
+ * notifications (renderer contract, docs/INTEGRATION.md): `content` is
+ * structured plain text (first line `Teammate <id|@name>
+ * finished|failed|stopped (<type>, <duration>)`, preview body, final
+ * `full result: <path>` line) and `details` is the machine-readable schema.
+ * A pi-style host may register a renderer for this type; without one the
+ * plain text displays verbatim. The runtime ships no renderer.
+ */
+export const TEAMMATE_NOTIFICATION_TYPE = "teammate-notification";

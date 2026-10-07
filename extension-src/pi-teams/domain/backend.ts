@@ -49,6 +49,10 @@ export interface BackendStatus {
 	modelFallback?: string;
 	detail?: string;
 	result?: string;
+	/** Absolute path of the child's full-result artifact, when one was written. */
+	resultFile?: string;
+	resultTruncated?: boolean;
+	resultOriginalLength?: number;
 	error?: string;
 	/** Verified child loss without a recovered RPC outcome; must not replace a persisted terminal outcome. */
 	outcomeUnavailable?: true;

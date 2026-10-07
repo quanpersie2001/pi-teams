@@ -19,11 +19,6 @@ import {
 	createAgentViewOverlay,
 } from "../../extension-src/pi-teams/features/agent-view/index.js";
 import { renderTranscriptItems } from "../../extension-src/pi-teams/features/agent-view/transcript-renderer.js";
-import {
-	createSubagentNotificationRenderer,
-	renderNotificationLines,
-	TEAMMATE_NOTIFICATION_TYPE,
-} from "../../extension-src/pi-teams/features/notifications/index.js";
 import { renderTheme } from "../helpers/render-theme.js";
 
 const theme = renderTheme();
@@ -355,52 +350,6 @@ describe("fullscreen agent transcript", () => {
 		);
 		expect(updated).not.toContain("PAIRED_OUTPUT");
 		expect(updated.match(/UPDATED_OUTPUT/g)).toHaveLength(1);
-	});
-});
-describe("teammate-notification rendering", () => {
-	const message = {
-		customType: TEAMMATE_NOTIFICATION_TYPE,
-		content: "✓ explore completed (Find auth files)\n\nFound 8 authentication-related files.",
-		display: true,
-		details: {
-			agentId: "run-1",
-			type: "explore",
-			description: "Find auth files",
-			outcome: "completed",
-			durationMs: 61_000,
-			toolUses: 8,
-		},
-	};
-
-	it("renders one compact box per run with icon, stats and preview at width 80", () => {
-		const lines = renderNotificationLines(message, { expanded: false }, fg, 80);
-		expect(lines.length).toBeGreaterThan(2);
-		const joined = lines.join("\n");
-		expect(joined).toContain("✓");
-		expect(joined).toContain("61s");
-		expect(joined).toContain("8 tools");
-		expect(joined).toContain("Found 8 authentication-related files.");
-		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
-	});
-
-	it("expands to the full result when requested", () => {
-		const collapsed = renderNotificationLines(message, { expanded: false }, fg, 80);
-		const expanded = renderNotificationLines(message, { expanded: true }, fg, 80);
-		expect(expanded.join("\n").length).toBeGreaterThanOrEqual(collapsed.join("\n").length);
-	});
-
-	it("renderer factory produces a stateless Component compatible with registerMessageRenderer", () => {
-		const renderer = createSubagentNotificationRenderer();
-		const component = renderer(message, { expanded: false }, { fg });
-		expect(component.render(40).every((line) => visibleWidth(line) <= 40)).toBe(true);
-		expect(component.invalidate()).toBeUndefined();
-	});
-
-	it("degrades to plain fallback content when details are absent", () => {
-		const bare = { customType: TEAMMATE_NOTIFICATION_TYPE, content: "plain text only" };
-		const lines = renderNotificationLines(bare, { expanded: false }, fg, 60);
-		expect(lines.join("\n")).toContain("plain text only");
-		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(60);
 	});
 });
 

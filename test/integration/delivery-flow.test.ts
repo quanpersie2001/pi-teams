@@ -7,8 +7,8 @@
 import { describe, expect, it } from "vitest";
 import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import { TEAMMATE_NOTIFICATION_TYPE } from "../../extension-src/pi-teams/domain/delivery.js";
 import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
-import { TEAMMATE_NOTIFICATION_TYPE } from "../../extension-src/pi-teams/features/notifications/index.js";
 import { createPiDeliveryHost } from "../../extension-src/pi-teams/pi/delivery-host.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 import { FakePiHost } from "../helpers/fake-pi-host.js";
@@ -103,17 +103,29 @@ describe("delivery host integration", () => {
 			run_in_background: true,
 		});
 		await settle(20);
-		fixture.backend.complete(record.id, "Found 8 authentication-related files.");
+		fixture.backend.complete(record.id, "Found 8 authentication-related files.", undefined, {
+			resultFile: "/tmp/teams/sessions/child-1/result.md",
+		});
 		await settle();
 
 		expect(fixture.host.sentMessages).toHaveLength(1);
 		const sent = fixture.host.sentMessages[0];
 		expect(sent.message.customType).toBe(TEAMMATE_NOTIFICATION_TYPE);
 		expect(sent.message.display).toBe(true);
-		expect(String(sent.message.content)).toContain("Found 8 authentication-related files.");
+		const content = String(sent.message.content);
+		// Renderer contract: structured plain text — teammate header line,
+		// preview body, full-result pointer footer.
+		expect(content).toMatch(new RegExp(`^Teammate ${record.id} finished \\(general-purpose, \\d+s\\)`));
+		expect(content).toContain("Found 8 authentication-related files.");
+		expect(content.endsWith("full result: /tmp/teams/sessions/child-1/result.md")).toBe(true);
 		expect(sent.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
 		const details = sent.message.details as Record<string, unknown>;
-		expect(details).toMatchObject({ agentId: record.id, outcome: "completed", status: "completed" });
+		expect(details).toMatchObject({
+			agentId: record.id,
+			outcome: "completed",
+			status: "completed",
+			resultFile: "/tmp/teams/sessions/child-1/result.md",
+		});
 	});
 
 	it("extension-owned runs emit pi.events but never inject a conversation message", async () => {

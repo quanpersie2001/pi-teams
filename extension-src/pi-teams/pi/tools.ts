@@ -237,8 +237,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 		name: "get_subagent_result",
 		label: "Get Agent Result",
 		description:
-			"Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the agent ID returned by Agent.",
-		promptSnippet: "Check status and retrieve results from a background agent",
+			"Check status and retrieve a background agent's result. The full result is durable: it is re-read from the agent's result file on every call and can be read any number of times; the output includes the file path so you can page through very long results with the read tool. The completion notification carries only a preview. Use the agent ID returned by Agent.",
 		parameters: Type.Object({
 			agent_id: Type.String({ description: "The agent ID returned by Agent." }),
 			wait: Type.Optional(

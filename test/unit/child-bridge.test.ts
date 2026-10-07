@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -185,7 +185,12 @@ describe("child bridge over an owner-only Unix socket", () => {
 			status: "completed",
 			resultTruncated: true,
 			resultOriginalLength: longAnswer.length,
+			resultFile: join(dir, "sessions", "result.md"),
 		});
+		// Full-result channel: the artifact carries the uncapped answer even
+		// though the inline outcome copy is preview-bounded.
+		expect(readFileSync(join(dir, "sessions", "result.md"), "utf8")).toBe(longAnswer);
+		expect(statSync(join(dir, "sessions", "result.md")).mode & 0o777).toBe(0o600);
 		expect(completed.transcript.items.at(-1)?.metadata).toMatchObject({
 			truncated: true,
 			originalLength: longAnswer.length,

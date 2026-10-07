@@ -7,7 +7,6 @@ import { WorktreeService } from "../app/worktree-service.js";
 import { isTerminalStatus } from "../domain/agent-run.js";
 import { DEFAULT_SUBAGENTS_SETTINGS } from "../domain/config.js";
 import type { InboxRecipient } from "../domain/message.js";
-import { createSubagentNotificationRenderer, TEAMMATE_NOTIFICATION_TYPE } from "../features/notifications/index.js";
 import { loadAgentMarkdownFiles, resolveAgentSourceDirs } from "./agent-files.js";
 import { installAgentMentionAutocomplete } from "./agent-mention-autocomplete.js";
 import { shouldSkipExtensionInChildSession } from "./child-guard.js";
@@ -80,7 +79,10 @@ export default function (pi: ExtensionAPI): void {
 	const transcripts = createPiTranscriptSource({ backends: [backend] });
 	let uiHandle: SubagentsUiHandle | undefined;
 	let rpc: SubagentsRpcWiring | undefined;
-	pi.registerMessageRenderer(TEAMMATE_NOTIFICATION_TYPE, createSubagentNotificationRenderer());
+	// No message renderer is registered: the teammate-notification customType
+	// plus its structured plain-text content IS the renderer contract exported
+	// for pi-style companions (docs/INTEGRATION.md); hosts without a renderer
+	// display the content verbatim.
 	registerAgentsCommand(pi, { manager: app.manager, openHub: () => uiHandle?.openHub() });
 	registerBackendCommand(pi, { backend });
 	registerSubagentTools(pi, app.manager, app.registry);

@@ -47,6 +47,12 @@ export interface AgentRun {
 	modelFallback?: string;
 	sessionFile?: string;
 	result?: string;
+	/** Absolute path of the child's full-result artifact (result.md); the inline `result` stays preview-bounded. */
+	resultFile?: string;
+	/** True when `result` is the truncated inline copy of a longer final answer. */
+	resultTruncated?: boolean;
+	/** Original character length of the final answer when `result` is truncated. */
+	resultOriginalLength?: number;
 	error?: string;
 	/** Worktree-preservation or durable-recovery failure that did not change the child outcome. */
 	recoveryError?: string;
@@ -96,7 +102,13 @@ export interface AgentRun {
 export type AgentRunEvent =
 	| { type: "start"; at?: number }
 	| { type: "launched"; at?: number }
-	| { type: "complete"; result?: string }
+	| {
+			type: "complete";
+			result?: string;
+			resultFile?: string;
+			resultTruncated?: boolean;
+			resultOriginalLength?: number;
+	  }
 	| { type: "stop" }
 	| { type: "abort" }
 	| { type: "fail"; error?: string };
