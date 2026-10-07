@@ -1,7 +1,4 @@
-// Session-scoped restore: runs belong to the conversation that launched
-// them. Only rows whose conversation owner matches the current session are
-// adopted; foreign rows (other conversations, extension consumers) are
-// bookkeeping-only and never surface in this session's manager or UI.
+// Startup archives this session's stale receipts without inspecting foreign owners.
 
 import { describe, expect, it, vi } from "vitest";
 import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
@@ -9,7 +6,6 @@ import type {
 	AgentRegistryEntry,
 	CompletedRunHistoryEntry,
 	PersistedRegistryEntry,
-	RestoreObservers,
 	SubagentRunStore,
 } from "../../extension-src/pi-teams/app/run-registry.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
@@ -58,20 +54,7 @@ function memoryStore(initial: readonly PersistedRegistryEntry[]) {
 	return { store, registry, history };
 }
 
-function observers(overrides: Partial<RestoreObservers> = {}): RestoreObservers {
-	return {
-		sessionPresent: () => true,
-		detectCompletion: () => ({ finished: false }),
-		resourceAlive: () => true,
-		...overrides,
-	};
-}
-
-async function makeApp(options: {
-	sessionId: string;
-	entries: readonly PersistedRegistryEntry[];
-	observers?: Partial<RestoreObservers>;
-}): Promise<{
+async function makeApp(options: { sessionId: string; entries: readonly PersistedRegistryEntry[] }): Promise<{
 	app: PiSubagentsApp;
 	registry: PersistedRegistryEntry[];
 	history: CompletedRunHistoryEntry[];
@@ -88,7 +71,7 @@ async function makeApp(options: {
 		configCwd: "/tmp/project",
 		getSessionId: () => options.sessionId,
 		runStore: store,
-		restoreObservers: observers(options.observers),
+
 		managerOverrides: {
 			idFactory: (() => {
 				let next = 0;
@@ -103,52 +86,16 @@ async function makeApp(options: {
 	return { app, registry, history, backend };
 }
 
-describe("session-scoped restore", () => {
-	it("archives own leftover active rows stopped (no re-adoption); foreign live rows are retained untouched", async () => {
+describe("session-start registry cleanup", () => {
+	it("archives stale owned rows while leaving foreign rows untouched", async () => {
 		const own = row("own-run");
 		const foreign = row("foreign-run", { owner: { kind: "conversation", sessionId: "session-b" } });
 		const { app, registry, history } = await makeApp({ sessionId: "session-a", entries: [own, foreign] });
-
-		// Session-bound lifetime (ADR 0007): an active own row is never
-		// re-adopted — it archives stopped with an honest note and verified
-		// disposal of its resource.
 		expect(app.manager.get("own-run")).toBeUndefined();
 		expect(app.manager.get("foreign-run")).toBeUndefined();
 		expect(history).toMatchObject([{ id: "own-run", status: "stopped" }]);
-		expect(history[0]?.recoveryError).toMatch(/never re-adopted/);
 		expect(registry.some((entry) => "id" in entry && entry.id === "foreign-run")).toBe(true);
 		expect(app.manager.list().map((record) => record.id)).toEqual([]);
-	});
-
-	it("archives a settled foreign row to history and drops it from the registry", async () => {
-		const foreign = row("foreign-settled", {
-			owner: { kind: "conversation", sessionId: "session-b" },
-		});
-		const { app, registry, history } = await makeApp({
-			sessionId: "session-a",
-			entries: [foreign],
-			observers: {
-				detectCompletion: () => ({ finished: true, outcome: "completed", result: "done elsewhere" }),
-			},
-		});
-
-		expect(app.manager.get("foreign-settled")).toBeUndefined();
-		expect(history).toMatchObject([{ id: "foreign-settled", status: "completed", result: "done elsewhere" }]);
-		expect(history[0]).not.toHaveProperty("handle");
-		expect(registry).toEqual([]);
-	});
-
-	it("marks a dead foreign child failed in history without adopting it", async () => {
-		const foreign = row("foreign-dead", { owner: { kind: "conversation", sessionId: "session-b" } });
-		const { app, history, registry } = await makeApp({
-			sessionId: "session-a",
-			entries: [foreign],
-			observers: { resourceAlive: () => false },
-		});
-
-		expect(app.manager.get("foreign-dead")).toBeUndefined();
-		expect(history).toMatchObject([{ id: "foreign-dead", status: "error" }]);
-		expect(registry).toEqual([]);
 	});
 
 	it("treats extension-owned rows as foreign", async () => {

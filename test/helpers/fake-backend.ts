@@ -142,12 +142,6 @@ export class FakeBackend implements AgentExecutionBackend {
 		return this.launcherKind !== "headless";
 	}
 
-	restoreHandle(runId: string, _serialized: SerializableBackendHandle): AgentBackendHandle {
-		const handle: AgentBackendHandle = { kind: "process", handle: `fake-restored-${runId}` };
-		this.runByHandle.set(handle.handle, runId);
-		return handle;
-	}
-
 	serializeHandle(handle: AgentBackendHandle): SerializableBackendHandle | undefined {
 		if (this.disposedHandles.includes(handle.handle)) return undefined;
 		const runId = this.runByHandle.get(handle.handle);

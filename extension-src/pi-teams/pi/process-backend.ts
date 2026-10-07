@@ -27,6 +27,9 @@ import { ChildRpcClient } from "./child-rpc-client.js";
 import { createModelAdmission } from "./model-admission.js";
 import { createProcessLaunchers } from "./process-launchers.js";
 import { teamsArtifactDir } from "./registry-host.js";
+import { TEAM_TASK_TOOL_NAMES } from "./team-task-tools.js";
+
+const TEAM_COORDINATION_TOOLS: readonly string[] = ["send_message", ...TEAM_TASK_TOOL_NAMES];
 
 interface ChildConnection {
 	bootstrap: ChildBootstrap;
@@ -54,6 +57,7 @@ interface RunConnection {
 	status: BackendStatus;
 	listeners: Set<(status: BackendStatus) => void>;
 	admissionUncertain?: boolean;
+	admissionError?: string;
 }
 export interface ProcessBackendOptions {
 	launcherHint?: BackendSelector;
@@ -172,6 +176,12 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		// Unix socket pathname limits are small; project/session paths may be arbitrarily long.
 		const controlDir = mkdtempSync("/tmp/pi-teams-");
 		chmodSync(controlDir, 0o700);
+		const tools = input.tools === undefined ? undefined : [...input.tools];
+		if (input.team && tools) {
+			for (const tool of TEAM_COORDINATION_TOOLS) {
+				if (!tools.includes(tool)) tools.push(tool);
+			}
+		}
 		const bootstrap: ChildBootstrap = {
 			childId,
 			token: randomBytes(32).toString("hex"),
@@ -185,12 +195,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			...(input.instructions !== undefined ? { instructions: input.instructions } : {}),
 			...(input.model !== undefined ? { model: input.model } : {}),
 			...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
-			...(input.tools !== undefined
-				? {
-						tools:
-							input.team && !input.tools.includes("send_message") ? [...input.tools, "send_message"] : [...input.tools],
-					}
-				: {}),
+			...(tools !== undefined ? { tools } : {}),
 			...(input.maxTurns !== undefined ? { maxTurns: input.maxTurns } : {}),
 			...(input.graceTurns !== undefined ? { graceTurns: input.graceTurns } : {}),
 			...(input.team !== undefined
@@ -400,11 +405,6 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		rmSync(dirname(child.bootstrap.socketPath), { recursive: true, force: true });
 		child.closed = true;
 	}
-	private reattachChild(child: ChildConnection): void {
-		if (!child.detached || child.closed || child.identityFailure) return;
-		child.detached = false;
-		this.watchChild(child);
-	}
 
 	private scheduleReconnect(child: ChildConnection): void {
 		if (child.detached || child.closed || child.identityFailure || child.reconnectTimer) return;
@@ -464,12 +464,13 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			return;
 		}
 		const outcome = snapshot.lastOutcome?.runId === run.runId ? snapshot.lastOutcome : undefined;
+		const ownsSnapshot = outcome !== undefined || snapshot.currentRunId === run.runId;
 		const meta = {
 			// Pi assigns a filename before its first persisted entry; rejected preflight has no resumable JSONL.
 			...(snapshot.sessionFile && existsSync(snapshot.sessionFile) ? { sessionFile: snapshot.sessionFile } : {}),
-			...(snapshot.usage ? { usage: snapshot.usage } : {}),
-			...(snapshot.turns !== undefined ? { turns: snapshot.turns } : {}),
-			...(snapshot.toolUses !== undefined ? { toolUses: snapshot.toolUses } : {}),
+			...(ownsSnapshot && snapshot.usage ? { usage: snapshot.usage } : {}),
+			...(ownsSnapshot && snapshot.turns !== undefined ? { turns: snapshot.turns } : {}),
+			...(ownsSnapshot && snapshot.toolUses !== undefined ? { toolUses: snapshot.toolUses } : {}),
 		};
 		if (outcome) {
 			this.publish(run, {
@@ -484,7 +485,11 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		} else if (!run.child.connected)
 			this.publish(run, { state: "disconnected", ...meta, detail: "Child control connection lost; reconnecting." });
 		else if (run.admissionUncertain && snapshot.currentRunId !== run.runId) {
-			this.publish(run, { state: "failed", ...meta, error: "Child snapshot confirms the prompt was not admitted." });
+			this.publish(run, {
+				state: "failed",
+				...meta,
+				error: run.admissionError ?? "Child snapshot confirms the prompt was not admitted.",
+			});
 		} else {
 			if (snapshot.currentRunId === run.runId) run.admissionUncertain = false;
 			this.publish(run, {
@@ -545,7 +550,10 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	async status(handle: AgentBackendHandle): Promise<BackendStatus> {
 		const run = this.requireRun(handle);
 		if (run.child.identityFailure) return { ...run.status };
-		this.reattachChild(run.child);
+		if (run.child.detached) {
+			this.publish(run, { state: "disconnected", detail: "Child control was released." });
+			return { ...run.status };
+		}
 		if (!run.child.connected && !run.child.detached && !run.child.closed) {
 			try {
 				this.acceptSnapshot(run.child, await run.child.client.connect());
@@ -577,6 +585,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 
 	async controlFocus(handle: AgentBackendHandle, command: ChildControlCommand): Promise<ChildState> {
 		const run = this.requireRun(handle);
+		if (!run.child.connected && !run.child.closed && !run.child.detached) await this.status(handle);
 		this.requireControl(run.child);
 		const state = await run.child.client.control(command);
 		this.acceptSnapshot(run.child, state);
@@ -608,19 +617,27 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		input: { runId: string; prompt: string; maxTurns?: number; graceTurns?: number },
 	): Promise<AgentBackendHandle> {
 		const child = this.requireRun(handle).child;
+		if (!child.connected && !child.closed && !child.detached) await this.status(handle);
 		this.requireControl(child);
-		this.createRun(input.runId, child);
-		await child.client.prompt(input.runId, input.prompt, {
-			...(input.maxTurns !== undefined ? { maxTurns: input.maxTurns } : {}),
-			...(input.graceTurns !== undefined ? { graceTurns: input.graceTurns } : {}),
-		});
+		const run = this.createRun(input.runId, child);
+		try {
+			await child.client.prompt(input.runId, input.prompt, {
+				...(input.maxTurns !== undefined ? { maxTurns: input.maxTurns } : {}),
+				...(input.graceTurns !== undefined ? { graceTurns: input.graceTurns } : {}),
+			});
+		} catch (error) {
+			// Once sent, reconcile this assignment's handle against native state;
+			// never expose the previous run's handle as its admission receipt.
+			run.admissionUncertain = true;
+			run.admissionError = error instanceof Error ? error.message : String(error);
+		}
 		await this.refreshChild(child);
 		return { kind: "process", handle: input.runId };
 	}
 
 	private requireControl(child: ChildConnection): void {
 		if (child.identityFailure) throw child.identityFailure;
-		if (!child.connected)
+		if (child.closed || child.detached || !child.connected)
 			throw new ChildProtocolError("disconnected", "Child control requires an authenticated connection");
 	}
 	async steer(handle: AgentBackendHandle, message: string): Promise<boolean> {
@@ -651,9 +668,9 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		const child = run.child;
 		if (child.closed) return { ...run.status };
 		// Cached-identity ownership gate — no RPC, no reconnect, no reattach.
-		// The run→child mapping was authenticated at launch/restore (bootstrap
-		// childId+token+socketPath); the launcher handle must belong to that
-		// child, and a cached authenticated snapshot must keep matching its PID.
+		// The run→child mapping was authenticated at launch (bootstrap childId,
+		// token+socketPath); the launcher handle must belong to that child, and a cached
+		// authenticated snapshot must keep matching its PID.
 		if (child.identityFailure) throw child.identityFailure;
 		if (child.bootstrap.childId !== child.launcherHandle.childId) {
 			throw new Error("Budget enforcement refused: launcher handle does not belong to the owned child identity.");
@@ -730,9 +747,16 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				...(input.model !== undefined ? { model: input.model } : {}),
 				...(input.modelFallback !== undefined ? { modelFallback: input.modelFallback } : {}),
 				...(bootstrap.thinking !== undefined ? { thinking: bootstrap.thinking } : {}),
-				...(bootstrap.tools !== undefined ? { tools: bootstrap.tools } : {}),
+				...(bootstrap.tools !== undefined
+					? {
+							tools: input.team
+								? bootstrap.tools
+								: bootstrap.tools.filter((tool) => !TEAM_COORDINATION_TOOLS.includes(tool)),
+						}
+					: {}),
 				...(bootstrap.maxTurns !== undefined ? { maxTurns: bootstrap.maxTurns } : {}),
 				...(bootstrap.graceTurns !== undefined ? { graceTurns: bootstrap.graceTurns } : {}),
+				...(input.team !== undefined ? { team: input.team } : {}),
 			},
 			input.sessionFile,
 		);
@@ -761,7 +785,6 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		const child = this.requireRun(handle).child;
 		if (child.closed) return;
 		if (child.identityFailure) throw child.identityFailure;
-		this.reattachChild(child);
 		if (!child.connected) {
 			try {
 				this.acceptSnapshot(child, await child.client.connect());
@@ -803,57 +826,40 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			...(sessionFile ? { sessionFile } : {}),
 		};
 	}
-	restoreHandle(runId: string, serialized: SerializableBackendHandle): AgentBackendHandle | null {
-		if (serialized.kind !== "process") return null;
+	async disposePersisted(serialized: SerializableBackendHandle): Promise<boolean> {
+		if (serialized.kind !== "process") return false;
 		const launcher = this.launchers.find((candidate) => candidate.kind === serialized.launcher.kind);
-		if (!launcher) return null;
+		if (!launcher) return false;
 		const bootstrapFile = join(serialized.runDir, "bootstrap.json");
-		if (!existsSync(bootstrapFile)) return null;
+		if (!existsSync(bootstrapFile)) return false;
 		const bootstrap = JSON.parse(readFileSync(bootstrapFile, "utf8")) as ChildBootstrap;
 		if (
+			serialized.launcher.kind !== launcher.kind ||
+			serialized.launcher.childId !== serialized.childId ||
 			bootstrap.childId !== serialized.childId ||
 			bootstrap.token !== serialized.token ||
 			bootstrap.socketPath !== serialized.socketPath
 		)
-			return null;
+			return false;
 		launcher.restore?.(serialized.launcher);
-		let child = this.children.get(serialized.childId);
-		if (!child) {
-			const client = new ChildRpcClient({
-				socketPath: serialized.socketPath,
-				childId: serialized.childId,
-				token: serialized.token,
-				connectTimeoutMs: this.options.connectTimeoutMs ?? 2000,
-			});
-			child = {
-				bootstrap,
-				runDir: serialized.runDir,
-				launcher,
-				launcherHandle: serialized.launcher,
-				client,
-				connected: false,
-				detached: false,
-				closed: false,
-				refreshing: false,
-				refreshAgain: false,
-				unlisten: [],
-				focusListeners: new Set(),
-				assignmentListeners: new Set(),
-				pendingAssignments: [],
-			};
-			this.children.set(serialized.childId, child);
-			this.watchChild(child);
+		const client = new ChildRpcClient({
+			socketPath: serialized.socketPath,
+			childId: serialized.childId,
+			token: serialized.token,
+			connectTimeoutMs: this.options.connectTimeoutMs ?? 2000,
+		});
+		try {
+			const snapshot = await client.connect();
+			this.verifyChildPid(serialized.launcher, snapshot);
+			await launcher.terminate(serialized.launcher);
+			rmSync(dirname(serialized.socketPath), { recursive: true, force: true });
+			return true;
+		} catch (error) {
+			if (error instanceof ChildProtocolError && error.code === "identity_mismatch") throw error;
+			return launcher.cleanupExited(serialized.launcher);
+		} finally {
+			client.disconnect();
 		}
-		this.reattachChild(child);
-		this.createRun(runId, child);
-		return { kind: "process", handle: runId };
-	}
-	async probeSerialized(serialized: SerializableBackendHandle, runId: string): Promise<BackendStatus> {
-		const handle = this.runs.has(runId)
-			? { kind: "process" as const, handle: runId }
-			: this.restoreHandle(runId, serialized);
-		if (!handle) return { state: "disconnected", detail: "Cannot validate persisted child identity." };
-		return this.status(handle);
 	}
 }
 function isSettled(status: BackendStatus): boolean {

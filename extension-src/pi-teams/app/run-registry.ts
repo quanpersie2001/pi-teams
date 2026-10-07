@@ -1,17 +1,16 @@
 // Process-only durable run registry/history file I/O.
 //
-// Registry rows retain control identity only while a child is active or cleanup
-// remains recoverable. History rows contain outcome/session metadata for cold
-// resume, never a live-process receipt.
+// Registry rows retain process identity while work is active or terminal cleanup
+// remains pending. History rows retain outcomes and session paths for cold resume.
 // Parsed legacy or malformed rows remain opaque and are never adopted.
 
 import type { AgentRun, AgentRunStatus, UsageSummary } from "../domain/agent-run.js";
-import type { AgentBackendHandle, BackendStatus } from "../domain/backend.js";
+import type { AgentBackendHandle } from "../domain/backend.js";
 import type { AgentOwner, DeliveryPolicy, ParentSessionRef } from "../domain/delivery.js";
 import type { LauncherHandle } from "../domain/process-launcher.js";
 import type { WorktreeResult } from "../domain/worktree.js";
 
-/** Durable identity and credentials needed to reconnect to one child process. */
+/** Durable identity used for active-run persistence and identity-checked disposal. */
 export interface SerializableBackendHandle {
 	kind: "process";
 	childId: string;
@@ -103,36 +102,10 @@ export interface SubagentRunStore {
 	recordCompleted(entry: CompletedRunHistoryEntry): void;
 }
 
-/** Outcome returned by an identity-checked process RPC snapshot. */
-export interface RestoreCompletionObservation {
-	finished: boolean;
-	outcome?: "completed" | "stopped" | "failed";
-	result?: string;
-	error?: string;
-	sessionFile?: string;
-	usage?: UsageSummary;
-	turns?: number;
-	toolUses?: number;
-}
-
-/** Process-RPC observations needed to restore a child without guessing. */
-export interface RestoreObservers {
-	sessionPresent(entry: AgentRegistryEntry): boolean;
-	detectCompletion(entry: AgentRegistryEntry): RestoreCompletionObservation | Promise<RestoreCompletionObservation>;
-	resourceAlive(entry: AgentRegistryEntry): boolean | undefined | Promise<boolean | undefined>;
-}
-
-/** Result of asking the manager to restore or clean up a process receipt. */
-export type RestoreReconnectResult =
-	| { state: "retained"; entry: AgentRegistryEntry }
-	| { state: "closed" }
-	| { state: "deferred" };
-
-/** Process backend persistence hooks; status is read from child RPC. */
-export interface RestorableExecutionBackend {
-	restoreHandle(runId: string, serialized: SerializableBackendHandle): AgentBackendHandle | null;
+/** Process backend handle serialization and guarded stale-receipt disposal. */
+export interface PersistedExecutionBackend {
 	serializeHandle?(handle: AgentBackendHandle, sessionFile?: string): SerializableBackendHandle | undefined;
-	probeSerialized?(serialized: SerializableBackendHandle, runId: string): Promise<BackendStatus>;
+	disposePersisted?(serialized: SerializableBackendHandle): Promise<boolean>;
 }
 
 export type HandleProjector = (

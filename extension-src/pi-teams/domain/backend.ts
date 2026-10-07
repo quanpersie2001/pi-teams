@@ -9,6 +9,12 @@ import type { ChildControlCommand, ChildState } from "./child-protocol.js";
 import type { TranscriptSnapshot } from "./transcript.js";
 import type { WorktreeInfo } from "./worktree.js";
 
+export interface TeamBootstrapContext {
+	teamDir: string;
+	teamKey: string;
+	teammateName: string;
+}
+
 /** Input for launching a specialist agent in a child process. */
 export interface AgentLaunchInput {
 	runId: string;
@@ -34,7 +40,7 @@ export interface AgentLaunchInput {
 	isolation?: IsolationPolicy;
 	worktree?: WorktreeInfo;
 	/** Authenticated team bootstrap context for named teammates only. */
-	team?: { teamDir: string; teamKey: string; teammateName: string };
+	team?: TeamBootstrapContext;
 }
 
 /** Opaque process-backend handle. */
@@ -73,6 +79,8 @@ export interface AgentResumeInput {
 	background: boolean;
 	model?: string;
 	modelFallback?: string;
+	/** Current owning team's context; never recovered from a previous team's bootstrap. */
+	team?: TeamBootstrapContext;
 }
 
 /** Model/auth admission must finish before allocating a run or child resource. */

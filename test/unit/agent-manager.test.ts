@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
 import { AgentRegistry, type LoadedAgentFile } from "../../extension-src/pi-teams/app/agent-registry.js";
 import type {
-	AgentRegistryEntry,
+	CompletedRunHistoryEntry,
 	PersistedRegistryEntry,
 	SubagentRunStore,
 } from "../../extension-src/pi-teams/app/run-registry.js";
@@ -87,31 +87,6 @@ function makeManager(
 	const events: AgentLifecycleEvent[] = [];
 	manager.subscribe((event) => events.push(event));
 	return { manager, backend, registry, store, events };
-}
-
-function persistedRun(id: string, status: AgentRegistryEntry["status"]): AgentRegistryEntry {
-	const childId = `child-${id}`;
-	return {
-		id,
-		type: "general-purpose",
-		description: "legacy child",
-		status,
-		backend: "process",
-		handle: {
-			kind: "process",
-			childId,
-			socketPath: `/tmp/${childId}.sock`,
-			token: `token-${childId}`,
-			runDir: `/tmp/${childId}`,
-			launcher: { kind: "tmux", childId, paneId: `%${id}` },
-		},
-		sessionFile: `/tmp/sessions/${id}.jsonl`,
-		cwd: "/tmp/project",
-		configCwd: "/tmp/project",
-		owner: { kind: "conversation", sessionId: "session-main" },
-		delivery: "conversation",
-		startedAt: 1,
-	};
 }
 
 async function load(fixture: ManagerFixture): Promise<void> {
@@ -491,45 +466,6 @@ describe("AgentManager pane attachment capability", () => {
 		native.backend.complete(nativeRun.id, "finished");
 		await native.manager.whenSettled(nativeRun.id);
 		expect(native.manager.canAttachPane(nativeRun.id)).toBe(false);
-	});
-});
-
-describe("AgentManager restored terminal cleanup", () => {
-	for (const [persistedStatus, nativeStatus, expectedStatus] of [
-		["completed", { state: "completed", result: "done" }, "completed"],
-		["stopped", { state: "stopped" }, "stopped"],
-		["error", { state: "failed", error: "failed" }, "error"],
-	] as const) {
-		it(`closes an authenticated restored ${persistedStatus} child`, async () => {
-			const fixture = makeManager();
-			await load(fixture);
-			const row = persistedRun(`old-${persistedStatus}`, persistedStatus);
-			fixture.backend.setStatus(row.id, { ...nativeStatus, sessionFile: row.sessionFile });
-
-			const result = await fixture.manager.restoreReconnectedRun(row);
-
-			expect(result).toEqual({ state: "closed" });
-			expect(fixture.backend.disposeAttempts).toEqual([`fake-restored-${row.id}`]);
-			expect(fixture.backend.disposedHandles).toEqual([`fake-restored-${row.id}`]);
-			expect(fixture.manager.get(row.id)?.status).toBe(expectedStatus);
-			expect(fixture.manager.get(row.id)?.handle).toBeUndefined();
-			expect(fixture.store.history[0]?.status).toBe(expectedStatus);
-			expect(fixture.store.history[0]).not.toHaveProperty("handle");
-			expect(fixture.store.registry).toEqual([]);
-		});
-	}
-
-	it("does not close an active restored child", async () => {
-		const fixture = makeManager();
-		await load(fixture);
-		const active = persistedRun("old-active", "running");
-		fixture.backend.setStatus(active.id, { state: "running" });
-
-		const activeResult = await fixture.manager.restoreReconnectedRun(active);
-
-		expect(activeResult.state).toBe("retained");
-		expect(fixture.backend.disposeAttempts).toEqual([]);
-		expect(fixture.manager.get(active.id)?.handle).toBeDefined();
 	});
 });
 
@@ -1272,68 +1208,5 @@ describe("AgentManager hard time budgets", () => {
 		expect(resumed.budgetTimeout).toBe(7);
 		expect(resumed.budgetIdleTimeout).toBe(3);
 		await expect(fixture.manager.resume(original.id, "again", { timeout: 0 })).rejects.toThrow(/invalid timeout/);
-	});
-
-	it("a reconnected retained child re-derives idle output from the transcript", async () => {
-		const fixture = timedManager();
-		await load(fixture);
-		const launchedAt = clock;
-		const row = persistedRun("budgeted-restore", "running");
-		row.budgetTimeout = 120;
-		row.budgetIdleTimeout = 30;
-		row.budgetStartedAt = launchedAt;
-		row.budgetLastOutputAt = launchedAt + 5_000;
-		fixture.backend.setStatus(row.id, { state: "running" });
-
-		const result = await fixture.manager.restoreReconnectedRun(row);
-		expect(result.state).toBe("retained");
-		const restored = fixture.manager.get(row.id);
-		expect(restored?.budgetStartedAt).toBe(launchedAt);
-
-		// The child produced output while the parent was away: the idle clock
-		// re-derives from the authenticated transcript instead of firing on the
-		// stale persisted value (t0+35s).
-		fixture.backend.emitFocus(row.id, [item("assistant", launchedAt + 40_000)]);
-		await settle(fixture.manager, 20);
-		await advance(34_000);
-		expect(fixture.manager.get(row.id)?.status).toBe("running");
-		expect(fixture.manager.get(row.id)?.budgetLastOutputAt).toBe(launchedAt + 40_000);
-
-		// Quiet since t0+40s: the corrected idle deadline (t0+70s) fires, not
-		// the stale persisted one (t0+35s), and the 120s wall clock is untouched.
-		await advance(35_000);
-		expect(fixture.manager.get(row.id)?.status).toBe("running");
-		await advance(1_000);
-		expect(fixture.manager.get(row.id)?.budgetExhausted).toBe("idle_timeout");
-		expect(fixture.manager.get(row.id)?.budgetSeconds).toBe(30);
-		expect(fixture.backend.stops).toHaveLength(1);
-	});
-
-	it("a reconnected retained child keeps the original wall clock across restart", async () => {
-		const fixture = timedManager();
-		await load(fixture);
-		const launchedAt = clock;
-		const row = persistedRun("wall-restore", "running");
-		row.budgetTimeout = 60;
-		row.budgetIdleTimeout = 0;
-		row.budgetStartedAt = launchedAt;
-		row.budgetLastOutputAt = launchedAt;
-		fixture.backend.setStatus(row.id, { state: "running" });
-
-		const result = await fixture.manager.restoreReconnectedRun(row);
-		expect(result.state).toBe("retained");
-
-		// The parent was away for 50s of the child's 60s wall budget: only 10s
-		// may remain. A fresh-clock restore would have fired 60s from now.
-		// (advance moves the injected clock AND the fake timer queue in lockstep
-		// — exactly like a real clock driving both.)
-		await advance(50_000);
-		expect(fixture.manager.get(row.id)?.status).toBe("running");
-		await advance(9_000);
-		expect(fixture.manager.get(row.id)?.status).toBe("running");
-		await advance(1_000);
-		expect(fixture.manager.get(row.id)?.budgetExhausted).toBe("timeout");
-		expect(fixture.manager.get(row.id)?.budgetSeconds).toBe(60);
-		expect(fixture.backend.stops).toHaveLength(1);
 	});
 });

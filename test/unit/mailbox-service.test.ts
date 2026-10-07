@@ -66,7 +66,7 @@ describe("MailboxService", () => {
 		const { sender, recipient } = services();
 		sender.send("worker", "first");
 		sender.send("worker", "second");
-		const [first] = recipient.receive();
+		const first = recipient.receive().find((message) => message.text === "first");
 		if (!first) throw new Error("No signed message was available to consume");
 		recipient.consume(first);
 		expect(recipient.receive()).toMatchObject([{ text: "second" }]);

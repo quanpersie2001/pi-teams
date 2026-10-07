@@ -5,6 +5,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MailboxService } from "../app/mailbox-service.js";
+import { TaskBoardService } from "../app/task-board-service.js";
 import { decideTurnEvent, SOFT_STEER_MESSAGE } from "../app/turn-policy.js";
 import { EMPTY_USAGE, type UsageSummary } from "../domain/agent-run.js";
 import {
@@ -29,6 +30,7 @@ import {
 } from "../domain/child-protocol.js";
 import type { TranscriptItem } from "../domain/transcript.js";
 import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
+import { createTeamTaskTools } from "./team-task-tools.js";
 
 const MAX_TRANSCRIPT_ITEMS = 256;
 const MAX_PARTIAL_ITEMS = 16;
@@ -1426,6 +1428,8 @@ export async function installChildBridgeExtension(pi: ExtensionAPI): Promise<voi
 				}),
 			),
 		);
+		const board = new TaskBoardService({ teamDir: initialBootstrap.teamDir, self: initialBootstrap.teammateName });
+		for (const tool of createTeamTaskTools(() => board)) pi.registerTool(tool);
 	}
 	pi.on("before_agent_start", async (event) => {
 		const bootstrap = await getBootstrap();

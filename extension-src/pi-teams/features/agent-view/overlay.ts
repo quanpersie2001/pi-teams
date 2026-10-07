@@ -170,7 +170,14 @@ export function createAgentViewOverlay(options: {
 
 	function footer(view: AgentTranscriptView, focus: AgentFocusSnapshot | undefined, width: number): string {
 		const actions: string[] = [];
-		if (canCompose(view)) actions.push(view.capabilities.steerable ? "type + enter steer" : "type + enter cold resume");
+		if (canCompose(view))
+			actions.push(
+				view.resourceState === "idle"
+					? "type + enter assign"
+					: view.capabilities.steerable
+						? "type + enter steer"
+						: "type + enter cold resume",
+			);
 		for (const command of ["model", "thinking", "compact"]) {
 			if (focus?.capabilities.includes(command)) {
 				actions.push(

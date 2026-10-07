@@ -12,6 +12,7 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { MailboxService } from "../app/mailbox-service.js";
+import { TaskBoardService } from "../app/task-board-service.js";
 import { type ChildBootstrap, ChildProtocolError } from "../domain/child-protocol.js";
 import {
 	type ChildBridgeHandle,
@@ -23,6 +24,7 @@ import {
 	startChildBridge,
 } from "./child-bridge.js";
 import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
+import { createTeamTaskTools } from "./team-task-tools.js";
 
 const CHILD_ENV = "PI_TEAMS_CHILD";
 
@@ -135,6 +137,20 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		bootstrap.teamDir && bootstrap.teamKey && bootstrap.teammateName
 			? new MailboxService({ teamDir: bootstrap.teamDir, teamKey: bootstrap.teamKey, self: bootstrap.teammateName })
 			: undefined;
+	const taskBoard =
+		bootstrap.teamDir && bootstrap.teammateName
+			? new TaskBoardService({ teamDir: bootstrap.teamDir, self: bootstrap.teammateName })
+			: undefined;
+	const customTools =
+		mailboxService && taskBoard
+			? [createChildMailboxTool(mailboxService), ...createTeamTaskTools(() => taskBoard)]
+			: undefined;
+	const tools = bootstrap.tools === undefined ? undefined : [...bootstrap.tools];
+	if (tools && customTools) {
+		for (const tool of customTools) {
+			if (!tools.includes(tool.name)) tools.push(tool.name);
+		}
+	}
 	const sessionOptions: CreateAgentSessionOptions = {
 		cwd: bootstrap.cwd,
 		agentDir,
@@ -142,10 +158,10 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		settingsManager,
 		resourceLoader,
 		sessionManager,
-		...(mailboxService ? { customTools: [createChildMailboxTool(mailboxService)] } : {}),
+		...(customTools ? { customTools } : {}),
 		...(model ? { model } : {}),
 		...(!requestedSessionFile && bootstrap.thinking !== undefined ? { thinkingLevel: bootstrap.thinking } : {}),
-		...(bootstrap.tools !== undefined ? { tools: [...bootstrap.tools] } : {}),
+		...(tools !== undefined ? { tools } : {}),
 	};
 	const { session } = await createAgentSession(sessionOptions);
 	if (!session.model) {

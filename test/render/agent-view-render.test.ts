@@ -294,7 +294,6 @@ describe("fullscreen agent transcript", () => {
 			resourceState: "closed",
 			capabilities: { attachable: false, viewable: true, steerable: false, stoppable: false, resumable: true },
 		});
-		expect(stripTerminalSequences(history.overlay.render(80).join("\n"))).toContain("type + enter cold resume");
 		history.editor.setText("continue the fix");
 		history.overlay.handleInput(ENTER);
 		expect(history.state.submitted).toEqual(["continue the fix"]);

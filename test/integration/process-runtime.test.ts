@@ -7,8 +7,9 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
 import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
-import { createPiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
 import type { SerializableBackendHandle, SubagentRunStore } from "../../extension-src/pi-teams/app/run-registry.js";
+import { TaskBoardService } from "../../extension-src/pi-teams/app/task-board-service.js";
+import { TeamService } from "../../extension-src/pi-teams/app/team-service.js";
 import { buildAgentListView } from "../../extension-src/pi-teams/app/ui-snapshot.js";
 import { type AgentRun, isTerminalStatus } from "../../extension-src/pi-teams/domain/agent-run.js";
 import type {
@@ -21,6 +22,7 @@ import type { LauncherHandle, ProcessLauncher } from "../../extension-src/pi-tea
 import { ProcessAgentExecutionBackend } from "../../extension-src/pi-teams/pi/process-backend.js";
 import { createProcessLaunchers } from "../../extension-src/pi-teams/pi/process-launchers.js";
 import { createSubagentRunStore } from "../../extension-src/pi-teams/pi/registry-host.js";
+import { createPiTeamStore } from "../../extension-src/pi-teams/pi/teams-host.js";
 
 const tempRoots: string[] = [];
 const servers: Server[] = [];
@@ -49,7 +51,7 @@ interface LocalProvider {
 	releaseFirst(): void;
 }
 
-async function localProvider(options: { holdFirst?: boolean } = {}): Promise<LocalProvider> {
+async function localProvider(options: { holdFirst?: boolean; createTeamTask?: boolean } = {}): Promise<LocalProvider> {
 	const root = await mkdtemp(join(tmpdir(), "teams-process-runtime-"));
 	tempRoots.push(root);
 	const agentDir = join(root, "agent");
@@ -79,12 +81,26 @@ async function localProvider(options: { holdFirst?: boolean } = {}): Promise<Loc
 				connection: "keep-alive",
 			});
 			const prefix = { id: "chatcmpl-local", object: "chat.completion.chunk", created: 1, model: "local-model" };
+			const createTask = options.createTeamTask && JSON.parse(body).messages.at(-1)?.role === "user";
+			const delta = createTask
+				? {
+						role: "assistant",
+						tool_calls: [
+							{
+								index: 0,
+								id: `native-task-${requests.length}`,
+								type: "function",
+								function: { name: "team_task_create", arguments: JSON.stringify({ title: "Cold continuation task" }) },
+							},
+						],
+					}
+				: { role: "assistant", content: "process-child-ok" };
 			for (const chunk of [
 				{
 					...prefix,
-					choices: [{ index: 0, delta: { role: "assistant", content: "process-child-ok" }, finish_reason: null }],
+					choices: [{ index: 0, delta, finish_reason: null }],
 				},
-				{ ...prefix, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+				{ ...prefix, choices: [{ index: 0, delta: {}, finish_reason: createTask ? "tool_calls" : "stop" }] },
 				{ ...prefix, choices: [], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } },
 			])
 				response.write(`data: ${JSON.stringify(chunk)}\n\n`);
@@ -511,72 +527,6 @@ function observedHeadlessLauncher(): {
 }
 
 describe("real process runtime", () => {
-	for (const live of [false, true]) {
-		it(`restores a settled unavailable-RPC receipt after ${live ? "control-loss self-termination" : "verified child death"}`, async () => {
-			const provider = await localProvider({ holdFirst: true });
-			const { launcher, exited } = observedHeadlessLauncher();
-			const original = new ProcessAgentExecutionBackend({ launchers: [launcher], connectTimeoutMs: 15_000 });
-			const restored = new ProcessAgentExecutionBackend({ launchers: [launcher] });
-			const id = `settled-disconnected-${live ? "selfstop" : "dead"}`;
-			const handle = await original.launch(launchInput(id, provider.cwd));
-			await provider.firstRequest;
-			const serialized = original.serializeHandle(handle);
-			if (!serialized?.launcher.pid) throw new Error("Native child identity is unavailable");
-			original.detach(handle);
-			await rm(serialized.socketPath, { force: true });
-			if (!live) process.kill(serialized.launcher.pid, "SIGKILL");
-			// Session-bound lifetime: a detached live child sees control-socket
-			// loss and stops itself; both variants end with a verified exit.
-			await exited;
-			const store = createSubagentRunStore(provider.cwd);
-			store.writeRegistry([
-				{
-					id,
-					type: "general-purpose",
-					description: "Interrupted failed-child cleanup",
-					status: "error",
-					backend: "process",
-					handle: serialized,
-					error: "Preserved provider failure",
-					startedAt: 1,
-					completedAt: 2,
-					cwd: provider.cwd,
-					configCwd: provider.cwd,
-					owner: { kind: "conversation", sessionId: "restore-smoke" },
-					delivery: "conversation",
-				},
-			]);
-			const observed = await restored.probeSerialized(serialized, id);
-			expect(observed.state).toBe("disconnected");
-			const app = createPiSubagentsApp({
-				sources: [],
-				loader: async () => [],
-				settings: sanitizeSettings({ rememberAgents: true, worktreeIsolation: false }),
-				backends: [restored],
-				cwd: provider.cwd,
-				configCwd: provider.cwd,
-				getSessionId: () => "restore-smoke",
-				runStore: store,
-				restoreObservers: {
-					sessionPresent: () => true,
-					detectCompletion: () => ({ finished: false }),
-					resourceAlive: () => undefined,
-				},
-			});
-			try {
-				await app.sessionStart();
-				expect(app.manager.get(id)?.status).toBe("error");
-				expect(app.manager.get(id)?.error).toBe("Preserved provider failure");
-				expect(app.manager.get(id)?.handle).toBeUndefined();
-				expect(store.readRegistry()).toEqual([]);
-				expect(() => process.kill(serialized.launcher.pid ?? 0, 0)).toThrow(/ESRCH/);
-				expect(store.readHistory()).toMatchObject([{ id, status: "error", error: "Preserved provider failure" }]);
-			} finally {
-				await app.sessionShutdown();
-				provider.releaseFirst();
-			}
-		}, 60_000);
-	}
 	it("rejects missing native auth before allocating a run, process, or artifacts", async () => {
 		const provider = await localProvider();
 		const previousEnv = process.env;
@@ -692,12 +642,11 @@ describe("real process runtime", () => {
 		}
 	}, 60_000);
 
-	it("rejects controls when authenticated native PID disagrees with a persisted launcher identity", async () => {
+	it("refuses stale disposal when the authenticated child PID disagrees with the launcher identity", async () => {
 		const provider = await localProvider({ holdFirst: true });
 		const original = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 15_000 });
-		const restored = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 2_000 });
+		const disposer = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 2_000 });
 		let originalHandle: AgentBackendHandle | undefined;
-		let restoredHandle: AgentBackendHandle | undefined;
 		try {
 			originalHandle = await original.launch(launchInput("identity-mismatch", provider.cwd));
 			await provider.firstRequest;
@@ -705,17 +654,9 @@ describe("real process runtime", () => {
 			if (!serialized?.launcher.pid) throw new Error("Fixture launcher identity was not serializable");
 			original.detach(originalHandle);
 			const mismatched = { ...serialized, launcher: { ...serialized.launcher, pid: serialized.launcher.pid + 1 } };
-			restoredHandle = restored.restoreHandle("identity-mismatch", mismatched) ?? undefined;
-			if (!restoredHandle) throw new Error("Fixture bootstrap was not restorable");
-			expect(await restored.status(restoredHandle)).toMatchObject({
-				state: "disconnected",
-				detail: expect.stringMatching(/PID/),
-			});
-			await expect(restored.steer(restoredHandle, "Do not admit this steer")).rejects.toThrow(/PID/);
-			await expect(restored.stop(restoredHandle)).rejects.toThrow(/PID/);
+			await expect(disposer.disposePersisted(mismatched)).rejects.toThrow(/PID/);
 		} finally {
 			provider.releaseFirst();
-			if (restoredHandle) restored.detach(restoredHandle);
 			if (originalHandle) await original.dispose(originalHandle);
 		}
 	}, 60_000);
@@ -774,26 +715,10 @@ describe("real process runtime", () => {
 			if (handle && !disposed) await backend.dispose(handle);
 		}
 	}, 60_000);
-	it("reauthenticates a detached live child in the same backend before accepting control", async () => {
-		const provider = await localProvider({ holdFirst: true });
-		const backend = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 15_000 });
-		let handle: AgentBackendHandle | undefined;
-		try {
-			handle = await backend.launch(launchInput("detached-active", provider.cwd));
-			await provider.firstRequest;
-			backend.detach(handle);
-			expect((await backend.status(handle)).state).toBe("running");
-			expect(await backend.stop(handle)).toBe(true);
-			expect((await waitForTerminal(backend, handle)).state).toBe("stopped");
-		} finally {
-			provider.releaseFirst();
-			if (handle) await backend.dispose(handle);
-		}
-	}, 60_000);
 	it("cold-resumes a native Pi child from the original persisted session", async () => {
 		const provider = await localProvider();
 		const cwd = provider.cwd;
-		let backend = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 15_000 });
+		const backend = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 15_000 });
 		let activeHandle: AgentBackendHandle | undefined;
 		try {
 			expect(await backend.available()).toBe(true);
@@ -843,30 +768,109 @@ describe("real process runtime", () => {
 				),
 			).toBe(true);
 
-			const serialized = backend.serializeHandle(resumed, resumedStatus.sessionFile);
-			if (!serialized) throw new Error("Completed child identity was not serializable");
-			const detachedBackend = backend;
-			detachedBackend.detach(resumed);
+			await backend.dispose(resumed);
 			activeHandle = undefined;
-			backend = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 15_000 });
-			const restored = backend.restoreHandle("process-run-2", serialized);
-			if (!restored) {
-				await detachedBackend.dispose(resumed);
-				throw new Error("Persisted child identity was not restorable");
-			}
-			activeHandle = restored;
-			expect(await backend.status(restored)).toMatchObject({ state: "completed", result: "process-child-ok" });
-			const transcriptBeforeClose = await backend.readTranscript(restored);
-			await backend.dispose(restored);
-			activeHandle = undefined;
-			expect(backend.serializeHandle(restored)).toBeUndefined();
-			expect(await backend.readTranscript(restored)).toEqual(transcriptBeforeClose);
-			expect(await backend.status(restored)).toMatchObject({
-				state: "completed",
-				sessionFile: resumedStatus.sessionFile,
-			});
 		} finally {
 			if (activeHandle) await backend.dispose(activeHandle);
+		}
+	}, 60_000);
+	it("cold-resumes a named child against its current team's board without mutating the previous team", async () => {
+		const provider = await localProvider({ createTeamTask: true });
+		const backend = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 15_000 });
+		const previousDir = join(provider.cwd, ".pi", "teams", "t", "previous");
+		const currentDir = join(provider.cwd, ".pi", "teams", "t", "current");
+		const previous = new TaskBoardService({ teamDir: previousDir, self: "lead" });
+		const current = new TaskBoardService({ teamDir: currentDir, self: "lead" });
+		let handle: AgentBackendHandle | undefined;
+		try {
+			handle = await backend.launch({
+				...launchInput("named-before-cold", provider.cwd),
+				maxTurns: 2,
+				team: { teamDir: previousDir, teamKey: "a".repeat(64), teammateName: "worker" },
+			});
+			const source = await waitForTerminal(backend, handle);
+			if (!source.sessionFile || source.state !== "completed")
+				throw new Error("Named source did not preserve a completed native session");
+			const previousTasks = previous.list();
+			await backend.dispose(handle);
+			handle = undefined;
+			handle = await backend.resume({
+				runId: "named-after-cold",
+				sessionFile: source.sessionFile,
+				prompt: "Continue the saved conversation in the current team.",
+				cwd: provider.cwd,
+				background: true,
+				team: { teamDir: currentDir, teamKey: "b".repeat(64), teammateName: "worker" },
+			});
+			expect((await waitForTerminal(backend, handle)).state).toBe("completed");
+			expect(previous.list()).toEqual(previousTasks);
+			expect(current.list()).toMatchObject([{ title: "Cold continuation task", status: "pending" }]);
+		} finally {
+			if (handle) await backend.dispose(handle);
+		}
+	}, 60_000);
+
+	it("releases execution capacity when a retained native teammate refuses a new assignment", async () => {
+		const provider = await localProvider();
+		const backend = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 15_000 });
+		const settings = sanitizeSettings({ maxConcurrent: 1, backgroundByDefault: true, worktreeIsolation: false });
+		const registry = new AgentRegistry({
+			sources: [],
+			loader: async () => [
+				{
+					sourcePath: join(provider.cwd, "worker.md"),
+					filenameStem: "worker",
+					frontmatter: { name: "worker", model: "local-test/local-model", tools: "none", max_turns: 1 },
+					body: "Use the local deterministic provider.",
+				},
+			],
+			settings,
+		});
+		await registry.load();
+		const team = new TeamService({
+			sessionId: "refused-native-assignment",
+			store: createPiTeamStore(provider.cwd, "refused-native-assignment"),
+		});
+		team.sessionStart();
+		const manager = new AgentManager({
+			registry,
+			settings,
+			backends: [backend],
+			cwd: provider.cwd,
+			configCwd: provider.cwd,
+		});
+		manager.setTeamService(team);
+		try {
+			const original = await manager.spawn({ type: "worker", name: "a", prompt: "Initial assignment." });
+			expect((await manager.whenSettled(original.id))?.status).toBe("completed");
+			const continuation = await manager.spawn({
+				type: "worker",
+				name: "a",
+				prompt: "Next assignment in the same native child.",
+			});
+			expect((await manager.whenSettled(continuation.id))?.status).toBe("completed");
+			await expect(manager.resume(original.id, "Do not duplicate the retained teammate.")).rejects.toThrow();
+			const oversized = await manager.spawn({ type: "worker", name: "a", prompt: "x".repeat(262_145) });
+			const rejected = await manager.whenSettled(oversized.id);
+			expect(rejected).toMatchObject({ status: "error", turns: 0, toolUses: 0 });
+			expect(rejected?.result).toBeUndefined();
+			expect(rejected?.resultFile).toBeUndefined();
+			const handle = manager.get(oversized.id)?.handle;
+			if (!handle) throw new Error("Named native child was not retained");
+			backend.detach(handle);
+			const refused = await manager.spawn({
+				type: "worker",
+				name: "a",
+				prompt: "Cannot admit through released control.",
+			});
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(manager.get(refused.id)?.status).toBe("error");
+			expect(manager.hasRunning()).toBe(false);
+			await manager.release(oversized.id);
+			const next = await manager.spawn({ type: "worker", name: "a", prompt: "Execution capacity remains available." });
+			expect((await manager.whenSettled(next.id))?.status).toBe("completed");
+		} finally {
+			await manager.shutdownSession();
 		}
 	}, 60_000);
 	it("manager closes native children and cold-resumes with saved conversation context", async () => {
@@ -1374,79 +1378,6 @@ describe("native time budgets", () => {
 				} catch {}
 			}
 			await harness.manager.dispose().catch(() => undefined);
-		}
-	}, 45_000);
-
-	it("anchors budget enforcement to the authenticated bootstrap identity, not a tampered registry PID", async () => {
-		const provider = await scriptedProvider([{ kind: "hold" }]);
-		const { launcher } = observedHeadlessLaunchers();
-		const backend = new ProcessAgentExecutionBackend({ launchers: [launcher], connectTimeoutMs: 15_000 });
-		const settings = sanitizeSettings({ backgroundByDefault: true, worktreeIsolation: false });
-		const registry = new AgentRegistry({ sources: [], loader: async () => [], settings });
-		await registry.load();
-		const store = createSubagentRunStore(provider.cwd);
-		const manager = new AgentManager({
-			registry,
-			settings,
-			backends: [backend],
-			cwd: provider.cwd,
-			configCwd: provider.cwd,
-			registryStore: store,
-		});
-		let handle: AgentBackendHandle | undefined;
-		let serialized: SerializableBackendHandle | undefined;
-		try {
-			handle = await backend.launch(launchInput("tampered-budget-run", provider.cwd));
-			await provider.firstRequest;
-			serialized = backend.serializeHandle(handle);
-			if (!serialized?.launcher.pid) throw new Error("native child identity was not serializable");
-			const realPid = serialized.launcher.pid;
-
-			// A stale/tampered launcher PID in a restored receipt must neither
-			// shield the owned child from its deadline nor redirect the kill at an
-			// unrelated process: ownership follows the authenticated bootstrap, the
-			// owned group is terminated, and the run settles with the budget outcome.
-			const staleClocks = Date.now() - 9_000;
-			const receipt = {
-				id: "tampered-budget-run",
-				type: "general-purpose",
-				description: "tampered receipt budget enforcement",
-				status: "running",
-				backend: "process",
-				handle: { ...serialized, launcher: { ...serialized.launcher, pid: realPid + 1 } },
-				model: "local-test/local-model",
-				startedAt: staleClocks,
-				cwd: provider.cwd,
-				configCwd: provider.cwd,
-				owner: { kind: "conversation", sessionId: "tampered-budget" },
-				delivery: "conversation",
-				budgetTimeout: 0,
-				budgetIdleTimeout: 8,
-				budgetStartedAt: staleClocks,
-				budgetLastOutputAt: staleClocks,
-			} as const;
-			store.writeRegistry([receipt]);
-			const restored = await manager.restoreReconnectedRun(receipt);
-			expect(restored.state).toBe("retained");
-
-			const settled = await manager.whenSettled("tampered-budget-run");
-			expect(settled?.status).toBe("stopped");
-			expect(settled?.budgetExhausted).toBe("idle_timeout");
-			expect(settled?.budgetSeconds).toBe(8);
-			expect(settled?.recoveryError).toBeUndefined();
-			// The owned child group is gone.
-			expect(() => process.kill(realPid, 0)).toThrow(/ESRCH/);
-			expect(store.readRegistry()).toEqual([]);
-			expect(store.readHistory()[0]).toMatchObject({
-				id: "tampered-budget-run",
-				status: "stopped",
-				budgetExhausted: "idle_timeout",
-				budgetSeconds: 8,
-			});
-		} finally {
-			await manager.shutdownSession();
-			if (serialized) await launcher.terminate(serialized.launcher).catch(() => undefined);
-			if (handle) await backend.dispose(handle).catch(() => undefined);
 		}
 	}, 45_000);
 });

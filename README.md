@@ -19,10 +19,11 @@ Delegate implementation, local exploration, external research, and code review w
 - **Opt-in time budgets** — optional `timeout`/`idle_timeout` limits in seconds hard-stop runaway children; the idle clock refreshes on child output only, and enforcement stops when the parent session shuts down.
 - **One Agents Hub** — Main and child conversations share navigation, while keeping drafts, scroll positions, and tool expansion independent.
 - **Focused specialists** — four bundled roles, layered Markdown definitions, native `@agent` autocomplete, and a packaged `create-agent` skill.
-- **Recoverable sessions** — durable native JSONL history supports cold continuation in a new child process; settled children close after durable finalization.
-- **Session-owned runs** — a run belongs to the conversation that launched it: other sessions in the same project never see, adopt, or control it. Teammates are session-bound ([ADR 0007](docs/decisions/0007-session-bound-agent-teams.md)): session end/switch/shutdown tears every child down (abort request → bounded grace → verified force-kill), children detect a dead parent through control-socket loss and stop themselves with an annotated partial `result.md`, and startup never re-adopts leftover active rows — they archive `stopped` with an honest note and go through verified disposal. Settled or verified-dead foreign rows are archived to shared history for explicit cold `resume` by run ID.
+- **Recoverable sessions** — durable native JSONL history supports explicit cold continuation in a new child process. Anonymous children close after durable finalization; named teammates retain their native child while idle.
+- **Session-owned runs** — other sessions never adopt or control a conversation's live runs. Session end/switch/shutdown tears children down (abort → bounded grace → verified force-kill); control-socket loss stops an orphan with an annotated partial result. Startup archives stale owned rows instead of re-adopting them; foreign-owner rows remain untouched.
 - **Workspace choice** — shared files by default, or opt-in Git worktrees with retained commits/checkouts and explicit cleanup.
 - **Extension integration** — signed peer mailboxes and public events RPC for consumers that own scheduling, retries, and review policy.
+- **Shared team board** — durable tasks, atomic self-claim and dependency unlocking; consumer scheduling, retries, acceptance and review remain outside the runtime.
 
 ---
 
@@ -104,7 +105,7 @@ Children do not inherit the parent's conversation automatically. For change revi
 | **Left twice within 500 ms** at Main's document start or from bottom navigation | Open Hub without losing the draft |
 | **Down** from empty Main | Enter the visible inline bottom navigation |
 | **Arrows / Enter** in navigation | Select / view a child |
-| **Enter** in the child composer | Steer an active child or cold-resume a settled session |
+| **Enter** in the child composer | Assign an idle named teammate or cold-resume a settled session |
 | **Esc** in a child view | Return without aborting |
 | **Alt+Left/Right / Alt+Up** with an empty child composer | Switch siblings / return to Main |
 | **Ctrl+X twice / Alt+O** with an empty child composer | Abort / open a verified live native pane |
@@ -121,10 +122,17 @@ HerdR/tmux keep Main on the left and stack at most three children per right-hand
 | `get_subagent_result` | Inspect a run's status and read its full result — durable, re-readable from the run's `result.md` artifact on every call; `wait: true` blocks until the run settles |
 | `steer_subagent` | Send guidance to an active run |
 | `send_message` | Send `{ target: "teammate-name" \| "lead", message: "..." }` through a signed peer mailbox |
+| `team_task_create` | Create `{ title, description?, dependencies? }` in the current team's board |
+| `team_task_update` | Claim a pending task (`in_progress`), release your own claim (`pending`) or complete it (`completed`) |
+| `team_task_list` | List current-team tasks with their current `blockedBy` dependency IDs |
+| `team_task_get` | Read one current-team task by ID |
 
 Named teammates stay alive while idle. A new assignment under the same name reuses its native child and specialist role; mailbox messages start an assignment when idle or steer the active turn. The bridge watches its inbox automatically—models never poll. In the main composer, `@name message` routes directly to a live teammate; unresolved mentions retain normal inline behavior.
+Cold continuation from an older run is refused while another assignment retains that teammate's native child; assign the retained child or explicitly release it first.
 
 Mailboxes use one owner-only, HMAC-signed file per message under `.pi/teams/t/<team-id>/inboxes/<name>/`. Invalid entries are quarantined with a warning. Messages are untrusted content and cannot approve permissions. Files are consumed only after native injection; they survive runtime reload as artifacts, but never revive a stopped session's children.
+
+The lead and named teammates share `.pi/teams/t/<team-id>/tasks/<id>.json`. Files are atomic and owner-only; exclusive lock directories serialize competing claims. A dependency remains `pending` until claimed, but completing its prerequisites removes its blockers immediately. Only the claimant can release or complete a task; completed tasks are terminal. A new session binds tools to its own team, and cold continuation never receives an old team's mailbox or board context.
 
 ---
 

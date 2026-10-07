@@ -62,7 +62,7 @@ Steering is a command, not a lifecycle state. Backend `disconnected` is unknown 
 
 ## 4. Composition root
 
-`pi/index.ts` binds the live Pi context, registers tools/commands, loads settings/definitions, restores authenticated handles, installs initial UI projection and announces integration readiness. Restoration precedes UI initialization; settled history needs no fresh event to appear. Restored native terminal outcomes follow the same finalization/cleanup policy as new runs.
+`pi/index.ts` binds the live Pi context, registers tools/commands, loads settings/definitions, archives stale owned registry rows, installs UI projection and announces integration readiness. Startup never registers old process handles as manager runs or consumes execution capacity.
 
 `Agent.prepareLoadout` exposes canonical enabled specialist names/effective descriptions before each model turn. `pi/agent-mention-autocomplete.ts` wraps public `ctx.ui.addAutocompleteProvider`, merges native/agent suggestions and delegates acceptance to the owning provider. It neither replaces the editor nor launches children.
 
@@ -76,13 +76,13 @@ Spawn resolves the definition without tracking a run, selects an available backe
 
 Running steer/abort awaits child acceptance. Abort acknowledgement does not settle a launched run; native settlement does. A queued run can be stopped before launch. Lost prompt acknowledgement is admission uncertainty, not permission to forget a potentially running child. Task-specific retries and acceptance checks are not manager policy.
 
-Time budgets add a manager-side watcher armed immediately before launch/resume (not admission or queueing) that samples pure `decideTimeBudget` decisions and observes child output through existing backend RPC/events — never session-file polling. The idle clock refreshes only on child output arrivals; steers, inbox/user messages and usage refreshes do not. Budget expiry is the only exception to abort-only stopping: after a 2-second cooperative grace it force-terminates the owned child process group through a budget-only verified backend path, and enforcement refusal surfaces as `recoveryError` with a retained receipt rather than a fabricated settlement. Ordinary steer/stop keeps abort semantics.
+Time budgets add a manager-side watcher armed immediately before launch/resume (not admission or queueing). Only child output refreshes the idle clock. Expiry requests cooperative abort, then verified process-group termination after a 2-second grace; refusal remains a visible recovery error rather than fabricated settlement. Session teardown uses the same verified termination path after its own bounded grace.
 
 ## 6. Execution backend contract
 
-`domain/backend.ts` defines the process execution port and optional focus/messaging/attachment ports. Controls use opaque handles, never caller-supplied child identity.
+`domain/backend.ts` defines the process execution port and optional focus, current-session assignment and native-pane attachment ports. Controls use opaque handles, never caller-supplied child identity.
 
-`pi/process-backend.ts` maintains monotonic per-run outcomes. Child events trigger coalesced refreshes; reconnect authenticates and resynchronizes state. Detach removes client observers without terminating active children. Later status/restore can reattach them.
+`pi/process-backend.ts` maintains monotonic per-run outcomes. Child events trigger coalesced refreshes; transient current-session connection recovery authenticates and resynchronizes state. Deliberate detach releases control permanently: status cannot reattach it. Verified disposal may authenticate an old receipt solely to close its owned resource, without registering a run or mailbox observer.
 
 `pi/model-admission.ts` uses native `ModelRuntime` in the child's configuration/auth directory. It captures the parent model before awaits, tries the resolved primary, caller fallback, captured parent and stable authenticated native candidates. Catalog refresh is offline; native OAuth may refresh. This is not a provider request, quota check or remote key-health guarantee. Launch repeats admission before artifacts/resources, covering queued auth changes.
 
@@ -105,7 +105,7 @@ Launchers never paste steer messages, press Enter for control, infer settlement 
 - Authenticated Unix socket with NDJSON requests/replies/events, child ID and random token.
 - Newly created private directories use `0700`; bootstrap/socket files use `0600`. Short OS-temp socket paths avoid Unix pathname limits.
 - Frames are bounded to 1 MiB. Transcript previews carry absolute cursor/offset and truncation metadata; full history remains in native JSONL.
-- At settlement the bridge writes the complete final assistant text to `sessions/<child-id>/result.md` (0600; last settled run wins) and attaches its path as `ChildOutcome.resultFile` — the full-result channel. The inline outcome copy stays 8 KiB-bounded for parent context economy; write failure degrades to the inline copy, never blocks settlement.
+- At settlement the bridge writes the complete final assistant text to an immutable `result.md` (0600): the first assignment uses `sessions/<child-id>/result.md`, subsequent assignments use `sessions/<child-id>/runs/<sha256(run-id)>/result.md`. `ChildOutcome.resultFile` carries the full-result pointer; the inline copy stays 8 KiB-bounded. Write failure degrades honestly to the inline copy without blocking native settlement.
 - Orphan self-termination (ADR 0007 §1): the socket server arms a control-loss watch when the last client disconnects; a silent window past the reconnect grace means the parent died. The runtime aborts the active run through the native path, gives settlement a bounded window to persist the annotated partial result, then stops the host process.
 - Sequenced focus state carries native cwd/model/thinking/context/capabilities. Stable transcript IDs/revisions permit partial upserts; stale/wrong-run projections cannot rewind focus.
 - Replay/deduplication prevents duplicate prompt admission and request-ID reuse with different contents.
@@ -132,13 +132,11 @@ Adding a full-height column reparents the prior column's lower rows beneath its 
 
 Registry/history live under the nearest original-project `.pi/teams/`; bootstraps and native sessions live under `sessions/<child-id>/`. Atomic registry writes use `0600` because handles include control credentials. Corrupt registry data is not silently rewritten as empty; incompatible records remain preserved.
 
-Restore validates bootstrap identity, authenticates RPC and reconciles native outcomes. Stored terminal results stay authoritative even if their process later disappears. Verified child loss sets `BackendStatus.outcomeUnavailable`: it fails an active execution but cannot overwrite a saved terminal result/error.
+`app/registry-archive.ts` performs archive-only startup reconciliation. Owned stale active rows become stopped history with an honest recovery note; owned terminal rows retain their saved outcome. Both attempt verified cleanup of any persisted resource. Cleanup failure is logged and recorded in `recoveryError`, not retained as a deferred active row. Foreign-owner rows are never inspected or changed; incompatible raw rows remain byte-for-value.
 
-Session-bound lifetime (ADR 0007): startup never re-adopts an active row. Leftover active rows archive `stopped` with an honest recovery note while a settled child outcome observed first stays authoritative; their resources go through verified disposal (the budget-enforcement path), and a row whose disposal cannot be verified retains its receipt for an explicit release retry. Worktree checkouts, preserved branches, history and result files survive sessions.
+Persisted disposal validates bootstrap/control identity and the authenticated PID before launcher termination, or requires `ProcessLauncher.cleanupExited` proof that the original process/group is absent. Missing RPC or `alive(false)` alone is not permission to kill a replacement process or close an unverified pane. No live restoration, process quarantine queue or session-scope reattachment remains.
 
-An authenticated PID mismatch against a non-tmux launcher identity quarantines control: disconnect/unwatch, stop reconnect attempts, reject steer/abort/resume/attach, and retain the resource receipt.
-
-Disposal requires an authenticated idle snapshot plus verified launcher termination, or `ProcessLauncher.cleanupExited` proof that the original process/group is absent and the saved terminal endpoint remains owned. `alive(false)` or missing RPC alone is insufficient: it may mean identity mismatch or transport uncertainty. Missing owned resources are idempotent success; foreign/replacement/live-disconnected resources retain a visible cleanup error and receipt. Startup retries this verified disposal for saved terminal rows.
+History, native JSONL, immutable results, preserved branches and worktree metadata remain available for explicit cold continuation. A saved terminal result cannot be overwritten by later process disappearance or cleanup failure.
 
 Settled headless termination verifies identity before SIGTERM and waits for confirmed process/group exit. Its native signal handler flushes/disposes the SDK session; unconfirmed exit retains the receipt. RPC shutdown is not used first, avoiding an ownership-check race against an exiting process.
 
@@ -192,10 +190,10 @@ Preservation failure retains the checkout with `recoveryError`. Release is non-f
 
 ## 17. Lifecycle and explicit cleanup
 
-- `session_start`: load configuration, restore handles (terminal recovery only — leftover active rows archive stopped with verified disposal), install UI projection, announce ready.
-- Session switch/end/shutdown: teardown every child (ADR 0007 §1) — abort request, bounded cooperative grace (15s), then verified force-termination through the budget-enforcement path — then detach clients and persist receipts. Worktrees and result artifacts survive.
+- `session_start`: load configuration, create the session's team, archive stale owned receipts without re-adoption, install UI projection and announce ready.
+- Session switch/end/shutdown awaits teardown of every child (abort → 15-second cooperative grace → verified force-termination), then releases control and persists artifacts. A session switch cannot re-arm the manager while the old team's teardown is still running.
 - Child-side orphan detection: the authenticated control socket staying silent past a short reconnect grace aborts the current turn natively, preserves the annotated partial `result.md` ("stopped: parent control lost") and stops the child process (headless exit / TUI pane close). A hung parent that keeps its socket changes nothing.
-- `stop`: acknowledge native abort; authoritative settlement preserves artifacts and closes owned child/pane.
+- `stop`: acknowledge native abort; native settlement preserves artifacts. Anonymous children close; named teammates retain their native process for the next assignment until teardown.
 - `/agents release <id>` or RPC `release`: retry retained verified child-resource cleanup; retain checkout.
 - `/agents release <id> --worktree` or `cleanupWorktree: true`: also remove clean preserved checkout after review/integration.
 - Active related runs must settle before release. Cleanup failure retains recovery metadata.
@@ -208,8 +206,18 @@ The parent renderer owns the inline panel, Agents Hub and remote-focus overlay, 
 
 One team per session, created at `session_start`; the team id derives from the session id and lives under `.pi/teams/t/<team-id>/` (`config.json`, owner-only, atomic writes). `Agent(name:)` claims a teammate address for the run — uniqueness is enforced against active runs only: **teammates persist across assignments until the session ends**, so a settled name claims a new assignment and a resumed run keeps its teammate. The roster records members (name, specialist type, latest run) through the app-layer `TeamService` over an injected store; the completion notification header addresses named runs as `Teammate @<name>`; `lead` is reserved.
 
-## 19. Exclusions and runtime boundary
+## 19. Shared task board (ADR 0007 §4)
 
-No Task/DAG workflow, nested delegation, scheduling, semantic memory, group joins, automatic integration, parent SDK fallback, terminal-input task steering or process security sandbox. See [ADR 0003](./decisions/0003-deliberate-feature-scope.md).
+`TaskBoardService` stores owner-only, atomic JSON files under the current team's `tasks/`. States are `pending`, `in_progress` and `completed`; dependency IDs reference existing tasks in that board. `blockedBy` is computed from current dependency state, so completion unlocks dependents without rewriting them or scheduling work.
+
+Exclusive `<id>.lock` directories serialize claim/update read-modify-write across native processes. Claims set the runtime actor as owner; only that owner can release or complete the task, and completed tasks are terminal. Lock conflicts are explicit errors, not automatic retries.
+
+`pi/team-task-tools.ts` provides `team_task_create/update/list/get` to the lead and named children. Native child tools are registered before session creation; explicit role allowlists still include coordination tools. Lead tools resolve the active board at execution time, so a session switch cannot mutate a previous team's board. Cold named continuation receives only the current team's authenticated context.
+
+The board is coordination only. Retention follows team/history artifacts; consumer retry, acceptance, review, priority and assignment policy remain outside the runtime. A settled board is a read-only artifact for consumers, not shared mutable `pi-tasks` state.
+
+## 20. Exclusions and runtime boundary
+
+No consumer Task/DAG workflow, nested delegation, retry/priority scheduling, semantic memory, group joins, automatic integration, parent SDK fallback, terminal-input task steering or process security sandbox. The shared board is the narrow coordination primitive amended by ADR 0007; see [ADR 0003](./decisions/0003-deliberate-feature-scope.md).
 
 Requires Node **22.19+**, Unix sockets and Pi peers **>=1.0.4 <1.1.0**. Optional HerdR/tmux add native terminal attachment; headless does not require them. These requirements do not imply support for platforms without the required process/socket facilities.

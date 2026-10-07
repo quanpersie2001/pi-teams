@@ -1,8 +1,8 @@
 // Application composition root for the pi-teams runtime (ARCHITECTURE.md §4).
 //
 // Host-injectable by contract: concrete adapters (agent-file loader, backend
-// instances, session id source, durable registry store, restore observers) are
-// passed in by pi/index.ts. This module never imports from pi/ (ARCH-004).
+// instances, session id source and durable registry store) are passed in by pi/index.ts.
+// This module never imports from pi/ (ARCH-004).
 
 import type { AgentExecutionBackend } from "../domain/backend.js";
 import type { SubagentsSettings } from "../domain/config.js";
@@ -13,13 +13,8 @@ import { AgentManager } from "./agent-manager.js";
 import { AgentRegistry, type RawAgentLoader } from "./agent-registry.js";
 import { type DeliveryHost, DeliveryService } from "./delivery-service.js";
 import { MailboxService } from "./mailbox-service.js";
-import { partitionOwnedEntries, restoreRegisteredRuns } from "./restore.js";
-import type {
-	IncompatibleRegistryEntry,
-	PersistedRegistryEntry,
-	RestoreObservers,
-	SubagentRunStore,
-} from "./run-registry.js";
+import { archiveRegistryRuns, partitionOwnedEntries } from "./registry-archive.js";
+import type { SubagentRunStore } from "./run-registry.js";
 import { TeamService, type TeamStore } from "./team-service.js";
 import type { WorktreeService } from "./worktree-service.js";
 
@@ -36,16 +31,8 @@ export interface PiSubagentsAppOptions {
 	configCwd: string;
 	/** Session id provider for default conversation ownership. */
 	getSessionId?: () => string;
-	/**
-	 * Durable registry/history store (pi/registry-host.ts). When omitted the
-	 * run registry stays in-memory only and no restore happens.
-	 */
+	/** Durable registry/history store; when omitted run persistence is in-memory only. */
 	runStore?: SubagentRunStore;
-	/**
-	 * Restore adapters built on process RPC/filesystem state by the host; required
-	 * together with `runStore` for startup restore.
-	 */
-	restoreObservers?: RestoreObservers;
 	/** Extra manager knobs for deterministic tests. */
 	managerOverrides?: Partial<Pick<AgentManagerOptions, "idFactory" | "now">>;
 	/**
@@ -83,8 +70,6 @@ export interface PiSubagentsApp {
 	readonly teams: TeamService | undefined;
 	/** Current session mailbox service, when a team is active. */
 	readonly mailbox: MailboxService | undefined;
-	/** Summary of the last session_start restore pass, when one ran. */
-	lastRestoreSummary?: Awaited<ReturnType<typeof restoreRegisteredRuns>>;
 	/**
 	 * Subscribe to owner-aware lifecycle events (AgentLifecycleEvent payloads).
 	 * The pi host forwards these onto pi.events channels `subagents:<name>`;
@@ -164,78 +149,28 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 			}
 
 			const store = options.runStore;
-			const observers = options.restoreObservers;
-			if (!store || !observers) return;
+			if (!store) return;
 
 			const entries = store.readRegistry();
-			// Runs belong to the conversation that launched them: only rows whose
-			// conversation owner matches the current session are restored. Rows
-			// owned by another conversation or an extension consumer are
-			// bookkeeping-only here — settled or verified-dead children are
-			// archived to history and dropped; live/unknown rows stay untouched on
-			// disk for their owning process and survive this session's rewrites.
+			// Foreign ownership is never inspected or changed; only this session's
+			// receipts are archived, and malformed rows remain byte-for-value.
 			const sessionId = options.getSessionId?.() ?? "unknown-session";
 			const { owned, incompatible, foreign } = partitionOwnedEntries(entries, (entry) => {
 				const owner = entry.owner;
 				return isConversationOwner(owner) && owner.sessionId === sessionId;
 			});
-			const retainedForeign: PersistedRegistryEntry[] = [];
-			for (const entry of foreign) {
-				if (!options.settings.rememberAgents && isHiddenTerminal(entry)) {
-					retainedForeign.push(entry);
-					continue;
-				}
-				const completion = await observers.detectCompletion(entry);
-				const alive = await observers.resourceAlive(entry);
-				if (completion.finished) {
-					const outcome = completion.outcome ?? "completed";
-					const historyRow = { ...entry };
-					delete historyRow.handle;
-					store.recordCompleted({
-						...historyRow,
-						status: outcome === "failed" ? "error" : outcome,
-						completedAt: entry.completedAt ?? Date.now(),
-						...(completion.result !== undefined ? { result: completion.result } : {}),
-						...(completion.error !== undefined ? { error: completion.error } : {}),
-						...(completion.sessionFile !== undefined ? { sessionFile: completion.sessionFile } : {}),
-					});
-					continue;
-				}
-				if (alive === false) {
-					const historyRow = { ...entry };
-					delete historyRow.handle;
-					store.recordCompleted({
-						...historyRow,
-						status: "error",
-						completedAt: entry.completedAt ?? Date.now(),
-						error: "owning session ended before the child settled and the child process is no longer available",
-					});
-					continue;
-				}
-				retainedForeign.push(entry);
-			}
-			manager.setForeignRegistryEntries(retainedForeign);
-			// rememberAgents=false: terminal rows are neither surfaced nor
-			// deleted — hand them to the manager so registry rewrites preserve
-			// them on disk untouched.
-			manager.setPreservedRegistryEntries(
-				[...incompatible, ...owned].filter(
-					(entry) =>
-						isIncompatibleRegistryEntry(entry) || (!options.settings.rememberAgents && isHiddenTerminal(entry)),
-				),
-			);
-
-			const summary = await restoreRegisteredRuns([...incompatible, ...owned], {
-				...observers,
-				reconnect: (entry) => manager.restoreReconnectedRun(entry),
-				disposeOrphan: (entry) => manager.disposeOrphanedRun(entry),
+			manager.setForeignRegistryEntries(foreign);
+			await archiveRegistryRuns([...incompatible, ...owned], {
+				dispose: (entry) => manager.attemptStaleDisposal(entry),
 				recordCompleted: (entry) => store.recordCompleted(entry),
-				persist: (kept) => store.writeRegistry([...kept, ...retainedForeign]),
+				persist: (kept) => {
+					manager.setPreservedRegistryEntries(kept);
+					store.writeRegistry([...kept, ...foreign]);
+				},
 				rememberAgents: options.settings.rememberAgents,
 				warn: (message) => console.warn(`[pi-teams] ${message}`),
 				now: () => Date.now(),
 			});
-			this.lastRestoreSummary = summary;
 		},
 
 		async sessionShutdown() {
@@ -249,14 +184,4 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 			return manager.subscribe(listener);
 		},
 	};
-}
-
-function isIncompatibleRegistryEntry(entry: PersistedRegistryEntry): entry is IncompatibleRegistryEntry {
-	return "kind" in entry && entry.kind === "incompatible";
-}
-
-function isHiddenTerminal(entry: PersistedRegistryEntry): boolean {
-	if (isIncompatibleRegistryEntry(entry)) return false;
-	const status = entry.status;
-	return status === "completed" || status === "stopped" || status === "aborted" || status === "error";
 }

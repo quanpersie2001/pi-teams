@@ -84,7 +84,7 @@ RPC spawn defaults to `{ kind: "extension", id: "pi-tasks" }` with `delivery: "e
 | `both` | lifecycle and guarded conversation completion |
 | `none` | caller obtains result/status explicitly |
 
-Conversation delivery checks the spawning session/branch context. Extension-owned events remain observable after conversation switches. `/new`/resume lifecycle detaches control connections without killing children or permanently disposing delivery; subsequent session starts reconnect and retain functioning completion routing.
+Conversation delivery checks the spawning session/branch context. Delivery subscriptions survive session transitions, but children do not: `/new`, resume and shutdown await teardown before a new team starts. Old control connections are not reattached.
 
 ## Completion notification contract (renderer)
 
@@ -134,7 +134,7 @@ Without `cleanupWorktree: true`, release retries any retained verified child-res
 
 ## Recovery handshake
 
-The parent restores registry records before installing the initial UI projection. Only rows whose conversation owner matches the current session are considered; rows owned by another conversation or an extension consumer are bookkeeping-only — settled or verified-dead foreign children are archived to history and dropped, live foreign rows stay untouched on disk. Session-bound lifetime (ADR 0007): own leftover ACTIVE rows are never re-adopted — they archive `stopped` with an honest recovery note and their resources go through verified disposal; a settled child outcome observed first stays authoritative. Legacy incompatible receipts are retained, not adopted as fake process handles.
+Startup reconciliation is archive-only, before UI initialization. Owned stale active rows become stopped history with a recovery note; saved terminal outcomes remain authoritative. Persisted resources go through identity-checked disposal without manager runs, capacity slots or mailbox subscriptions. Failed cleanup is logged and retained in history metadata, not deferred as an active row. Foreign-owner rows remain untouched; incompatible raw rows remain opaque. Explicit cold continuation from native JSONL stays available.
 
 `pi-tasks` restores its own tasks/mappings, probes `ping`, calls `status`, subscribes to lifecycle and decides assignment/retry/review. Assignment prompts must be self-contained: goal, parent context, exact scope/non-goals, edit policy, acceptance and verification. The runtime does not validate task-specific acceptance criteria.
 
@@ -153,4 +153,21 @@ The lead receives runtime-authored `teammate-message` custom messages (`deliverA
 The main TUI composer offers live teammates in `@` completion. `@name message` is intercepted before normal submission and written directly to that mailbox; unresolved names retain inline-mention behavior. Routing never takes input from an overlay, panel navigation or autocomplete menu. Failed writes preserve the editor text without forwarding it to the lead.
 
 Messages carry no permission authority. The shared team key authenticates team-originated content, not a permission grant or isolation between mutually untrusted native processes. Each child's native permission surface remains authoritative. Session teardown stops peers; persisted mailboxes never restart them.
+
+## Shared team task board
+
+The lead and named teammates receive these tools:
+
+| Tool | Arguments |
+|---|---|
+| `team_task_create` | `{ title: string, description?: string, dependencies?: string[] }` |
+| `team_task_update` | `{ id: string, status: "pending" \| "in_progress" \| "completed" }` |
+| `team_task_get` | `{ id: string }` |
+| `team_task_list` | `{}` |
+
+Tasks persist as atomic 0600 files in `.pi/teams/t/<team-id>/tasks/` (0700 directory). Results include `blockedBy`, computed from incomplete prerequisites. Dependency IDs must exist in the same board. Claiming sets the caller as owner only when blockers are empty; the owner alone may release or complete it. Completed tasks cannot reopen. Exclusive lock-directory conflicts surface as native tool errors without automatic retries.
+
+Tool definitions resolve the current team when executed; they accept no team directory or caller-selected owner. A new session cannot use them to mutate an old board. Cold named continuation gets the current team's bootstrap, never the old team's key/path.
+
+The board does not replace consumer task management. Integration v3 is unchanged; `pi-tasks` owns retries, acceptance, review, priorities and assignment policy and may read a settled final board as an artifact.
 

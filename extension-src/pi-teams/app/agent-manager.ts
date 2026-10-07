@@ -22,6 +22,7 @@ import type {
 	AgentLaunchInput,
 	AgentResumeInput,
 	BackendStatus,
+	TeamBootstrapContext,
 } from "../domain/backend.js";
 import type { ChildControlCommand, ChildState } from "../domain/child-protocol.js";
 import type { SubagentsSettings } from "../domain/config.js";
@@ -40,17 +41,11 @@ import type {
 	AgentRegistryEntry,
 	CompletedRunHistoryEntry,
 	HandleProjector,
+	PersistedExecutionBackend,
 	PersistedRegistryEntry,
-	RestorableExecutionBackend,
-	RestoreReconnectResult,
 	SubagentRunStore,
 } from "./run-registry.js";
-import {
-	isIncompatibleRegistryEntry,
-	isSerializableBackendHandle,
-	toHistoryEntry,
-	toRegistryEntry,
-} from "./run-registry.js";
+import { isIncompatibleRegistryEntry, toHistoryEntry, toRegistryEntry } from "./run-registry.js";
 import type { TeamService } from "./team-service.js";
 import { type BudgetExpiry, TimeBudgetWatcher } from "./time-budget-watcher.js";
 import type { WorktreeService } from "./worktree-service.js";
@@ -113,7 +108,7 @@ export interface AgentManagerOptions {
 type LaunchPlan =
 	| { kind: "launch"; prompt: string }
 	| { kind: "mailbox" }
-	| { kind: "assignment"; handle: AgentBackendHandle; prompt: string }
+	| { kind: "assignment"; handle: AgentBackendHandle; prompt: string; sourceAgentId: string }
 	| {
 			kind: "resume";
 			input: AgentResumeInput;
@@ -427,6 +422,14 @@ export class AgentManager {
 			throw new Error("AgentManager session changed during model admission; no run was allocated.");
 		snapshot = { ...snapshot, resolved: { ...snapshot.resolved, model: admission.model } };
 		if (request.name !== undefined) this.assertTeammateNameAvailable(request.name);
+		if (plan.kind === "resume" && request.name !== undefined) {
+			for (const candidate of this.runs.values()) {
+				if (candidate.record.teammateName === request.name && candidate.record.handle !== undefined)
+					throw new Error(
+						`Teammate "${request.name}" retains child run "${candidate.record.id}"; assign it or release it before cold continuation.`,
+					);
+			}
+		}
 		let retained: RunInternals | undefined;
 		if (plan.kind === "launch" && request.name !== undefined && this.teamService) {
 			for (const candidate of this.runs.values()) {
@@ -445,7 +448,12 @@ export class AgentManager {
 				throw new Error(`Teammate "${request.name}" keeps its specialist role; use a new name for a different role.`);
 			if (retained.backend !== backend || !backend.assign)
 				throw new Error("The retained teammate backend cannot accept another assignment.");
-			plan = { kind: "assignment", handle: retained.record.handle, prompt: plan.prompt };
+			plan = {
+				kind: "assignment",
+				handle: retained.record.handle,
+				prompt: plan.prompt,
+				sourceAgentId: retained.record.id,
+			};
 			worktree = retained.worktreeInfo;
 		}
 		const id = this.idFactory();
@@ -745,9 +753,8 @@ export class AgentManager {
 	 * revision of a streaming assistant message, or a COMPLETED tool result.
 	 * Steers, user items, tool-call starts, empty assistant upserts, partial
 	 * tool updates and usage/turn refreshes never count. The first snapshot
-	 * after subscribe (baseline — including a reconnect restore) re-derives the
-	 * output clock strictly from item timestamps, so historical content never
-	 * buys a fresh idle window.
+	 * after subscribe (the launch baseline) re-derives the output clock strictly
+	 * from item timestamps, so historical content never buys a fresh idle window.
 	 */
 	private observeBudgetOutput(internal: RunInternals, state: ChildState): void {
 		if (!isActiveStatus(internal.record.status) || internal.record.budgetStartedAt === undefined) return;
@@ -868,32 +875,6 @@ export class AgentManager {
 		this.budgetWatcher.stop(internal.record.id);
 		internal.budgetFocusUnsubscribe?.();
 		delete internal.budgetFocusUnsubscribe;
-	}
-
-	/**
-	 * Re-arm the watchdog for a restored receipt using the persisted original
-	 * limits and clocks. Runs without a budget snapshot (legacy rows) or with
-	 * both budgets unlimited stay unwatched.
-	 */
-	private resumeBudgetWatch(internal: RunInternals): void {
-		const record = internal.record;
-		if (!isActiveStatus(record.status) || record.budgetStartedAt === undefined) return;
-		const timeout = record.budgetTimeout ?? 0;
-		const idleTimeout = record.budgetIdleTimeout ?? 0;
-		if (timeout <= 0 && idleTimeout <= 0) return;
-		record.budgetLastOutputAt = Math.max(record.budgetLastOutputAt ?? 0, record.budgetStartedAt);
-		// The reconnect snapshot is history: re-baseline strictly from item
-		// timestamps so nothing produced while the parent was away buys a fresh
-		// idle window.
-		delete internal.budgetOutputSeen;
-		delete internal.budgetOutputBaselined;
-		this.budgetWatcher.watch(record.id, {
-			timeout,
-			idleTimeout,
-			startedAt: record.budgetStartedAt,
-			lastOutputAt: record.budgetLastOutputAt,
-		});
-		this.connectBudgetOutput(internal);
 	}
 
 	/** Request stop for every run without pretending backend acceptance settled it. */
@@ -1054,7 +1035,7 @@ export class AgentManager {
 		const backend = internal?.backend;
 		const handle = internal?.record.handle;
 		if (!backend?.attach || !handle) return false;
-		const serialized = (backend as unknown as RestorableExecutionBackend).serializeHandle?.(
+		const serialized = (backend as AgentExecutionBackend & PersistedExecutionBackend).serializeHandle?.(
 			handle,
 			internal.record.sessionFile,
 		);
@@ -1074,7 +1055,7 @@ export class AgentManager {
 
 		const targetSerialized =
 			target.backend && target.record.handle
-				? (target.backend as unknown as RestorableExecutionBackend).serializeHandle?.(
+				? (target.backend as AgentExecutionBackend & PersistedExecutionBackend).serializeHandle?.(
 						target.record.handle,
 						target.record.sessionFile,
 					)
@@ -1082,7 +1063,7 @@ export class AgentManager {
 		const sharedChild: RunInternals[] = [];
 		for (const internal of this.runs.values()) {
 			if (!internal.backend || !internal.record.handle) continue;
-			const serialized = (internal.backend as unknown as RestorableExecutionBackend).serializeHandle?.(
+			const serialized = (internal.backend as AgentExecutionBackend & PersistedExecutionBackend).serializeHandle?.(
 				internal.record.handle,
 				internal.record.sessionFile,
 			);
@@ -1196,118 +1177,17 @@ export class AgentManager {
 		this.runningSlots = 0;
 	}
 
-	// -- durable registry / restore -------------------------------------------
+	// -- durable registry ------------------------------------------------------
 
-	/** Rebuild a validated stored receipt; controls require RPC auth, disposal verifies resource ownership. */
-	async restoreReconnectedRun(entry: AgentRegistryEntry): Promise<RestoreReconnectResult> {
-		if (this.disposed || this.runs.has(entry.id) || !entry.handle || !isSerializableBackendHandle(entry.handle))
-			return { state: "deferred" };
-		const backend = this.backends.find((candidate) => candidate.kind === "process");
-		if (!backend) return { state: "deferred" };
-		const restorable = backend as unknown as RestorableExecutionBackend;
-		const handle = restorable.restoreHandle(entry.id, entry.handle);
-		if (!handle) return { state: "deferred" };
-
-		let resolveSettle!: (record: AgentRun) => void;
-		const settle = new Promise<AgentRun>((resolve) => {
-			resolveSettle = resolve;
-		});
-		const record: AgentRun = {
-			id: entry.id,
-			type: entry.type,
-			description: entry.description,
-			status: entry.status,
-			...(entry.teammateName !== undefined ? { teammateName: entry.teammateName } : {}),
-			backend: "process",
-			handle,
-			...(entry.model !== undefined ? { model: entry.model } : {}),
-			...(entry.modelFallback !== undefined ? { modelFallback: entry.modelFallback } : {}),
-			...(entry.sessionFile !== undefined ? { sessionFile: entry.sessionFile } : {}),
-			...(entry.result !== undefined ? { result: entry.result } : {}),
-			...(entry.resultFile !== undefined ? { resultFile: entry.resultFile } : {}),
-			...(entry.resultTruncated !== undefined ? { resultTruncated: entry.resultTruncated } : {}),
-			...(entry.resultOriginalLength !== undefined ? { resultOriginalLength: entry.resultOriginalLength } : {}),
-			...(entry.error !== undefined ? { error: entry.error } : {}),
-			...(entry.recoveryError !== undefined ? { recoveryError: entry.recoveryError } : {}),
-			...(entry.completedAt !== undefined ? { completedAt: entry.completedAt } : {}),
-			startedAt: entry.startedAt,
-			toolUses: entry.toolUses ?? 0,
-			turns: entry.turns ?? 0,
-			usage: entry.usage ? { ...entry.usage } : { ...EMPTY_USAGE },
-			owner: { ...entry.owner },
-			delivery: entry.delivery,
-			isBackground: entry.isBackground ?? true,
-			...(entry.resultConsumed !== undefined ? { resultConsumed: entry.resultConsumed } : {}),
-			...(entry.parentSession !== undefined ? { parentSession: { ...entry.parentSession } } : {}),
-			...(entry.worktree !== undefined ? { worktree: { ...entry.worktree } } : {}),
-			...(entry.worktreeResult !== undefined
-				? { worktreeResult: { ...entry.worktreeResult, commits: [...entry.worktreeResult.commits] } }
-				: {}),
-			...(entry.worktreeReleased !== undefined ? { worktreeReleased: entry.worktreeReleased } : {}),
-			...(entry.budgetTimeout !== undefined ? { budgetTimeout: entry.budgetTimeout } : {}),
-			...(entry.budgetIdleTimeout !== undefined ? { budgetIdleTimeout: entry.budgetIdleTimeout } : {}),
-			...(entry.budgetStartedAt !== undefined ? { budgetStartedAt: entry.budgetStartedAt } : {}),
-			...(entry.budgetLastOutputAt !== undefined ? { budgetLastOutputAt: entry.budgetLastOutputAt } : {}),
-			...(entry.budgetExhausted !== undefined ? { budgetExhausted: entry.budgetExhausted } : {}),
-			...(entry.budgetSeconds !== undefined ? { budgetSeconds: entry.budgetSeconds } : {}),
-		};
-		const internal: RunInternals = {
-			record,
-			backend,
-			cwd: entry.cwd,
-			settle,
-			resolveSettle,
-			plan: { kind: "launch", prompt: "" },
-			pendingSteers: [],
-			stopRequested: false,
-			stopAcknowledged: false,
-			slotAcquired: isActiveStatus(record.status),
-			...(record.worktree !== undefined ? { worktreeInfo: { ...record.worktree } } : {}),
-		};
-		this.runs.set(record.id, internal);
-		if (internal.slotAcquired) this.runningSlots += 1;
-		else resolveSettle(record);
-		if (record.worktree !== undefined) this.worktreeService?.reconnect(record.worktree);
-		// A retained live child keeps its ORIGINAL clocks: the persisted
-		// budgetStartedAt/budgetLastOutputAt continue counting wall time across
-		// the parent restart (no fresh idle window). The first authenticated
-		// snapshot re-derives lastOutputAt from the transcript when the child
-		// produced output while the parent was away.
-		this.resumeBudgetWatch(internal);
-		internal.unsubscribeBackend = backend.subscribe(handle, (status) => {
-			void this.reconcileBackendStatus(internal, status).catch((error: unknown) => {
-				record.recoveryError = errorText(error);
-				this.syncRegistry();
-			});
-		});
+	/** Attempt identity-verified disposal of a stale receipt without adopting it. */
+	async attemptStaleDisposal(entry: AgentRegistryEntry): Promise<boolean> {
+		if (this.disposed || !entry.handle) return false;
+		const backend = this.backends.find((candidate) => candidate.kind === "process") as
+			| (AgentExecutionBackend & PersistedExecutionBackend)
+			| undefined;
+		if (!backend?.disposePersisted) return false;
 		try {
-			await this.reconcileBackendStatus(internal, await backend.status(handle));
-		} catch {
-			// Connection failures are retained as active/unknown, never rewritten as job failures.
-		}
-		if (isTerminalStatus(record.status) && record.handle === undefined) return { state: "closed" };
-		const restoredEntry = toRegistryEntry(record, entry.cwd, this.configCwd, this.projectHandle(internal));
-		return { state: "retained", entry: restoredEntry };
-	}
-
-	/**
-	 * Session-bound lifetime (ADR 0007 §1): an active row left behind by a
-	 * previous parent is never re-adopted. Its resource goes through verified
-	 * disposal only — restore the handle and force-terminate through the
-	 * budget-enforcement path (identity-checked, idempotent for resources
-	 * that already exited). Returns true when disposal is verified; false
-	 * retains the row for an explicit `/agents release` retry.
-	 */
-	async disposeOrphanedRun(entry: AgentRegistryEntry): Promise<boolean> {
-		if (this.disposed || !entry.handle || !isSerializableBackendHandle(entry.handle)) return false;
-		const backend = this.backends.find((candidate) => candidate.kind === "process");
-		if (!backend) return false;
-		const restorable = backend as unknown as RestorableExecutionBackend;
-		const handle = restorable.restoreHandle(entry.id, entry.handle);
-		if (!handle || backend.enforceTerminate === undefined) return false;
-		try {
-			await backend.enforceTerminate(handle, 0);
-			return true;
+			return await backend.disposePersisted(entry.handle);
 		} catch {
 			return false;
 		}
@@ -1430,6 +1310,8 @@ export class AgentManager {
 		this.queue = this.queue.filter((id) => id !== internal.record.id);
 		this.applyEvent(internal, { type: "start" });
 		this.emit(internal.record, "started");
+		// A borrowed assignment handle still identifies the previous settled run.
+		let handleCommitted = internal.plan.kind === "mailbox";
 
 		try {
 			const backend = internal.backend;
@@ -1461,7 +1343,8 @@ export class AgentManager {
 				// Clocks start here — after admission/queue prep, immediately before
 				// the resume call itself.
 				this.beginBudgetClocks(internal);
-				handle = await backend.resume({ ...internal.plan.input, runId: internal.record.id });
+				const team = this.currentTeamContext(internal.record);
+				handle = await backend.resume({ ...internal.plan.input, runId: internal.record.id, ...(team ? { team } : {}) });
 			} else {
 				const snapshot = this.registry.getActiveSnapshot(internal.record.id);
 				if (!snapshot) throw new Error(`invocation snapshot lost for run "${internal.record.id}"`);
@@ -1482,6 +1365,7 @@ export class AgentManager {
 			}
 
 			internal.record.handle = handle;
+			handleCommitted = true;
 			this.connectBudgetOutput(internal);
 			if (internal.pendingBudgetStop !== undefined) {
 				// The deadline expired while the launch was still in flight; enforce
@@ -1504,10 +1388,21 @@ export class AgentManager {
 			await this.flushPendingControls(internal);
 			if (this.shuttingDown) this.syncRegistry();
 		} catch (error) {
-			if (internal.record.handle !== undefined) {
+			if (handleCommitted && internal.record.handle !== undefined) {
 				// A post-launch RPC failure is connection uncertainty, not job failure.
 				this.syncRegistry();
 				return;
+			}
+			if (internal.plan.kind === "assignment") {
+				const source = this.runs.get(internal.plan.sourceAgentId);
+				if (source && internal.backend) {
+					source.record.handle = internal.plan.handle;
+					source.backend = internal.backend;
+					delete internal.record.handle;
+					delete internal.worktreeInfo;
+					delete internal.record.worktree;
+					this.observeAssignments(source);
+				}
 			}
 			await this.preserveWorktree(internal);
 			this.applyEvent(internal, {
@@ -1541,12 +1436,16 @@ export class AgentManager {
 		if (resolved.thinking !== undefined) input.thinking = resolved.thinking;
 		if (resolved.tools !== undefined) input.tools = [...resolved.tools];
 		if (resolved.maxTurnLimit !== undefined) input.maxTurns = resolved.maxTurnLimit;
-		const teamService = this.teamService;
-		const team = teamService?.current;
-		if (record.teammateName !== undefined && team !== undefined && teamService !== undefined) {
-			input.team = { teamDir: teamService.teamDir, teamKey: team.teamKey, teammateName: record.teammateName };
-		}
+		const team = this.currentTeamContext(record);
+		if (team) input.team = team;
 		return input;
+	}
+
+	private currentTeamContext(record: AgentRun): TeamBootstrapContext | undefined {
+		const service = this.teamService;
+		const team = service?.current;
+		if (!service || !team || record.teammateName === undefined) return undefined;
+		return { teamDir: service.teamDir, teamKey: team.teamKey, teammateName: record.teammateName };
 	}
 
 	private observeAssignments(internal: RunInternals): void {
@@ -1589,6 +1488,13 @@ export class AgentManager {
 			backend: "process",
 			handle,
 			...(previous.model !== undefined ? { model: previous.model } : {}),
+			...(previous.modelFallback !== undefined ? { modelFallback: previous.modelFallback } : {}),
+			...(previous.sessionFile !== undefined ? { sessionFile: previous.sessionFile } : {}),
+			...(previous.worktree !== undefined ? { worktree: { ...previous.worktree } } : {}),
+			...(previous.worktreeResult !== undefined
+				? { worktreeResult: { ...previous.worktreeResult, commits: [...previous.worktreeResult.commits] } }
+				: {}),
+			...(previous.worktreeReleased !== undefined ? { worktreeReleased: previous.worktreeReleased } : {}),
 			startedAt: now,
 			toolUses: 0,
 			turns: 0,
@@ -1612,6 +1518,7 @@ export class AgentManager {
 			stopRequested: false,
 			stopAcknowledged: false,
 			slotAcquired: false,
+			...(source.worktreeInfo !== undefined ? { worktreeInfo: { ...source.worktreeInfo } } : {}),
 		};
 		this.runs.set(runId, internal);
 		this.queue.push(runId);
@@ -1786,7 +1693,7 @@ export class AgentManager {
 		const backend = internal.backend;
 		const handle = internal.record.handle;
 		if (!backend || !handle) return;
-		const restorable = backend as unknown as RestorableExecutionBackend;
+		const restorable = backend as unknown as PersistedExecutionBackend;
 		const serialized = restorable.serializeHandle?.(handle, internal.record.sessionFile);
 		const childId = serialized?.childId;
 		if (!childId) {
@@ -1816,7 +1723,7 @@ export class AgentManager {
 
 	private runsForChild(backend: AgentExecutionBackend, childId: string): RunInternals[] {
 		const linked: RunInternals[] = [];
-		const restorable = backend as unknown as RestorableExecutionBackend;
+		const restorable = backend as unknown as PersistedExecutionBackend;
 		for (const internal of this.runs.values()) {
 			if (internal.backend !== backend || !internal.record.handle) continue;
 			if (restorable.serializeHandle?.(internal.record.handle, internal.record.sessionFile)?.childId === childId) {
@@ -1910,8 +1817,7 @@ export class AgentManager {
 	private projectHandle(internal: RunInternals): HandleProjector | undefined {
 		const backend = internal.backend;
 		if (!backend || !internal.record.handle) return undefined;
-		const restorable = backend as unknown as RestorableExecutionBackend;
-		if (typeof restorable.serializeHandle !== "function") return undefined;
+		const restorable = backend as unknown as PersistedExecutionBackend;
 		return (handle, sessionFile) => restorable.serializeHandle?.(handle, sessionFile);
 	}
 	private formatRecord(internal: RunInternals, fullResult?: { text?: string; note?: string }): string {
@@ -1973,7 +1879,7 @@ export function budgetStopNote(record: Pick<AgentRun, "id" | "budgetExhausted" |
 
 /**
  * Effective budget resolution: invocation override > frozen snapshot of the
- * source run (resume/restore; 0 = unlimited) > current definition tier >
+ * source run (cold resume; 0 = unlimited) > current definition tier >
  * settings default (0 = unlimited). Malformed overrides never reach this
  * function — resolveInvocation rejects them first.
  */

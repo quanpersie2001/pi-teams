@@ -70,7 +70,20 @@ export function createAgentFocusPort(options: AgentFocusServiceOptions): AgentFo
 			return project(runId, await manager.controlFocus(runId, command));
 		},
 		async continue(runId, text) {
-			const continuation = await manager.resume(runId, text);
+			const source = manager.get(runId);
+			const continuation =
+				source?.teammateName && source.handle
+					? await manager.spawn({
+							type: source.type,
+							name: source.teammateName,
+							prompt: text,
+							description: source.description,
+							run_in_background: source.isBackground,
+							owner: source.owner,
+							delivery: source.delivery,
+							...(source.parentSession ? { parentSession: source.parentSession } : {}),
+						})
+					: await manager.resume(runId, text);
 			return { runId: continuation.id };
 		},
 	};

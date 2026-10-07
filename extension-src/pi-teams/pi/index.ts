@@ -2,9 +2,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { createAgentFocusPort } from "../app/focus-service.js";
 import { createPiSubagentsApp } from "../app/index.js";
-import type { RestoreObservers } from "../app/run-registry.js";
+import { TaskBoardService } from "../app/task-board-service.js";
 import { WorktreeService } from "../app/worktree-service.js";
-import { isTerminalStatus } from "../domain/agent-run.js";
 import { DEFAULT_SUBAGENTS_SETTINGS } from "../domain/config.js";
 import { loadAgentMarkdownFiles, resolveAgentSourceDirs } from "./agent-files.js";
 import { installAgentMentionAutocomplete, installTeammateMentionRouting } from "./agent-mention-autocomplete.js";
@@ -15,35 +14,12 @@ import { createPiDeliveryHost, installLeadMailbox } from "./delivery-host.js";
 import { ProcessAgentExecutionBackend, resolveLauncherHint, resolveSessionLauncherHint } from "./process-backend.js";
 import { createSubagentRunStore } from "./registry-host.js";
 import { type SubagentsRpcWiring, wireSubagentsRpc } from "./rpc.js";
+import { createTeamTaskTools } from "./team-task-tools.js";
 import { createPiTeamStore } from "./teams-host.js";
 import { registerLeadSendMessageTool, registerSubagentTools } from "./tools.js";
 import { createPiTranscriptSource } from "./transcript-host.js";
 import { installSubagentsUi, type SubagentsUiHandle } from "./ui-host.js";
 import { createGitRunner, worktreeTmpRoot } from "./worktree-host.js";
-
-function restoreObservers(backend: ProcessAgentExecutionBackend): RestoreObservers {
-	return {
-		sessionPresent: (entry) => entry.handle?.kind === "process",
-		async detectCompletion(entry) {
-			if (!entry.handle) return { finished: false };
-			const status = await backend.probeSerialized(entry.handle, entry.id);
-			if (status.outcomeUnavailable && isTerminalStatus(entry.status)) return { finished: false };
-			if (status.state === "completed" || status.state === "failed" || status.state === "stopped") {
-				return {
-					finished: true,
-					outcome: status.state === "failed" ? "failed" : status.state,
-					...(status.result !== undefined ? { result: status.result } : {}),
-				};
-			}
-			return { finished: false };
-		},
-		async resourceAlive(entry) {
-			if (!entry.handle) return false;
-			const status = await backend.probeSerialized(entry.handle, entry.id);
-			return status.state === "disconnected" ? undefined : true;
-		},
-	};
-}
 
 /** Parent extension. Child sessions load only their explicit control bridge. */
 export default function (pi: ExtensionAPI): void {
@@ -72,12 +48,12 @@ export default function (pi: ExtensionAPI): void {
 			settings: { ...DEFAULT_SUBAGENTS_SETTINGS },
 		}),
 		runStore: createSubagentRunStore(configCwd),
-		restoreObservers: restoreObservers(backend),
 		deliveryHost: createPiDeliveryHost(pi, () => latestCtx),
 		createTeamStore: (sessionId) => createPiTeamStore(configCwd, sessionId),
 	});
 	const transcripts = createPiTranscriptSource({ backends: [backend] });
 	let uiHandle: SubagentsUiHandle | undefined;
+	let board: TaskBoardService | undefined;
 	let closeLeadMailbox: (() => void) | undefined;
 	let stopMentionRouting: (() => void) | undefined;
 	let rpc: SubagentsRpcWiring | undefined;
@@ -93,9 +69,11 @@ export default function (pi: ExtensionAPI): void {
 		() => app.mailbox,
 		() => app.teams?.current?.members.map((member) => member.name) ?? [],
 	);
+	for (const tool of createTeamTaskTools(() => board)) pi.registerTool(tool);
 
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
+		board = undefined;
 		rpc?.dispose();
 		rpc = wireSubagentsRpc({ events: pi.events, manager: app.manager });
 		uiHandle?.dispose();
@@ -108,6 +86,8 @@ export default function (pi: ExtensionAPI): void {
 		// Env override (four launchers) wins over the settings key (auto|headless).
 		backend.setLauncherHint(resolveSessionLauncherHint(process.env, settings.backend));
 		await app.sessionStart();
+		const team = app.teams;
+		board = team ? new TaskBoardService({ teamDir: team.teamDir, self: "lead" }) : undefined;
 		if (app.mailbox) closeLeadMailbox = installLeadMailbox(pi, app.mailbox);
 		uiHandle = installSubagentsUi(ctx, {
 			manager: app.manager,
@@ -127,7 +107,8 @@ export default function (pi: ExtensionAPI): void {
 		}
 		rpc.announceReady();
 	});
-	pi.on("session_before_switch", () => {
+	pi.on("session_before_switch", async () => {
+		board = undefined;
 		closeLeadMailbox?.();
 		stopMentionRouting?.();
 		closeLeadMailbox = undefined;
@@ -136,11 +117,15 @@ export default function (pi: ExtensionAPI): void {
 		// Session-bound lifetime (ADR 0007 §1): switching sessions ends the
 		// owning session's team — tear its children down before the next
 		// session_start re-arms the manager.
-		void app.sessionShutdown().catch((error: unknown) => {
+		try {
+			await app.sessionShutdown();
+		} catch (error) {
 			console.warn(`[pi-teams] session teardown failed: ${error instanceof Error ? error.message : String(error)}`);
-		});
+			throw error;
+		}
 	});
 	pi.on("session_shutdown", async () => {
+		board = undefined;
 		closeLeadMailbox?.();
 		stopMentionRouting?.();
 		closeLeadMailbox = undefined;
