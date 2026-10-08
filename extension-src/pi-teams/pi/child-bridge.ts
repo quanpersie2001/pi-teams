@@ -30,6 +30,7 @@ import {
 } from "../domain/child-protocol.js";
 import type { TranscriptItem } from "../domain/transcript.js";
 import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
+import { deriveViewerToken } from "./child-rpc-auth.js";
 import { createTeamTaskTools } from "./team-task-tools.js";
 
 const MAX_TRANSCRIPT_ITEMS = 256;
@@ -195,9 +196,14 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 	const teamDir = parseOptionalString(value, "teamDir", 4_096);
 	const teamKey = parseOptionalString(value, "teamKey", 512);
 	const teammateName = parseOptionalString(value, "teammateName", 64);
+	const teammateColor = parseOptionalString(value, "teammateColor", 7);
+	if (teammateColor !== undefined && !/^#[\da-fA-F]{6}$/.test(teammateColor))
+		throw new ChildProtocolError("invalid_bootstrap", "teammateColor must be a normalized #RRGGBB value");
 	if ((teamDir === undefined) !== (teamKey === undefined) || (teamDir === undefined) !== (teammateName === undefined)) {
 		throw new ChildProtocolError("invalid_bootstrap", "teamDir, teamKey, and teammateName must be provided together");
 	}
+	if (teammateColor !== undefined && teammateName === undefined)
+		throw new ChildProtocolError("invalid_bootstrap", "teammateColor requires a named teammate");
 	if (teamDir !== undefined && teamKey !== undefined && (!isAbsolute(teamDir) || !/^[a-f0-9]{64}$/i.test(teamKey))) {
 		throw new ChildProtocolError("invalid_bootstrap", "team context has an invalid directory or HMAC key");
 	}
@@ -218,7 +224,7 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 		...(maxTurns !== undefined ? { maxTurns } : {}),
 		...(graceTurns !== undefined ? { graceTurns } : {}),
 		...(teamDir !== undefined && teamKey !== undefined && teammateName !== undefined
-			? { teamDir, teamKey, teammateName }
+			? { teamDir, teamKey, teammateName, ...(teammateColor ? { teammateColor } : {}) }
 			: {}),
 	};
 }
@@ -566,6 +572,8 @@ class ChildRuntime {
 		};
 		return {
 			childId: this.bootstrap.childId,
+			...(this.bootstrap.teammateName !== undefined ? { teammateName: this.bootstrap.teammateName } : {}),
+			...(this.bootstrap.teammateColor !== undefined ? { teammateColor: this.bootstrap.teammateColor } : {}),
 			pid: process.pid,
 			...(sessionFile !== undefined ? { sessionFile } : {}),
 			execution: this.activeRun ? "running" : "idle",
@@ -1122,6 +1130,7 @@ async function openChildSocket(bootstrap: ChildBootstrap, runtime: ChildRuntime)
 	const clients = new Set<Socket>();
 	const cache = new Map<string, CachedCommand>();
 	let connections = 0;
+	let ownerConnections = 0;
 	let intentionalClose = false;
 	let controlLossTimer: NodeJS.Timeout | undefined;
 	const cancelControlLossWatch = (): void => {
@@ -1146,12 +1155,26 @@ async function openChildSocket(bootstrap: ChildBootstrap, runtime: ChildRuntime)
 		}
 		connections++;
 		clients.add(socket);
-		cancelControlLossWatch();
-		attachClient(socket, bootstrap, runtime, cache, () => {
-			connections--;
-			clients.delete(socket);
-			if (connections === 0) armControlLossWatch();
-		});
+		attachClient(
+			socket,
+			bootstrap,
+			runtime,
+			cache,
+			(role) => {
+				if (role === "owner") {
+					ownerConnections++;
+					cancelControlLossWatch();
+				}
+			},
+			(role) => {
+				connections--;
+				clients.delete(socket);
+				if (role === "owner") {
+					ownerConnections--;
+					if (ownerConnections === 0) armControlLossWatch();
+				}
+			},
+		);
 	});
 	await new Promise<void>((resolve, reject) => {
 		const onError = (error: Error) => {
@@ -1216,9 +1239,11 @@ function attachClient(
 	bootstrap: ChildBootstrap,
 	runtime: ChildRuntime,
 	cache: Map<string, CachedCommand>,
-	onClose: () => void,
+	onAuthenticated: (role: "owner" | "viewer") => void,
+	onClose: (role: "owner" | "viewer" | undefined) => void,
 ): void {
 	let authenticated = false;
+	let role: "owner" | "viewer" | undefined;
 	let buffer = Buffer.alloc(0);
 	let closed = false;
 	const unsubscribe = runtime.subscribe((event) => {
@@ -1237,7 +1262,7 @@ function attachClient(
 		closed = true;
 		clearTimeout(authTimer);
 		unsubscribe();
-		onClose();
+		onClose(role);
 	});
 	socket.on("error", () => {
 		closed = true;
@@ -1272,8 +1297,12 @@ function attachClient(
 				runtime,
 				cache,
 				() => authenticated,
-				() => {
+				() => role,
+				(nextRole) => {
+					if (role !== undefined) return;
 					authenticated = true;
+					role = nextRole;
+					onAuthenticated(nextRole);
 				},
 				(value, afterReply) => {
 					if (closed || socket.destroyed) return;
@@ -1299,7 +1328,8 @@ async function handleSocketRequest(
 	runtime: ChildRuntime,
 	cache: Map<string, CachedCommand>,
 	isAuthenticated: () => boolean,
-	markAuthenticated: () => void,
+	getRole: () => "owner" | "viewer" | undefined,
+	markAuthenticated: (role: "owner" | "viewer") => void,
 	respond: (value: unknown, afterReply?: () => void) => void,
 ): Promise<void> {
 	const failure = (code: string, message: string): ChildReply => ({
@@ -1311,7 +1341,9 @@ async function handleSocketRequest(
 		try {
 			const identity = parseChildIdentity(request.params);
 			const given = Buffer.from(identity.token);
-			const expected = Buffer.from(bootstrap.token);
+			const expected = Buffer.from(
+				identity.role === "viewer" ? deriveViewerToken(bootstrap.childId, bootstrap.token) : bootstrap.token,
+			);
 			if (
 				identity.childId !== bootstrap.childId ||
 				given.byteLength !== expected.byteLength ||
@@ -1320,7 +1352,7 @@ async function handleSocketRequest(
 				respond(failure("unauthorized", "Child identity was rejected"));
 				return;
 			}
-			markAuthenticated();
+			markAuthenticated(identity.role ?? "owner");
 			respond({
 				id: request.id,
 				ok: true,
@@ -1341,6 +1373,13 @@ async function handleSocketRequest(
 	}
 	if (!isAuthenticated()) {
 		respond(failure("unauthorized", "Child RPC handshake is required"));
+		return;
+	}
+	if (
+		getRole() === "viewer" &&
+		(request.method === "shutdown" || request.method === "admit_assignment" || request.method === "prompt")
+	) {
+		respond(failure("forbidden", "Viewer connections cannot change child lifetime or assignment admission"));
 		return;
 	}
 	const commandFingerprint = fingerprint(request.method, request.params);

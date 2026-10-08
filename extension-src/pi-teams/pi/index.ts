@@ -88,7 +88,12 @@ export default function (pi: ExtensionAPI): void {
 		await app.sessionStart();
 		const team = app.teams;
 		board = team ? new TaskBoardService({ teamDir: team.teamDir, self: "lead" }) : undefined;
-		if (app.mailbox) closeLeadMailbox = installLeadMailbox(pi, app.mailbox);
+		if (app.mailbox)
+			closeLeadMailbox = installLeadMailbox(
+				pi,
+				app.mailbox,
+				(name) => app.teams?.current?.members.find((member) => member.name === name)?.color,
+			);
 		uiHandle = installSubagentsUi(ctx, {
 			manager: app.manager,
 			focus: createAgentFocusPort({ manager: app.manager, transcripts }),

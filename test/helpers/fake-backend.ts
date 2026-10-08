@@ -24,6 +24,7 @@ export class FakeBackend implements AgentExecutionBackend {
 	readonly kind = "process" as const;
 	launcherKind: LauncherKind = "headless";
 	availableResult = true;
+	viewerAvailable = false;
 	steerError: Error | undefined;
 	stopError: Error | undefined;
 	disposeError: Error | undefined;
@@ -58,6 +59,7 @@ export class FakeBackend implements AgentExecutionBackend {
 	private readonly runByHandle = new Map<string, string>();
 	private readonly listeners = new Map<string, Set<(status: BackendStatus) => void>>();
 	private readonly focusListeners = new Map<string, Set<(state: ChildState) => void>>();
+	private readonly presentationListeners = new Map<string, Set<(available: boolean) => void>>();
 	private readonly focusSeqByRun = new Map<string, number>();
 	private nextHandle = 0;
 	private readonly launchWaiters: Array<PromiseWithResolvers<AgentLaunchInput>> = [];
@@ -112,6 +114,17 @@ export class FakeBackend implements AgentExecutionBackend {
 		});
 	}
 
+	async assign(
+		_handle: AgentBackendHandle,
+		input: { runId: string; prompt: string; maxTurns?: number; graceTurns?: number },
+	): Promise<AgentBackendHandle> {
+		this.nextHandle += 1;
+		const handle: AgentBackendHandle = { kind: "process", handle: `fake-handle-${this.nextHandle}` };
+		this.runByHandle.set(handle.handle, input.runId);
+		this.setStatus(input.runId, { state: "running" });
+		return handle;
+	}
+
 	async status(handle: AgentBackendHandle): Promise<BackendStatus> {
 		const runId = this.runByHandle.get(handle.handle);
 		return (runId !== undefined ? this.statuses.get(runId) : undefined) ?? { state: "starting" };
@@ -137,9 +150,31 @@ export class FakeBackend implements AgentExecutionBackend {
 		this.disposeAttempts.push(handle.handle);
 		if (this.disposeError) throw this.disposeError;
 		this.disposedHandles.push(handle.handle);
+		this.setViewer(false);
 	}
 	async attach(_handle: AgentBackendHandle): Promise<boolean> {
-		return this.launcherKind !== "headless";
+		return this.viewerAvailable;
+	}
+	hasViewer(_handle: AgentBackendHandle): boolean {
+		return this.viewerAvailable;
+	}
+	subscribePresentation(handle: AgentBackendHandle, listener: (available: boolean) => void): () => void {
+		let listeners = this.presentationListeners.get(handle.handle);
+		if (!listeners) {
+			listeners = new Set();
+			this.presentationListeners.set(handle.handle, listeners);
+		}
+		listeners.add(listener);
+		return () => {
+			listeners?.delete(listener);
+			if (listeners?.size === 0) this.presentationListeners.delete(handle.handle);
+		};
+	}
+	setViewer(available: boolean): void {
+		this.viewerAvailable = available;
+		for (const listeners of this.presentationListeners.values()) {
+			for (const listener of listeners) listener(available);
+		}
 	}
 
 	serializeHandle(handle: AgentBackendHandle): SerializableBackendHandle | undefined {

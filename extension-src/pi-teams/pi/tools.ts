@@ -94,6 +94,12 @@ const agentParameters = Type.Object({
 				'Optional teammate name (letters, digits, ".", "_", "-", 1-64 chars). Names the run as a teammate of this session\'s team: it becomes the address for messaging, the task board and @mentions. A name is refused while that teammate is still working; reusing a settled name gives that teammate a new assignment.',
 		}),
 	),
+	color: Type.Optional(
+		Type.String({
+			description:
+				"Optional teammate identity color (only with name), as #RGB or #RRGGBB. Fixed when that teammate is first created.",
+		}),
+	),
 	model: Type.Optional(
 		Type.String({
 			description:
@@ -184,6 +190,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 			const base = {
 				type: params.subagent_type as string,
 				...(typeof params.name === "string" && params.name.length > 0 ? { name: params.name } : {}),
+				...(typeof params.color === "string" ? { color: params.color } : {}),
 				prompt: params.prompt as string,
 				description: params.description as string,
 				model: params.model as string | undefined,
@@ -200,6 +207,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 				if (typeof params.resume === "string" && params.resume.length > 0) {
 					const resumed = await manager.resume(params.resume, base.prompt, {
 						run_in_background: base.run_in_background,
+						...(base.color !== undefined ? { color: base.color } : {}),
 						...(base.timeout !== undefined ? { timeout: base.timeout } : {}),
 						...(base.idle_timeout !== undefined ? { idle_timeout: base.idle_timeout } : {}),
 					});
@@ -207,6 +215,8 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 						return textResult(`{agent:${resumed.id} started (resumed from ${params.resume})}`, {
 							agentId: resumed.id,
 							resumedFrom: params.resume,
+							...(resumed.teammateName !== undefined ? { teammateName: resumed.teammateName } : {}),
+							...(resumed.teammateColor !== undefined ? { color: resumed.teammateColor } : {}),
 							background: true,
 							model: resumed.model,
 							modelFallback: resumed.modelFallback,
@@ -219,6 +229,8 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 						resumeNote !== undefined ? `${settledResume.result ?? ""}\n\n${resumeNote}` : (settledResume.result ?? ""),
 						{
 							agentId: resumed.id,
+							...(settledResume.teammateName !== undefined ? { teammateName: settledResume.teammateName } : {}),
+							...(settledResume.teammateColor !== undefined ? { color: settledResume.teammateColor } : {}),
 							model: settledResume.model,
 							modelFallback: settledResume.modelFallback,
 							...(settledResume.budgetExhausted !== undefined
@@ -248,6 +260,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 							agentId: record.id,
 							...(record.teammateName !== undefined ? { teammateName: record.teammateName } : {}),
 							status: record.status,
+							...(record.teammateColor !== undefined ? { color: record.teammateColor } : {}),
 							background: true,
 							model: record.model,
 							modelFallback: record.modelFallback,
@@ -263,6 +276,8 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 					return textResult(`Agent failed: ${settled.error ?? "unknown error"}`, {
 						agentId: settled.id,
 						status: settled.status,
+						...(settled.teammateName !== undefined ? { teammateName: settled.teammateName } : {}),
+						...(settled.teammateColor !== undefined ? { color: settled.teammateColor } : {}),
 						model: settled.model,
 						modelFallback: settled.modelFallback,
 					});
@@ -277,6 +292,8 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 					toolUses: settled.toolUses,
 					model: settled.model,
 					modelFallback: settled.modelFallback,
+					...(settled.teammateName !== undefined ? { teammateName: settled.teammateName } : {}),
+					...(settled.teammateColor !== undefined ? { color: settled.teammateColor } : {}),
 					...(settled.budgetExhausted !== undefined ? { budgetExhausted: settled.budgetExhausted } : {}),
 					...(settled.budgetSeconds !== undefined ? { budgetSeconds: settled.budgetSeconds } : {}),
 				});

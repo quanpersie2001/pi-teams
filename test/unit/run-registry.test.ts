@@ -184,6 +184,17 @@ describe("process handle serialization", () => {
 		const store = createSubagentRunStore(project.cwd);
 		const processEntry = entry();
 		expect(isSerializableBackendHandle(processEntry.handle)).toBe(true);
+		const withViewer = {
+			...processEntry.handle,
+			viewer: { kind: "tmux" as const, childId: "child-1-viewer", paneId: "%11" },
+		};
+		expect(isSerializableBackendHandle(withViewer)).toBe(true);
+		expect(
+			isSerializableBackendHandle({
+				...processEntry.handle,
+				viewer: { kind: "tmux", childId: "foreign-viewer", paneId: "%11" },
+			}),
+		).toBe(false);
 
 		store.writeRegistry([processEntry]);
 		const read = store.readRegistry();

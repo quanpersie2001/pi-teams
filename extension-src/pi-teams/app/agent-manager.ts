@@ -33,7 +33,7 @@ import {
 	PROTOCOL_VERSION,
 	toRunSnapshot,
 } from "../domain/integration-protocol.js";
-import { teammateNameProblem } from "../domain/team.js";
+import { normalizeTeammateColor, teammateNameProblem } from "../domain/team.js";
 import type { WorktreeInfo } from "../domain/worktree.js";
 import type { AgentRegistry } from "./agent-registry.js";
 import { resolveBackend } from "./backend-selector.js";
@@ -56,8 +56,9 @@ export interface SpawnRequest {
 	/** Teammate address for this assignment (ADR 0007 §2); uniqueness is enforced against active runs. */
 	name?: string;
 	prompt: string;
+	/** Teammate identity color; accepted only with name and frozen at creation. */
+	color?: string;
 	description?: string | undefined;
-	/** Explicit detached flag; omitted → the resolved definition's defaultBackground. */
 	run_in_background?: boolean | undefined;
 	model?: string | undefined;
 	thinking?: ThinkingLevel | undefined;
@@ -83,6 +84,7 @@ export interface GetResultOptions {
 
 export interface ResumeOptions {
 	run_in_background?: boolean | undefined;
+	color?: string | undefined;
 	/** Wall-clock budget override (whole seconds); beats the frozen source budgets. */
 	timeout?: number | undefined;
 	/** Idle-budget override (whole seconds); beats the frozen source budgets. */
@@ -154,6 +156,8 @@ interface RunInternals {
 	launchPromise?: Promise<void>;
 	unsubscribeBackend?: () => void;
 	unsubscribeAssignments?: () => void;
+	unsubscribePresentation?: () => void;
+	presentationHandle?: AgentBackendHandle;
 	worktreeInfo?: WorktreeInfo;
 	finalizePromise?: Promise<void>;
 	settlementPromise?: Promise<void>;
@@ -190,6 +194,7 @@ export class AgentManager {
 	private queue: string[] = [];
 	private readonly listeners = new Set<(event: AgentLifecycleEvent) => void>();
 	private readonly focusObservations = new Map<string, FocusObservation>();
+	private readonly presentationListeners = new Set<(agentId: string) => void>();
 	private runningSlots = 0;
 	private maxConcurrent: number;
 	private settings: SubagentsSettings;
@@ -245,11 +250,12 @@ export class AgentManager {
 		this.settings = settings;
 		this.setMaxConcurrent(settings.maxConcurrent);
 	}
-	/** Begin a host session after previously detaching child RPC clients. */
+	/** Begin a host session after the previous session's teardown completes. */
 	beginSession(): void {
 		if (this.disposed) throw new Error("AgentManager is disposed");
 		this.admissionEpoch += 1;
 		this.shuttingDown = false;
+		for (const backend of this.backends) backend.setPresentationActive?.(true);
 	}
 
 	get currentSettings(): Readonly<SubagentsSettings> {
@@ -274,6 +280,13 @@ export class AgentManager {
 			this.listeners.delete(listener);
 		};
 	}
+	/** Subscribe to live presentation-view availability changes. */
+	subscribePresentation(listener: (agentId: string) => void): () => void {
+		this.presentationListeners.add(listener);
+		return () => {
+			this.presentationListeners.delete(listener);
+		};
+	}
 
 	private emit(record: AgentRun, event: AgentLifecycleEventName): void {
 		if (this.listeners.size === 0) return;
@@ -286,6 +299,7 @@ export class AgentManager {
 			description: snapshot.description,
 			status: snapshot.status,
 			...(snapshot.teammateName !== undefined ? { teammateName: snapshot.teammateName } : {}),
+			...(snapshot.teammateColor !== undefined ? { teammateColor: snapshot.teammateColor } : {}),
 			owner: snapshot.owner,
 			delivery: snapshot.delivery,
 			usage: snapshot.usage,
@@ -366,6 +380,22 @@ export class AgentManager {
 			);
 		}
 	}
+	private latestTeammateRun(name: string): AgentRun | undefined {
+		let latest: AgentRun | undefined;
+		for (const internal of this.runs.values()) {
+			if (internal.record.teammateName === name) latest = internal.record;
+		}
+		return latest;
+	}
+	private assertTeammateColor(name: string, color: string | undefined): void {
+		this.teamService?.assertIdentityColor(name, color);
+		if (this.teamService) return;
+		const existing = this.latestTeammateRun(name);
+		if (existing && color !== undefined && color !== existing.teammateColor)
+			throw new Error(
+				`Teammate "@${name}" already has color ${existing.teammateColor ?? "the default"}; its identity color cannot change.`,
+			);
+	}
 
 	/**
 	 * Foreground spawn: shares the concurrency queue and awaits settlement.
@@ -386,7 +416,15 @@ export class AgentManager {
 	private async allocate(request: SpawnRequest, plan: LaunchPlan, worktree?: WorktreeInfo): Promise<AgentRun> {
 		if (this.disposed) throw new Error("AgentManager is disposed");
 		if (this.shuttingDown) throw new Error("AgentManager is shutting down");
-		if (request.name !== undefined) this.assertTeammateNameAvailable(request.name);
+		if (request.color !== undefined && request.name === undefined)
+			throw new Error("Teammate color requires a named teammate.");
+		const color = request.color === undefined ? undefined : normalizeTeammateColor(request.color);
+		if (request.color !== undefined && color === undefined)
+			throw new Error("Invalid teammate color; use #RGB or #RRGGBB.");
+		if (request.name !== undefined) {
+			this.assertTeammateNameAvailable(request.name);
+			this.assertTeammateColor(request.name, color);
+		}
 		const epoch = this.admissionEpoch;
 
 		const overrides: {
@@ -404,7 +442,7 @@ export class AgentManager {
 		if (request.timeout !== undefined) overrides.timeout = request.timeout;
 		if (request.idle_timeout !== undefined) overrides.idleTimeout = request.idle_timeout;
 
-		let snapshot = this.registry.resolveInvocation(request.type, overrides);
+		const snapshot = this.registry.resolveInvocation(request.type, overrides);
 		const background = request.run_in_background ?? snapshot.resolved.defaultBackground;
 		const owner: AgentOwner = request.owner ?? ({ kind: "conversation", sessionId: this.getSessionId() } as const);
 		const delivery: DeliveryPolicy = request.delivery ?? (owner.kind === "conversation" ? "conversation" : "event");
@@ -420,8 +458,10 @@ export class AgentManager {
 		});
 		if (this.disposed || this.shuttingDown || epoch !== this.admissionEpoch)
 			throw new Error("AgentManager session changed during model admission; no run was allocated.");
-		snapshot = { ...snapshot, resolved: { ...snapshot.resolved, model: admission.model } };
-		if (request.name !== undefined) this.assertTeammateNameAvailable(request.name);
+		if (request.name !== undefined) {
+			this.assertTeammateNameAvailable(request.name);
+			this.assertTeammateColor(request.name, color);
+		}
 		if (plan.kind === "resume" && request.name !== undefined) {
 			for (const candidate of this.runs.values()) {
 				if (candidate.record.teammateName === request.name && candidate.record.handle !== undefined)
@@ -456,6 +496,17 @@ export class AgentManager {
 			};
 			worktree = retained.worktreeInfo;
 		}
+		const previous = request.name !== undefined ? this.latestTeammateRun(request.name) : undefined;
+		const teammateColor =
+			request.name !== undefined
+				? (this.teamService?.ensureIdentity({
+						name: request.name,
+						type: snapshot.resolved.type,
+						...(color !== undefined ? { color } : {}),
+					}) ??
+					previous?.teammateColor ??
+					color)
+				: undefined;
 		const id = this.idFactory();
 		this.registry.trackSnapshot(id, snapshot);
 		if (plan.kind === "resume") {
@@ -468,8 +519,9 @@ export class AgentManager {
 			type: snapshot.resolved.type,
 			description: request.description ?? snapshot.resolved.description,
 			status: "queued",
-			...(request.name !== undefined ? { teammateName: request.name } : {}),
 			backend: "process",
+			...(request.name !== undefined ? { teammateName: request.name } : {}),
+			...(teammateColor !== undefined ? { teammateColor } : {}),
 			...(plan.kind === "assignment" ? { handle: plan.handle } : {}),
 			model: admission.model,
 			...(admission.fallback !== undefined ? { modelFallback: admission.fallback } : {}),
@@ -515,6 +567,9 @@ export class AgentManager {
 		if (retained) {
 			retained.unsubscribeAssignments?.();
 			delete retained.unsubscribeAssignments;
+			retained.unsubscribePresentation?.();
+			delete retained.unsubscribePresentation;
+			delete retained.presentationHandle;
 			delete retained.record.handle;
 			delete retained.backend;
 		}
@@ -638,6 +693,41 @@ export class AgentManager {
 				/* View failures must never interrupt child execution or settlement. */
 			}
 		}
+	}
+	private observePresentation(internal: RunInternals): void {
+		const handle = internal.record.handle;
+		if (internal.presentationHandle === handle) return;
+		internal.unsubscribePresentation?.();
+		delete internal.unsubscribePresentation;
+		if (!handle) {
+			delete internal.presentationHandle;
+			this.notifyPresentation(internal);
+			return;
+		}
+		internal.presentationHandle = handle;
+		const backend = internal.backend;
+		if (backend?.subscribePresentation) {
+			internal.unsubscribePresentation = backend.subscribePresentation(handle, () => {
+				this.syncRegistry();
+				this.notifyPresentation(internal);
+			});
+		}
+		this.notifyPresentation(internal);
+	}
+
+	private notifyPresentation(internal: RunInternals): void {
+		for (const listener of this.presentationListeners) {
+			try {
+				listener(internal.record.id);
+			} catch {
+				/* View refresh failures must never interrupt child execution. */
+			}
+		}
+	}
+	private stopObservingPresentation(internal: RunInternals): void {
+		internal.unsubscribePresentation?.();
+		delete internal.unsubscribePresentation;
+		delete internal.presentationHandle;
 	}
 
 	private rememberFocusState(internal: RunInternals, state: ChildState): ChildState {
@@ -928,6 +1018,15 @@ export class AgentManager {
 		if (source.sessionFile === undefined) {
 			throw new Error(`Agent "${agentId}" has no persisted session to resume from.`);
 		}
+		if (options.color !== undefined) {
+			const color = normalizeTeammateColor(options.color);
+			if (color === undefined) throw new Error("Invalid teammate color; use #RGB or #RRGGBB.");
+			if (source.teammateName === undefined) throw new Error("Teammate color requires a named teammate.");
+			if (color !== source.teammateColor)
+				throw new Error(
+					`Teammate "@${source.teammateName}" already has color ${source.teammateColor ?? "the default"}; its identity color cannot change.`,
+				);
+		}
 
 		const background = (options.run_in_background ?? source.isBackground ?? true) === true;
 		const input: AgentResumeInput = {
@@ -941,6 +1040,7 @@ export class AgentManager {
 			type: source.type,
 			// A resumed run is the same teammate's next assignment.
 			...(source.teammateName !== undefined ? { name: source.teammateName } : {}),
+			...(source.teammateColor !== undefined ? { color: source.teammateColor } : {}),
 			prompt,
 			description: source.description,
 			run_in_background: background,
@@ -1034,12 +1134,7 @@ export class AgentManager {
 		const internal = this.runs.get(agentId);
 		const backend = internal?.backend;
 		const handle = internal?.record.handle;
-		if (!backend?.attach || !handle) return false;
-		const serialized = (backend as AgentExecutionBackend & PersistedExecutionBackend).serializeHandle?.(
-			handle,
-			internal.record.sessionFile,
-		);
-		return serialized?.launcher.kind === "herdr" || serialized?.launcher.kind === "tmux";
+		return backend?.hasViewer && handle ? backend.hasViewer(handle) : false;
 	}
 	async attachPane(agentId: string): Promise<boolean> {
 		const internal = this.runs.get(agentId);
@@ -1098,9 +1193,11 @@ export class AgentManager {
 				this.detachBudgetWatch(internal);
 				internal.unsubscribeBackend?.();
 				delete internal.unsubscribeBackend;
+				this.stopObservingPresentation(internal);
 				delete internal.record.handle;
 				delete internal.backend;
 				this.notifyFocus(internal);
+				this.notifyPresentation(internal);
 			}
 		}
 		this.preservedRegistryEntries = this.preservedRegistryEntries.filter(
@@ -1141,6 +1238,7 @@ export class AgentManager {
 		if (this.disposed) return;
 		this.shuttingDown = true;
 		this.admissionEpoch += 1;
+		for (const backend of this.backends) backend.setPresentationActive?.(false);
 		for (const [id, internal] of [...this.runs]) {
 			if (internal.record.status === "queued") await this.stop(id);
 		}
@@ -1151,6 +1249,7 @@ export class AgentManager {
 			if (!isActiveStatus(internal.record.status) || !internal.backend || !internal.record.handle) continue;
 			if (!(await this.stop(id)) && isActiveStatus(internal.record.status)) {
 				this.shuttingDown = false;
+				for (const backend of this.backends) backend.setPresentationActive?.(true);
 				throw new Error(`Child did not accept abort for run "${id}".`);
 			}
 		}
@@ -1169,10 +1268,12 @@ export class AgentManager {
 				delete internal.record.handle;
 				delete internal.backend;
 			}
+			this.stopObservingPresentation(internal);
 		}
 		this.budgetWatcher.clear();
 		this.syncRegistry();
 		this.clearFocusObservations();
+		this.presentationListeners.clear();
 		this.runs.clear();
 		this.runningSlots = 0;
 	}
@@ -1214,6 +1315,7 @@ export class AgentManager {
 		if (this.disposed) return;
 		this.shuttingDown = true;
 		this.admissionEpoch += 1;
+		for (const backend of this.backends) backend.setPresentationActive?.(false);
 		const active = [...this.runs.values()].filter((internal) => isActiveStatus(internal.record.status));
 		for (const internal of active) {
 			try {
@@ -1246,11 +1348,13 @@ export class AgentManager {
 			delete internal.unsubscribeBackend;
 			if (internal.backend && internal.record.handle) internal.backend.detach(internal.record.handle);
 			this.focusObservations.get(internal.record.id)?.unsubscribe?.();
+			this.stopObservingPresentation(internal);
 		}
 		this.budgetWatcher.clear();
 		this.syncRegistry();
 		this.clearFocusObservations();
 		this.runs.clear();
+		this.presentationListeners.clear();
 		this.queue = [];
 		this.runningSlots = 0;
 	}
@@ -1375,6 +1479,7 @@ export class AgentManager {
 				this.syncRegistry();
 			}
 			this.notifyFocus(internal);
+			this.observePresentation(internal);
 			internal.unsubscribeBackend = backend.subscribe(handle, (status) => {
 				void this.reconcileBackendStatus(internal, status).catch((error: unknown) => {
 					internal.record.recoveryError = errorText(error);
@@ -1445,7 +1550,12 @@ export class AgentManager {
 		const service = this.teamService;
 		const team = service?.current;
 		if (!service || !team || record.teammateName === undefined) return undefined;
-		return { teamDir: service.teamDir, teamKey: team.teamKey, teammateName: record.teammateName };
+		return {
+			teamDir: service.teamDir,
+			teamKey: team.teamKey,
+			teammateName: record.teammateName,
+			...(record.teammateColor !== undefined ? { teammateColor: record.teammateColor } : {}),
+		};
 	}
 
 	private observeAssignments(internal: RunInternals): void {
@@ -1475,6 +1585,9 @@ export class AgentManager {
 		const backend = source.backend;
 		source.unsubscribeAssignments?.();
 		delete source.unsubscribeAssignments;
+		source.unsubscribePresentation?.();
+		delete source.unsubscribePresentation;
+		delete source.presentationHandle;
 		delete source.record.handle;
 		delete source.backend;
 		const previous = source.record;
@@ -1485,6 +1598,7 @@ export class AgentManager {
 			description: previous.description,
 			status: "queued",
 			teammateName,
+			...(previous.teammateColor !== undefined ? { teammateColor: previous.teammateColor } : {}),
 			backend: "process",
 			handle,
 			...(previous.model !== undefined ? { model: previous.model } : {}),
@@ -1757,7 +1871,9 @@ export class AgentManager {
 			delete internal.unsubscribeBackend;
 			delete internal.record.handle;
 			delete internal.backend;
+			this.stopObservingPresentation(internal);
 			this.notifyFocus(internal);
+			this.notifyPresentation(internal);
 			if (internal.record.recoveryError?.startsWith("Child cleanup failed;")) {
 				delete internal.record.recoveryError;
 				cleanupErrorCleared = true;
@@ -1915,6 +2031,7 @@ function historyToRun(entry: CompletedRunHistoryEntry): AgentRun {
 		description: entry.description,
 		status: entry.status,
 		...(entry.teammateName !== undefined ? { teammateName: entry.teammateName } : {}),
+		...(entry.teammateColor !== undefined ? { teammateColor: entry.teammateColor } : {}),
 		backend: entry.backend,
 		...(entry.model !== undefined ? { model: entry.model } : {}),
 		...(entry.modelFallback !== undefined ? { modelFallback: entry.modelFallback } : {}),

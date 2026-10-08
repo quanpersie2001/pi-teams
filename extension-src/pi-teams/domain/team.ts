@@ -4,16 +4,17 @@
 // spawn and persist across assignments until the session ends — a settled
 // teammate may receive a new assignment under the same name; an active one may
 // not. Pure module: no Pi, fs or process imports.
-
 export interface TeamMember {
 	/** Team-unique teammate address: mailbox path segment, send_message target, @mention. */
 	name: string;
 	/** Specialist type (agent definition) the teammate was spawned as. */
 	type: string;
+	/** Effective runtime color frozen when the teammate identity was created. */
+	color?: string;
 	/** Latest admitted run carrying this teammate name. */
-	lastRunId: string;
-	firstAssignedAt: number;
-	lastAssignedAt: number;
+	lastRunId?: string;
+	firstAssignedAt?: number;
+	lastAssignedAt?: number;
 }
 
 export interface TeamRoster {
@@ -42,6 +43,41 @@ export function teammateNameProblem(name: string): string | undefined {
 		return "teammate names are 1–64 characters of letters, digits, '.', '_' or '-' and start with a letter or digit";
 	return undefined;
 }
+/** Match pi-style's concrete RGB normalization (trim, expand #RGB, lowercase). */
+export function normalizeTeammateColor(input: string): string | undefined {
+	const value = input.trim();
+	if (/^#[\da-f]{6}$/i.test(value)) return value.toLowerCase();
+	if (/^#[\da-f]{3}$/i.test(value))
+		return `#${[...value.slice(1)].map((digit) => digit.repeat(2)).join("")}`.toLowerCase();
+	return undefined;
+}
+
+/** Create the roster identity before allocating any child resource. */
+export function ensureMemberIdentity(
+	roster: TeamRoster,
+	identity: { name: string; type: string; color?: string },
+	at: number,
+): { roster: TeamRoster; color?: string } {
+	const existing = roster.members.find((member) => member.name === identity.name);
+	if (existing) {
+		if (identity.color !== undefined && existing.color !== identity.color)
+			throw new Error(
+				`Teammate "@${identity.name}" already has color ${existing.color ?? "the default"}; its identity color cannot change.`,
+			);
+		return { roster, ...(existing.color !== undefined ? { color: existing.color } : {}) };
+	}
+	const member: TeamMember = {
+		name: identity.name,
+		type: identity.type,
+		...(identity.color !== undefined ? { color: identity.color } : {}),
+		firstAssignedAt: at,
+		lastAssignedAt: at,
+	};
+	return {
+		roster: { ...roster, members: [...roster.members, member] },
+		...(identity.color !== undefined ? { color: identity.color } : {}),
+	};
+}
 
 /**
  * Team id derived from the owning session id (one team per session): unsafe
@@ -60,13 +96,19 @@ export function deriveTeamId(sessionId: string): string {
  */
 export function upsertMember(
 	roster: TeamRoster,
-	assignment: { name: string; type: string; runId: string; at: number },
+	assignment: { name: string; type: string; runId: string; at: number; color?: string },
 ): TeamRoster {
 	const existing = roster.members.find((member) => member.name === assignment.name);
 	const members = existing
 		? roster.members.map((member) =>
 				member === existing
-					? { ...member, type: assignment.type, lastRunId: assignment.runId, lastAssignedAt: assignment.at }
+					? {
+							...member,
+							type: assignment.type,
+							lastRunId: assignment.runId,
+							lastAssignedAt: assignment.at,
+							...(member.color !== undefined ? { color: member.color } : {}),
+						}
 					: member,
 			)
 		: [
@@ -74,6 +116,7 @@ export function upsertMember(
 				{
 					name: assignment.name,
 					type: assignment.type,
+					...(assignment.color !== undefined ? { color: assignment.color } : {}),
 					lastRunId: assignment.runId,
 					firstAssignedAt: assignment.at,
 					lastAssignedAt: assignment.at,

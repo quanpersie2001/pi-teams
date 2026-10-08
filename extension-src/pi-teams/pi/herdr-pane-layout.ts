@@ -230,8 +230,20 @@ export function createHerdrPaneLayoutAdapter(
 			if (!target) throw new Error("HerdR resize target is not in the saved parent tab");
 			const difference = height - target.height;
 			if (difference === 0) return;
-
-			const boundaries: HerdrSplit[] = [];
+			const below = panes.find(
+				(pane) => pane.x === target.x && pane.width === target.width && pane.y === target.y + target.height,
+			);
+			let sourcePane = target;
+			let direction: "up" | "down" = "down";
+			if (difference < 0) {
+				if (!below) throw new Error("HerdR lower resize boundary has no verified adjacent row");
+				sourcePane = below;
+				direction = "up";
+			}
+			const edge = direction === "up" ? sourcePane.y : sourcePane.y + sourcePane.height;
+			// Mirror HerdR's nearest-edge split choice; the CLI receives only pane, direction, and delta.
+			let chosen: HerdrSplit | undefined;
+			let chosenDistance = Number.POSITIVE_INFINITY;
 			for (const candidate of layout.splits) {
 				const item = object(candidate);
 				const splitArea = rect(item?.rect);
@@ -241,38 +253,92 @@ export function createHerdrPaneLayoutAdapter(
 					item.direction !== "down" ||
 					typeof item.ratio !== "number" ||
 					!Number.isFinite(item.ratio) ||
+					splitArea.x >= sourcePane.x + sourcePane.width ||
+					sourcePane.x >= splitArea.x + splitArea.width
+				)
+					continue;
+				const position = splitArea.y + Math.round(splitArea.height * item.ratio);
+				const distance = Math.abs(position - edge);
+				if (distance <= 1 && distance < chosenDistance) {
+					chosen = { ratio: item.ratio, area: splitArea };
+					chosenDistance = distance;
+				}
+			}
+			if (!chosen) throw new Error("HerdR resize target has no adjacent vertical split boundary");
+			const nextRatio = (target.y + height - chosen.area.y) / chosen.area.height;
+			const amount = Math.abs(nextRatio - chosen.ratio);
+			if (!Number.isFinite(amount) || amount <= 0 || nextRatio < 0.1 || nextRatio > 0.9)
+				throw new Error("Requested HerdR pane height exceeds the adjacent split's adjustable range");
+			await run(
+				["pane", "resize", "--pane", sourcePane.paneId, "--direction", direction, "--amount", String(amount)],
+				parent.socketPath,
+			);
+		},
+		async resizeWidth(parent, paneId, width) {
+			if (!Number.isSafeInteger(width) || width <= 0) throw new Error("HerdR pane width must be a positive cell count");
+			await verifyParent(parent);
+			const result = parseJson(
+				(await run(["pane", "layout", "--pane", parent.paneId], parent.socketPath)).stdout,
+				"pane layout",
+			);
+			const layout = object(result.layout) ?? result;
+			const area = rect(layout.area);
+			if (!area || !Array.isArray(layout.panes) || !Array.isArray(layout.splits))
+				throw new Error("HerdR pane layout omitted geometry or split boundaries");
+			const panes: PaneGeometry[] = [];
+			for (const entry of layout.panes) {
+				const item = object(entry);
+				const paneRect = rect(item?.rect);
+				if (!item || typeof item.pane_id !== "string" || !paneRect)
+					throw new Error("HerdR pane layout contains invalid pane geometry");
+				panes.push({ paneId: item.pane_id, ...paneRect });
+			}
+			const target = panes.find((pane) => pane.paneId === paneId);
+			if (!target) throw new Error("HerdR resize target is not in the saved parent tab");
+			const difference = width - target.width;
+			if (difference === 0) return;
+			const boundaries: HerdrSplit[] = [];
+			for (const candidate of layout.splits) {
+				const item = object(candidate);
+				const splitArea = rect(item?.rect);
+				if (
+					!item ||
+					!splitArea ||
+					item.direction !== "right" ||
+					typeof item.ratio !== "number" ||
+					!Number.isFinite(item.ratio) ||
 					splitArea.x > target.x ||
 					splitArea.x + splitArea.width < target.x + target.width ||
 					splitArea.y > target.y ||
 					splitArea.y + splitArea.height < target.y + target.height
-				) {
+				)
 					continue;
-				}
-				const position = splitArea.y + Math.round(splitArea.height * item.ratio);
-				if (target.y + target.height === position) boundaries.push({ ratio: item.ratio, area: splitArea });
+				const position = splitArea.x + Math.round(splitArea.width * item.ratio);
+				if (target.x + target.width === position) boundaries.push({ ratio: item.ratio, area: splitArea });
 			}
-			boundaries.sort((left, right) => left.area.height - right.area.height);
+			boundaries.sort((left, right) => left.area.width - right.area.width);
 			const chosen = boundaries[0];
-			if (!chosen) throw new Error("HerdR resize target has no lower vertical split boundary");
-			// Aim at the center of the desired cell, not the old ratio's half-cell rounding threshold.
-			const nextRatio = (target.y + height - chosen.area.y) / chosen.area.height;
+			if (!chosen) throw new Error("HerdR resize target has no right horizontal split boundary");
+			const nextRatio = (target.x + width - chosen.area.x) / chosen.area.width;
 			const amount = Math.abs(nextRatio - chosen.ratio);
-			if (!Number.isFinite(amount) || amount <= 0 || amount > 0.5) {
-				throw new Error("Requested HerdR pane height exceeds the adjacent split's adjustable range");
-			}
-			// HerdR chooses the boundary in the requested direction. Shrink from the row below
-			// so an UP resize cannot move this row's upper edge and disturb an already balanced row.
-			const below = panes.find(
-				(pane) => pane.x === target.x && pane.width === target.width && pane.y === target.y + target.height,
+			if (!Number.isFinite(amount) || amount <= 0 || nextRatio < 0.1 || nextRatio > 0.9)
+				throw new Error("Requested HerdR pane width exceeds the adjacent split's adjustable range");
+			const right = panes.find(
+				(pane) =>
+					pane.x === target.x + target.width && pane.y < target.y + target.height && target.y < pane.y + pane.height,
 			);
-			if (!below) throw new Error("HerdR lower resize boundary has no verified adjacent row");
-			const sourcePaneId = difference < 0 ? below.paneId : paneId;
-			const direction = difference < 0 ? "up" : "down";
-			if (nextRatio < 0.1 || nextRatio > 0.9) {
-				throw new Error("Requested HerdR pane height exceeds the adjacent split's adjustable range");
-			}
+			if (!right) throw new Error("HerdR right resize boundary has no verified adjacent pane");
 			await run(
-				["pane", "resize", "--pane", sourcePaneId, "--direction", direction, "--amount", String(amount)],
+				[
+					"pane",
+					"resize",
+					"--pane",
+					difference < 0 ? right.paneId : paneId,
+					"--direction",
+					difference < 0 ? "left" : "right",
+					"--amount",
+					String(amount),
+				],
 				parent.socketPath,
 			);
 		},

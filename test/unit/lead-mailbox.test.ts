@@ -26,6 +26,7 @@ it("retains a queued lead message until its own native acknowledgement and repla
 		| ((event: { message: { role: string; customType: string; details: { messageId: string } } }) => void)
 		| undefined;
 	const deliveries: string[] = [];
+	const details: Record<string, unknown>[] = [];
 	const pi = {
 		on: (_event: string, handler: typeof acknowledge) => {
 			acknowledge = handler;
@@ -33,21 +34,23 @@ it("retains a queued lead message until its own native acknowledgement and repla
 				acknowledge = undefined;
 			};
 		},
-		sendMessage: (message: { content: string }) => {
+		sendMessage: (message: { content: string; details?: Record<string, unknown> }) => {
 			deliveries.push(message.content);
+			details.push(message.details ?? {});
 		},
 	} as unknown as ExtensionAPI;
-	close = installLeadMailbox(pi, lead);
+	close = installLeadMailbox(pi, lead, () => "#aabbcc");
 	expect(lead.receive().map((message) => message.id)).toEqual([sent.id]);
 	acknowledge?.({ message: { role: "custom", customType: "teammate-message", details: { messageId: "unrelated" } } });
 	expect(lead.receive().map((message) => message.id)).toEqual([sent.id]);
 	close();
-	close = installLeadMailbox(pi, lead);
+	close = installLeadMailbox(pi, lead, () => "#aabbcc");
 	expect(deliveries).toEqual([
 		"Message from @worker:\n\nfindings that must survive native delivery failure",
 		"Message from @worker:\n\nfindings that must survive native delivery failure",
 	]);
 	expect(lead.receive().map((message) => message.id)).toEqual([sent.id]);
+	expect(details[0]).toMatchObject({ from: "worker", color: "#aabbcc", untrusted: true });
 	acknowledge?.({ message: { role: "custom", customType: "teammate-message", details: { messageId: sent.id } } });
 	expect(lead.receive()).toEqual([]);
 });

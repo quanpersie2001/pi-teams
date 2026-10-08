@@ -922,6 +922,10 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		if (!disposed) void refresh();
 	});
 	disposers.push(unsubscribeLifecycle);
+	const unsubscribePresentation = manager.subscribePresentation(() => {
+		if (!disposed) void refresh();
+	});
+	disposers.push(unsubscribePresentation);
 	// setWidget invokes its factory synchronously in Pi. Capture the native TUI
 	// even before the first child exists, then remove the empty widget: Hub
 	// shortcuts must still respect dialogs when there is no inline roster.

@@ -66,7 +66,7 @@ Steering is a command, not a lifecycle state. Backend `disconnected` is unknown 
 
 `Agent.prepareLoadout` exposes canonical enabled specialist names/effective descriptions before each model turn. `pi/agent-mention-autocomplete.ts` wraps public `ctx.ui.addAutocompleteProvider`, merges native/agent suggestions and delegates acceptance to the owning provider. It neither replaces the editor nor launches children.
 
-Build emits `dist/extensions/pi-teams.js`, `child-bridge.js`, `headless-child.js` and shared chunks. Interactive launchers resolve the installed supported Pi peer's CLI, not global `pi` from PATH.
+Build emits `dist/extensions/pi-teams.js`, `child-bridge.js`, `headless-child.js`, `child-viewer.js` and shared chunks. Multiplexer viewers resolve the installed supported Pi peer's CLI, not global `pi` from PATH.
 
 ## 5. AgentManager
 
@@ -92,21 +92,21 @@ Interactive native `sendUserMessage` is fire-and-forget: preflight failure may h
 
 Launchers create, inspect liveness, attach and terminate; they do not execute/control the task through terminal input.
 
-- **HerdR:** interactive native Pi TUI. Shell-quoted command is passed as one `pane run` argument because that CLI joins command arguments. Ownership uses saved socket/pane/terminal, PID birth time, foreground process group and authenticated bridge PID. Process title/environment are not durable ownership evidence; `process-info` exposes `pid`/`argv0`, not an argv array. Attachment focuses only verified owned panes.
-- **tmux:** interactive native Pi TUI. Saved server socket/PID, pane PID and owner-marked startup command prevent targeting a reused pane or another server.
-- **Headless:** detached independent Node process with a native SDK session, owner-marked process identity/group and private diagnostic log; no terminal attachment.
+- **HerdR:** native Pi viewer, separate from execution. Shell-quoted command is passed as one `pane run` argument because that CLI joins command arguments. Ownership uses saved socket/pane/terminal, PID birth time and foreground process group. Process title/environment are not durable ownership evidence; `process-info` exposes `pid`/`argv0`, not an argv array. Attachment focuses only verified owned panes.
+- **tmux:** native Pi viewer, separate from execution. Saved server socket/PID, pane PID and owner-marked startup command prevent targeting a reused pane or another server.
+- **Headless:** every assignment executes in a detached independent Node process with a native SDK session, owner-marked process identity/group and private diagnostic log. Its PID, child ID, native context and control connection survive presentation changes.
 
 Launchers never paste steer messages, press Enter for control, infer settlement from pane text/badges, or silently switch implementation after launch failure. Unavailable transport is unknown liveness, never authority to kill an unverified resource.
 
 ## 8. Child control bridge
 
-`domain/child-protocol.ts`, `pi/child-rpc-client.ts` and `pi/child-bridge.ts` define child protocol **v2**, separate from public integration v3. `headless-child.ts` uses the same bridge with a native SDK session; interactive children load its small extension.
+`domain/child-protocol.ts`, `pi/child-rpc-client.ts` and `pi/child-bridge.ts` define child protocol **v2**, separate from public integration v3. `headless-child.ts` hosts execution; `child-viewer.ts` presents its native transcript and controls through RPC without admitting assignments directly.
 
-- Authenticated Unix socket with NDJSON requests/replies/events, child ID and random token.
+- Authenticated Unix socket with NDJSON requests/replies/events and child ID. Owner and viewer credentials are distinct: the viewer token is HMAC-derived and cannot authenticate as owner. Viewers may inspect/steer/control but cannot call `prompt`, `admit_assignment` or `shutdown`; idle named composition routes through the signed mailbox and parent capacity admission.
 - Newly created private directories use `0700`; bootstrap/socket files use `0600`. Short OS-temp socket paths avoid Unix pathname limits.
 - Frames are bounded to 1 MiB. Transcript previews carry absolute cursor/offset and truncation metadata; full history remains in native JSONL.
 - At settlement the bridge writes the complete final assistant text to an immutable `result.md` (0600): the first assignment uses `sessions/<child-id>/result.md`, subsequent assignments use `sessions/<child-id>/runs/<sha256(run-id)>/result.md`. `ChildOutcome.resultFile` carries the full-result pointer; the inline copy stays 8 KiB-bounded. Write failure degrades honestly to the inline copy without blocking native settlement.
-- Orphan self-termination (ADR 0007 §1): the socket server arms a control-loss watch when the last client disconnects; a silent window past the reconnect grace means the parent died. The runtime aborts the active run through the native path, gives settlement a bounded window to persist the annotated partial result, then stops the host process.
+- Orphan self-termination (ADR 0007 §1): losing the last authenticated owner arms the control-loss watch; viewers cannot keep an orphan alive. A silent window past reconnect grace means the parent died. The runtime aborts the active run through the native path, gives settlement a bounded window to persist the annotated partial result, then stops the host process. Viewer disconnection alone never aborts execution.
 - Sequenced focus state carries native cwd/model/thinking/context/capabilities. Stable transcript IDs/revisions permit partial upserts; stale/wrong-run projections cannot rewind focus.
 - Replay/deduplication prevents duplicate prompt admission and request-ID reuse with different contents.
 - Native `agent_settled`, not `agent_end`, final text, pane disappearance or a sentinel, owns settlement. A natural final answer at the turn limit completes; continuing tool loops obey soft/grace/hard limits.
@@ -116,15 +116,17 @@ Incompatible live receipts are preserved without adopting their control credenti
 
 ## 9. Launcher selection
 
-New launches resolve their launcher hint in this order: the session `/teams-backend` runtime switch (`auto`/`headless`), then the `PI_TEAMS_BACKEND` env override (`auto|herdr|tmux|headless`), then the `backend` settings key (`auto`/`headless`), then `auto`. It is a launcher hint, not an alternate execution backend. Auto chooses the first available launcher:
+New launches resolve their presentation hint in this order: the session `/teams-backend` runtime switch (`auto`/`headless`), then the `PI_TEAMS_BACKEND` env override (`auto|herdr|tmux|headless`), then the `backend` settings key (`auto`/`headless`), then `auto`. Execution is always independent headless; auto selects the first available viewer launcher:
 
 ```text
-auto → HerdR → tmux → independent headless child
+auto → HerdR viewer → tmux viewer → no viewer
 ```
 
 Forced unavailable launchers fail explicitly.
 
-Terminal allocation is serialized by saved socket, Main pane and parent identity. Main remains full-height on the left. The first child splits Main right at 50%; each child column holds at most three panes. Allocate into the earliest non-full column; when all are full, add a full-height column on the right. Balance only owned rows within their columns; closing a child does not compact survivors across columns. Preserve focus and foreign panes, and reject unverified/user-modified geometry rather than rearranging it.
+Terminal allocation is serialized by saved socket, Main pane and parent identity. Count all live runtime-owned execution children, including unnamed active children and named idle children, excluding Main. Zero leaves Main alone; one–three use two equal horizontal partitions with children stacked vertically; four–six use three equal horizontal partitions with child rows 2+2, 3+2 and 3+3 (separator/cell rounding applies). Above six, remove all managed viewers; returning to at most six recreates viewers without replacing execution PID/child ID/context or replaying assignments. Presentation changes synchronize durable viewer receipts and attachment availability. Preserve focus and foreign panes, and reject unverified/user-modified geometry rather than rearranging it.
+
+Session teardown suppresses viewer recreation before stopping children; removing ending execution children never opens new viewers for the remaining ending cohort. The next session re-enables presentation only after old-team teardown completes.
 
 Adding a full-height column reparents the prior column's lower rows beneath its top row. tmux uses same-window `join-pane`; HerdR uses a no-focus temporary-tab roundtrip because same-tab moves are no-ops. Pane identity is preserved and focused-leaf focus restored.
 

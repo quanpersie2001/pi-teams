@@ -125,5 +125,14 @@ export function createTmuxPaneLayoutAdapter(
 				throw new Error("Saved tmux parent identity no longer matches the pane/server/window");
 			await run(["resize-pane", "-y", String(height), "-t", paneId], parent.socketPath);
 		},
+		async resizeWidth(parent, paneId, width) {
+			if (!Number.isSafeInteger(width) || width < 1) throw new Error("Invalid tmux pane width");
+			const expected = decodeIdentity(parent.identity);
+			if (expected.paneId !== parent.paneId) throw new Error("Saved tmux parent identity does not match its pane");
+			const actual = await resolveIdentity(parent.paneId, parent.socketPath);
+			if (encodeIdentity(actual) !== encodeIdentity(expected))
+				throw new Error("Saved tmux parent identity no longer matches the pane/server/window");
+			await run(["resize-pane", "-x", String(width), "-t", paneId], parent.socketPath);
+		},
 	};
 }

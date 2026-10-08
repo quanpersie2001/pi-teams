@@ -37,7 +37,7 @@
 		"test": "npm run build && vitest run",
 		"test:watch": "npm run build && vitest",
 		"build": "tsup",
-		"package:smoke": "node --input-type=module -e \"await import('./dist/extensions/pi-teams.js'); await import('./dist/extensions/child-bridge.js'); const { access } = await import('node:fs/promises'); await access('./dist/extensions/headless-child.js'); console.log('package smoke: parent and bridge load; headless entry packaged');\"",
+		"package:smoke": "node --input-type=module -e \"await import('./dist/extensions/pi-teams.js'); await import('./dist/extensions/child-bridge.js'); await import('./dist/extensions/child-viewer.js'); const { access } = await import('node:fs/promises'); await access('./dist/extensions/headless-child.js'); console.log('package smoke: parent, bridge and viewer load; headless entry packaged');\"",
 		"dev": "tsup --watch",
 		"dev:pi": "node ./node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js -ne -e .",
 		"smoke:live": "node ./node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js -ne -e . -p \"Reply with exactly: OK\"",

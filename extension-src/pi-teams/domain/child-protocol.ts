@@ -48,6 +48,8 @@ export interface ChildBootstrap {
 	teamKey?: string;
 	/** This child's teammate name (its mailbox address). */
 	teammateName?: string;
+	/** Normalized #RRGGBB runtime identity color. */
+	teammateColor?: string;
 }
 
 export interface ChildOutcome {
@@ -78,6 +80,8 @@ export interface ChildFocusModel {
 
 export interface ChildState {
 	childId: string;
+	teammateName?: string;
+	teammateColor?: string;
 	pid: number;
 	sessionFile?: string;
 	execution: ChildExecution;
@@ -128,6 +132,8 @@ export interface ChildIdentity {
 	protocolVersion: typeof CHILD_PROTOCOL_VERSION;
 	childId: string;
 	token: string;
+	/** Owner controls execution lifetime; viewer sockets are presentation-only. */
+	role?: "owner" | "viewer";
 }
 
 export interface ChildRequest {
@@ -209,10 +215,14 @@ export function parseChildIdentity(value: unknown): ChildIdentity {
 	if (value.protocolVersion !== CHILD_PROTOCOL_VERSION) {
 		throw new ChildProtocolError("protocol_mismatch", "Unsupported child protocol version");
 	}
+	const role = value.role === undefined ? "owner" : value.role;
+	if (role !== "owner" && role !== "viewer")
+		throw new ChildProtocolError("unauthorized", "Invalid child identity role");
 	return {
 		protocolVersion: CHILD_PROTOCOL_VERSION,
 		childId: requireString(value.childId, "childId"),
 		token: requireString(value.token, "token", 512),
+		role,
 	};
 }
 
@@ -292,6 +302,15 @@ export function assertChildState(value: unknown, expectedChildId: string): Child
 	}
 	if (!Number.isSafeInteger(value.seq) || (value.seq as number) < 0) {
 		throw new ChildProtocolError("invalid_state", "Child state has an invalid event sequence");
+	}
+	if (value.teammateName !== undefined && typeof value.teammateName !== "string") {
+		throw new ChildProtocolError("invalid_state", "Child teammate name is invalid");
+	}
+	if (
+		value.teammateColor !== undefined &&
+		(typeof value.teammateColor !== "string" || !/^#[\da-f]{6}$/.test(value.teammateColor))
+	) {
+		throw new ChildProtocolError("invalid_state", "Child teammate color is invalid");
 	}
 	if (value.focus !== undefined && !assertChildFocus(value.focus)) {
 		throw new ChildProtocolError("invalid_state", "Child focus metadata is invalid");

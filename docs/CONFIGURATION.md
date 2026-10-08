@@ -85,7 +85,9 @@ Model admission first tries the resolved primary. If it cannot resolve a native 
 
 Admission uses the native child's `ModelRuntime`, `models.json` and `auth.json` in Pi's agent directory. Catalog refresh is offline; native auth may refresh OAuth. This does **not** check provider availability, remote key acceptance, billing or quota. Launch rechecks after queueing and the child guards dispatch. `model` and optional `modelFallback` in replies/status/lifecycle/history describe the actual selection.
 
-Isolation is configuration-only. Enable `worktreeIsolation` and set the specialist's `isolation: worktree`; with the master switch off, it runs in the shared workspace. Neither `Agent` nor spawn RPC accepts an isolation override. `Agent` also does not accept instance `name` or `inherit_context`; supply needed context in `prompt`.
+Isolation is configuration-only. Enable `worktreeIsolation` and set the specialist's `isolation: worktree`; with the master switch off, it runs in the shared workspace. Neither `Agent` nor spawn RPC accepts an isolation override. `Agent` does not accept `inherit_context`; supply needed context in `prompt`.
+
+`Agent(name: "review-api", color: "#e879f9")` creates a current-team identity. Color accepts `#RGB` or `#RRGGBB`, normalizes to lowercase six-digit hex, and belongs to the teammate instance, not specialist frontmatter. A color requires a name. The roster freezes the creation-time color; later assignments inherit it, and a different color is rejected before model admission or execution allocation. Cold continuation takes identity only from the current team's roster, never automatically from the old team.
 
 ### Time budgets
 
@@ -145,7 +147,7 @@ Defaults:
 | `strictAgentFiles` | Strict mode fails loading on malformed files or validated invalid fields, naming the source path. Lenient mode skips unreadable/unparseable files, but corrects invalid fields with warnings while retaining the specialist. |
 | `fallbackSubagent` | Specialist name to use when requested type is unknown/disabled/ambiguous; `none` rejects. Empty/mistyped values default to `none`. |
 | `agentPanel` | Enables inline panel, Hub and remote child focus; no effect on lifecycle or automatic cleanup. |
-| `backend` | Multiplexer mode: `auto` (default) detects HerdR → tmux with a headless fallback; `headless` never attaches a multiplexer. Explicit `herdr`/`tmux` forcing is env-only. `/teams-backend [auto\|headless]` switches the mode for the current session (future launches only). |
+| `backend` | Presentation mode: `auto` (default) detects HerdR → tmux, otherwise no viewer; `headless` never attaches a multiplexer. Execution always uses independent native SDK workers. Explicit `herdr`/`tmux` forcing is env-only. `/teams-backend [auto\|headless]` switches selection for future children in the current session. |
 
 Both settings files are read at each `session_start`, merged per key (`project > global`), then sanitized. Missing/unreadable files contribute nothing; corrupt JSON warns and contributes nothing. Unknown keys are dropped and mistyped values use built-in defaults. Project values are not sanitized independently before overriding global values. The runtime only reads these files; operators own edits.
 
@@ -160,7 +162,7 @@ Selection precedence for new launches:
     > auto
 ```
 
-`auto` picks the first available launcher — HerdR, then tmux, then an independent headless process — so explicit herdr/tmux forcing is normally unnecessary. `/teams-backend` without arguments reports the current mode, what auto detects, and any active env override; switching affects only future launches (started children keep their launcher) and resets at the next session start. A forced unavailable launcher fails explicitly; launch failure does not silently switch implementation: Headless uses native SDK in its own child process, never the parent.
+`auto` selects the first available viewer launcher — HerdR, then tmux, otherwise no viewer. Every assignment executes through native SDK in its own independent headless child, never the parent. `/teams-backend` without arguments reports the current mode, auto detection and any env override; switching affects future children and resets at the next session start. Existing children keep their selected viewer launcher. Above six live runtime-owned children, every viewer closes; returning to at most six restores presentation without relaunching execution. A forced unavailable viewer launcher fails explicitly.
 
 Requires Node >=22.19, Unix sockets and Pi peers >=1.0.4 <1.1.0. Interactive launchers use the installed peer's CLI, not global `pi` from PATH. Headless supports the same parent Hub/focus without terminal attachment.
 
@@ -177,7 +179,7 @@ Artifacts use the nearest `.pi/` from the original configuration cwd (or its `.p
 
 Child ID differs from run ID. Cold continuation validates the saved bootstrap, prefers its saved model and opens the original native JSONL in a new child/run. Missing/corrupt bootstrap is an error, not a fallback to new context. Only a materialized JSONL is advertised as resumable history.
 
-After durable finalization, native settlement automatically closes the verified child/pane. Pending/failed cleanup must resolve before resume. Bootstrap/registry contain authentication metadata: private directories use `0700`, control/bootstrap/registry files use `0600`, and sockets use short private OS-temp paths. Live state/transcript/completion use RPC/events, never JSONL polling; JSONL supplies closed history/recovery.
+After durable finalization, anonymous settlement closes verified execution/viewer resources; named teammates retain idle execution until explicit release or session teardown. Pending/failed cleanup must resolve before cold resume. Bootstrap/registry contain authentication metadata, including separate optional viewer receipts: private directories use `0700`, control/bootstrap/registry files use `0600`, and sockets use short private OS-temp paths. Live state/transcript/completion use RPC/events, never JSONL polling; JSONL supplies closed history/recovery.
 
 Worktree completion preserves commits/dirty changes and retains the checkout. Review, test and manually cherry-pick before `/agents release <id> --worktree`. Release refuses dirty/unpreserved changes and retains preserved branches. A released/missing worktree is not silently recreated by resume.
 

@@ -14,8 +14,9 @@ function fixture() {
 	const areas = new Map<PaneTree, PaneGeometry>();
 	const painted = new Set<string>();
 	let tree: PaneTree = { paneId: "main" };
-	let rejectResize = false;
+	const focusedPaneId = "main";
 	let rejectMove = false;
+	let rejectResize = false;
 	function paint(node = tree, area: PaneGeometry = { paneId: "main", x: 0, y: 0, width: 120, height: 36 }): void {
 		if (node === tree) {
 			for (const id of painted) panes.delete(id);
@@ -118,6 +119,21 @@ function fixture() {
 					boundary[0].ratio += (height - pane.height) / boundary[1].height;
 					paint();
 				},
+				async resizeWidth(_parent, paneId, width) {
+					const pane = panes.get(paneId);
+					const boundary = [...areas.entries()].find(
+						([node, area]) =>
+							pane &&
+							!("paneId" in node) &&
+							node.direction === "right" &&
+							area.y === pane.y &&
+							area.height === pane.height &&
+							area.x + Math.round(area.width * node.ratio) === pane.x + pane.width,
+					);
+					if (!pane || !boundary || "paneId" in boundary[0]) throw new Error("No right boundary");
+					boundary[0].ratio += (width - pane.width) / boundary[1].width;
+					paint();
+				},
 			},
 			async (spec, plan) => {
 				await Promise.resolve();
@@ -138,6 +154,9 @@ function fixture() {
 		launcher,
 		panes,
 		owners,
+		focusedPaneId() {
+			return focusedPaneId;
+		},
 		rejectNextResize() {
 			rejectResize = true;
 		},
@@ -226,52 +245,76 @@ describe("managed terminal pane column", () => {
 			["d", 12],
 		]);
 	});
-	it("opens a second and third full-height column instead of stacking a fourth child", async () => {
-		const state = fixture();
-		const launcher = state.launcher();
-		await Promise.all(["a", "b", "c", "d", "e", "f", "g"].map((id) => launcher.launch(spec(id))));
-		expect(geometry(state.panes)).toEqual([
-			{ paneId: "main", x: 0, y: 0, width: 60, height: 36 },
-			{ paneId: "a", x: 60, y: 0, width: 30, height: 12 },
-			{ paneId: "b", x: 60, y: 12, width: 30, height: 12 },
-			{ paneId: "c", x: 60, y: 24, width: 30, height: 12 },
-			{ paneId: "d", x: 90, y: 0, width: 15, height: 12 },
-			{ paneId: "e", x: 90, y: 12, width: 15, height: 12 },
-			{ paneId: "f", x: 90, y: 24, width: 15, height: 12 },
-			{ paneId: "g", x: 105, y: 0, width: 15, height: 36 },
-		]);
+	it("keeps one child column through three viewers, then balances two columns through six", async () => {
+		for (const count of [1, 2, 3, 4, 5, 6]) {
+			const state = fixture();
+			const launcher = state.launcher();
+			const handles = await Promise.all(
+				["a", "b", "c", "d", "e", "f"].slice(0, count).map((id) => launcher.launch(spec(id))),
+			);
+			const panes = geometry(state.panes);
+			const main = panes.find((pane) => pane.paneId === "main");
+			const children = panes.filter((pane) => pane.paneId !== "main");
+			const childColumns = [...new Set(children.map((pane) => pane.x))];
+			expect(main?.width).toBe(count > 3 ? 40 : 60);
+			expect(childColumns).toHaveLength(count > 3 ? 2 : 1);
+			expect(children.map((pane) => pane.paneId).sort()).toEqual(["a", "b", "c", "d", "e", "f"].slice(0, count).sort());
+			const columnSizes = childColumns.map((x) => children.filter((pane) => pane.x === x).length);
+			expect(Math.max(...columnSizes) - Math.min(...columnSizes)).toBeLessThanOrEqual(1);
+			expect(state.focusedPaneId()).toBe("main");
+			expect(children.every((pane) => pane.width === main?.width)).toBe(true);
+			for (const handle of handles) await launcher.terminate(handle);
+			expect(geometry(state.panes)).toEqual([{ paneId: "main", x: 0, y: 0, width: 120, height: 36 }]);
+		}
 	});
-	it("restores multiple columns, fills a vacancy, and collapses an emptied column without compacting other children", async () => {
+	it("refuses a seventh viewer without allocating a pane or altering existing geometry", async () => {
 		const state = fixture();
-		const first = state.launcher();
-		const handles = await Promise.all(["a", "b", "c", "d", "e", "f"].map((id) => first.launch(spec(id))));
 		const launcher = state.launcher();
-		for (const handle of handles) launcher.restore?.(JSON.parse(JSON.stringify(handle)) as LauncherHandle);
-		const g = await launcher.launch(spec("g"));
-		const b = handles[1];
-		if (!b) throw new Error("Fixture lost its second child");
-		await launcher.terminate(b);
-		const otherColumns = geometry(state.panes)
-			.filter((pane) => pane.x >= 90)
-			.map((pane) => ({ ...pane }));
-		const h = await launcher.launch(spec("h"));
+		const handles = await Promise.all(["a", "b", "c", "d", "e", "f"].map((id) => launcher.launch(spec(id))));
+		const before = geometry(state.panes);
+		await expect(launcher.launch(spec("g"))).rejects.toThrow("at most six visible children");
+		expect(geometry(state.panes)).toEqual(before);
+		expect(state.focusedPaneId()).toBe("main");
+		for (const handle of handles) await launcher.terminate(handle);
+	});
+	it("rebalances the three/four boundary without replacing surviving panes", async () => {
+		const state = fixture();
+		const launcher = state.launcher();
+		const handles = await Promise.all(["a", "b", "c", "d"].map((id) => launcher.launch(spec(id))));
+		const originalPaneIds = handles.map((handle) => handle.paneId).sort();
+		const removed = handles[3];
+		if (!removed) throw new Error("Fixture lost its fourth child");
+		await launcher.terminate(removed);
 		expect(
 			geometry(state.panes)
-				.filter((pane) => pane.x === 60)
-				.map((pane) => [pane.paneId, pane.height]),
-		).toEqual([
-			["a", 12],
-			["c", 12],
-			["h", 12],
-		]);
-		expect(geometry(state.panes).filter((pane) => pane.x >= 90)).toEqual(otherColumns);
-		for (const handle of handles.slice(3)) await launcher.terminate(handle);
-		expect(state.panes.get("g")).toEqual({ paneId: "g", x: 90, y: 0, width: 30, height: 36 });
-		for (const handle of [handles[0], handles[2], g, h]) {
-			if (!handle) throw new Error("Fixture lost its surviving child");
-			await launcher.terminate(handle);
-		}
+				.map((pane) => pane.paneId)
+				.filter((id) => id !== "main")
+				.sort(),
+		).toEqual(originalPaneIds.slice(0, 3));
+		expect(
+			new Set(
+				geometry(state.panes)
+					.filter((pane) => pane.paneId !== "main")
+					.map((pane) => pane.x),
+			).size,
+		).toBe(1);
+		for (const handle of handles.slice(0, 3)) await launcher.terminate(handle);
 		expect(geometry(state.panes)).toEqual([{ paneId: "main", x: 0, y: 0, width: 120, height: 36 }]);
+	});
+	it("restores persisted membership and leaves foreign panes outside the managed region", async () => {
+		const state = fixture();
+		state.panes.set("unrelated", { paneId: "unrelated", x: 0, y: 40, width: 120, height: 20 });
+		const first = state.launcher();
+		const handles = await Promise.all(["a", "b", "c", "d"].map((id) => first.launch(spec(id))));
+		const restored = state.launcher();
+		for (const handle of handles) restored.restore?.(JSON.parse(JSON.stringify(handle)) as LauncherHandle);
+		const before = state.panes.get("unrelated");
+		const removed = handles[0];
+		if (!removed) throw new Error("No child pane was launched");
+		await restored.terminate(removed);
+		expect(state.panes.get("unrelated")).toEqual(before);
+		for (const handle of handles.slice(1)) await restored.terminate(handle);
+		expect(state.panes.get("unrelated")).toEqual(before);
 	});
 	it("rolls back a new column when reparenting fails before touching existing children", async () => {
 		const state = fixture();
@@ -281,7 +324,5 @@ describe("managed terminal pane column", () => {
 		state.rejectNextMove();
 		await expect(launcher.launch(spec("d"))).rejects.toThrow("Move refused");
 		expect(geometry(state.panes)).toEqual(before);
-		await launcher.launch(spec("e"));
-		expect(state.panes.get("e")).toEqual({ paneId: "e", x: 90, y: 0, width: 30, height: 36 });
 	});
 });

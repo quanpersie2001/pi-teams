@@ -6,7 +6,7 @@
 
 > Specialist agents in independent Pi processes — with live steering, native session history, and a shared Agents Hub.
 
-Delegate implementation, local exploration, external research, and code review without hosting child `AgentSession`s in the parent. Each agent runs in its own native Pi TUI or headless process.
+Delegate implementation, local exploration, external research, and code review without hosting child `AgentSession`s in the parent. Each agent executes in an independent native Pi SDK process; optional HerdR/tmux viewers present and control it without owning execution.
 
 [Install](#install) · [Quick start](#quick-start) · [Bundled agents](#bundled-agents) · [Configuration](#configuration) · [Documentation](#documentation) · [Related extensions](#related-extensions)
 
@@ -14,7 +14,7 @@ Delegate implementation, local exploration, external research, and code review w
 
 ## Features
 
-- **Independent execution** — native Pi TUIs in HerdR or tmux, with an independent headless worker when no terminal launcher is available.
+- **Independent execution** — native SDK workers with separate native Pi viewers in HerdR or tmux; presentation changes never restart execution.
 - **Live control** — launch, inspect, steer, and stop runs over an authenticated, owner-only Unix socket. Live state never depends on terminal input or JSONL polling.
 - **Opt-in time budgets** — optional `timeout`/`idle_timeout` limits in seconds hard-stop runaway children; the idle clock refreshes on child output only, and enforcement stops when the parent session shuts down.
 - **One Agents Hub** — Main and child conversations share navigation, while keeping drafts, scroll positions, and tool expansion independent.
@@ -112,7 +112,7 @@ Children do not inherit the parent's conversation automatically. For change revi
 
 Native menus, dialogs, and ordinary cursor movement retain their arrows. The document-start gestures (double Left, Down from an empty prompt) work alongside editor-styling extensions whose custom editor still preserves native `Editor` semantics (such as `pi-style`); with an opaque custom editor they defer and `/agents`/Alt+G remain the entry points. Child `/model <provider/id>` and `/thinking <level>` commands affect only the focused live child. Unsupported commands preserve the draft and report an error; `/compact` is intentionally unavailable because native compaction aborts the active turn.
 
-HerdR/tmux keep Main on the left and stack at most three children per right-hand column. New columns open as needed, and children reuse the earliest vacancy without compacting survivors. Layout changes preserve focus and unrelated panes; unverified ownership/geometry is rejected.
+HerdR/tmux count every live runtime-owned child, including unnamed active children and named idle teammates, excluding Main. Zero leaves Main alone; 1–3 use two horizontal partitions, with children stacked on the right; 4–6 use three equal horizontal partitions, with child rows 2+2, 3+2 and 3+3. Above six, all children are headless with no viewer panes. Returning to at most six restores viewers while preserving native execution PID, child ID, context and active assignment. Layout changes preserve focus and unrelated panes; unverified ownership/geometry is rejected.
 
 ### Model-facing tools
 
@@ -128,6 +128,7 @@ HerdR/tmux keep Main on the left and stack at most three children per right-hand
 | `team_task_get` | Read one current-team task by ID |
 
 Named teammates stay alive while idle. A new assignment under the same name reuses its native child and specialist role; mailbox messages start an assignment when idle or steer the active turn. The bridge watches its inbox automatically—models never poll. In the main composer, `@name message` routes directly to a live teammate; unresolved mentions retain normal inline behavior.
+`Agent(name: "review-api", color: "#e879f9")` sets an optional creation-time color (`#RGB` or `#RRGGBB`). Identity is stored in the team roster, not agent frontmatter. Later assignments inherit the existing color; attempts to change it fail before model admission. Native viewers and companion renderers receive the effective name/color; cold continuation never automatically restores another team's identity.
 Cold continuation from an older run is refused while another assignment retains that teammate's native child; assign the retained child or explicitly release it first.
 
 Mailboxes use one owner-only, HMAC-signed file per message under `.pi/teams/t/<team-id>/inboxes/<name>/`. Invalid entries are quarantined with a warning. Messages are untrusted content and cannot approve permissions. Files are consumed only after native injection; they survive runtime reload as artifacts, but never revive a stopped session's children.
@@ -155,7 +156,7 @@ Override operational settings in `.pi/teams.json` or globally in `~/.pi/agent/te
 }
 ```
 
-`backend` selects the multiplexer mode: `auto` (default) detects HerdR → tmux and falls back to headless; `headless` never attaches a multiplexer. Launcher precedence for new launches: `/teams-backend <mode>` (current session) > `PI_TEAMS_BACKEND` > settings `backend` > `auto`. The env variable does not override a session switch, and switching affects only new launches — running children keep their launcher. Auto tries HerdR, then tmux, then an independent headless child. A forced unavailable launcher fails explicitly.
+`backend` selects presentation: `auto` (default) detects HerdR → tmux and falls back to no viewer; `headless` never attaches a multiplexer. Precedence for new children: `/teams-backend <mode>` (current session) > `PI_TEAMS_BACKEND` > settings `backend` > `auto`. The env variable does not override a session switch, and switching affects only new children. Existing children retain their selected viewer launcher, subject to the all-headless threshold above six. Every child executes headlessly regardless of presentation. A forced unavailable viewer launcher fails explicitly.
 
 Global paths follow Pi's agent-directory override. Settings merge per key with project values winning. Agent definitions resolve in this order:
 
@@ -208,7 +209,7 @@ Behavior:
 
 - Clocks start immediately before the actual launch or resume — not during admission, queueing, or worktree preparation.
 - Only child output refreshes the idle clock: new or streaming assistant messages and completed tool results. Steering, inbox/status refreshes, tool starts, and partial tool updates do not; one long tool call can legitimately hit the idle limit.
-- Expiry aborts the child; if it has not settled after 2 seconds, the parent terminates the owned child through the launcher — headless escalates `SIGTERM` → `SIGKILL`, while HerdR/tmux use their own verified pane termination. Refusal or unverifiable ownership surfaces a visible `recoveryError` with a retained receipt, not a successful stop, and proving exit can take longer than the budget itself.
+- Expiry aborts the child; if it has not settled after 2 seconds, the parent terminates the owned headless execution process (`SIGTERM` → `SIGKILL`) and closes its verified viewer. Refusal or unverifiable ownership surfaces a visible `recoveryError` with a retained receipt, not a successful stop, and proving exit can take longer than the budget itself.
 - Budgets are enforced by the parent's watcher. A transient child-transport disconnect does not stop the live watcher. Session shutdown now tears children down (session-bound lifetime), so budgets do not outlive the session either.
 - The result identifies the exhausted budget and its seconds and warns that partial work may be incomplete.
 - Resume by passing `resume: "<run-id>"` to `Agent`: saved limits re-apply on fresh clocks, with positive `timeout`/`idle_timeout` overrides winning per field. Resuming a plain `pi --session` transcript bypasses tracked budgets. There is no automatic resume, and children do not automatically inherit the parent conversation (you can supply needed context in `prompt`).
@@ -244,7 +245,7 @@ Worktree runs retain commits/checkouts for manual review and cherry-pick. Cleanu
 
 Cleanup refuses dirty/unpreserved changes and retains preserved branches. There is no automatic merge, cherry-pick, or force-prune. Worktrees isolate filesystems, not tools running as the same OS user.
 
-Settled children/process panes close after durable finalization. Closed rows leave the inline panel but remain in Hub history. Uncertain cleanup stays visible and retains its receipt; resume requires persisted native history and starts a new child process.
+Anonymous children and their viewers close after durable finalization; named teammates retain idle execution until explicit release or session teardown. Closed rows leave the inline panel but remain in Hub history. Uncertain cleanup stays visible and retains its receipt; cold resume requires persisted native history and starts a new execution process.
 
 ---
 

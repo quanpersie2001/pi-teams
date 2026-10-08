@@ -6,7 +6,7 @@
 // disk are untouched), unlike registry rows which are never rewritten.
 
 import { randomBytes } from "node:crypto";
-import { deriveTeamId, type TeamRoster, upsertMember } from "../domain/team.js";
+import { deriveTeamId, ensureMemberIdentity, type TeamRoster, upsertMember } from "../domain/team.js";
 
 /** Durable roster adapter; implementations write atomically with owner-only permissions. */
 export interface TeamStore {
@@ -71,12 +71,31 @@ export class TeamService {
 		return this.roster;
 	}
 
+	/** Rejects a changed color before admission without changing the roster. */
+	assertIdentityColor(name: string, color: string | undefined): void {
+		const member = this.roster?.members.find((candidate) => candidate.name === name);
+		if (member && color !== undefined && member.color !== color)
+			throw new Error(
+				`Teammate "@${name}" already has color ${member.color ?? "the default"}; its identity color cannot change.`,
+			);
+	}
+
+	/** Freeze a new identity before allocating a run or child resource. */
+	ensureIdentity(identity: { name: string; type: string; color?: string }): string | undefined {
+		if (!this.roster) return identity.color;
+		const ensured = ensureMemberIdentity(this.roster, identity, this.now());
+		if (ensured.roster !== this.roster) {
+			this.roster = ensured.roster;
+			this.persist();
+		}
+		return ensured.color;
+	}
+
 	/**
-	 * Record one admitted assignment (a run spawned under a teammate name).
-	 * Teammates persist across assignments until the session ends, so a
-	 * settled name gains a new run instead of a new member.
+	 * Record an admitted assignment against its already-frozen member identity.
+	 * Teammates persist across assignments until the session ends.
 	 */
-	recordAssignment(assignment: { name: string; type: string; runId: string }): void {
+	recordAssignment(assignment: { name: string; type: string; runId: string; color?: string }): void {
 		if (!this.roster) return;
 		this.roster = upsertMember(this.roster, { ...assignment, at: this.now() });
 		this.persist();

@@ -104,7 +104,12 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 	let mailbox: MailboxService | undefined;
 	manager.subscribe((event) => {
 		if (event.event !== "started" || event.teammateName === undefined) return;
-		teams?.recordAssignment({ name: event.teammateName, type: event.type, runId: event.agentId });
+		teams?.recordAssignment({
+			name: event.teammateName,
+			type: event.type,
+			runId: event.agentId,
+			...(event.teammateColor !== undefined ? { color: event.teammateColor } : {}),
+		});
 	});
 
 	// Owner-aware completion delivery. Subscribes to the same

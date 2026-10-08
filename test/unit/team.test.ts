@@ -3,7 +3,9 @@
 import { describe, expect, it } from "vitest";
 import {
 	deriveTeamId,
+	ensureMemberIdentity,
 	LEAD_ADDRESS,
+	normalizeTeammateColor,
 	type TeamRoster,
 	teammateNameProblem,
 	upsertMember,
@@ -22,6 +24,12 @@ describe("teammate names", () => {
 		expect(teammateNameProblem("-nope")).toBeDefined();
 		expect(teammateNameProblem("has space")).toBeDefined();
 		expect(teammateNameProblem("x".repeat(65))).toBeDefined();
+	});
+	it("normalizes teammate colors like pi-style and rejects non-RGB values", () => {
+		expect(normalizeTeammateColor(" #AbC ")).toBe("#aabbcc");
+		expect(normalizeTeammateColor("#12ABef")).toBe("#12abef");
+		expect(normalizeTeammateColor("red")).toBeUndefined();
+		expect(normalizeTeammateColor("#abcd")).toBeUndefined();
 	});
 });
 
@@ -50,5 +58,20 @@ describe("upsertMember", () => {
 		});
 		// Input roster untouched (pure).
 		expect(first.members[0]?.lastRunId).toBe("run-1");
+	});
+	it("freezes member identity color across assignments", () => {
+		const created = ensureMemberIdentity(roster(), { name: "scout", type: "scout", color: "#abcdef" }, 5);
+		expect(created.color).toBe("#abcdef");
+		const reassigned = upsertMember(created.roster, {
+			name: "scout",
+			type: "scout",
+			runId: "run-1",
+			at: 10,
+		});
+		expect(reassigned.members[0]).toMatchObject({ name: "scout", color: "#abcdef", lastRunId: "run-1" });
+		expect(ensureMemberIdentity(reassigned, { name: "scout", type: "scout" }, 20).color).toBe("#abcdef");
+		expect(() => ensureMemberIdentity(reassigned, { name: "scout", type: "scout", color: "#123456" }, 30)).toThrow(
+			/cannot change/,
+		);
 	});
 });

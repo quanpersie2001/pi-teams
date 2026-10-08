@@ -11,6 +11,7 @@ import {
 	parseChildBootstrap,
 	startChildBridge,
 } from "../../extension-src/pi-teams/pi/child-bridge.js";
+import { deriveViewerToken } from "../../extension-src/pi-teams/pi/child-rpc-auth.js";
 import { ChildRpcClient } from "../../extension-src/pi-teams/pi/child-rpc-client.js";
 
 const TOKEN = "bridge-test-secret-token";
@@ -115,6 +116,13 @@ describe("child bridge over an owner-only Unix socket", () => {
 		const connectionTransitions: boolean[] = [];
 		first.subscribeConnection((connected) => connectionTransitions.push(connected));
 		clients.push(first, second, intruder);
+		const viewer = new ChildRpcClient({
+			socketPath: bootstrap.socketPath,
+			childId: bootstrap.childId,
+			token: deriveViewerToken(bootstrap.childId, TOKEN),
+			role: "viewer",
+		});
+		clients.push(viewer);
 		const initialConnection = first.connect();
 		void initialConnection.catch(() => undefined); // Awaited below after the server starts.
 		const childBridge = await startChildBridge(bootstrap, host);
@@ -123,6 +131,21 @@ describe("child bridge over an owner-only Unix socket", () => {
 		await expect(intruder.connect()).rejects.toMatchObject({ code: "unauthorized" });
 		const initial = await initialConnection;
 		await second.connect();
+		await viewer.connect();
+		const elevatedViewer = new ChildRpcClient({
+			socketPath: bootstrap.socketPath,
+			childId: bootstrap.childId,
+			token: deriveViewerToken(bootstrap.childId, TOKEN),
+			role: "owner",
+		});
+		clients.push(elevatedViewer);
+		await expect(elevatedViewer.connect()).rejects.toMatchObject({ code: "unauthorized" });
+		await expect(viewer.shutdown()).rejects.toMatchObject({ code: "forbidden" });
+		await expect(viewer.prompt("viewer-bypass", "Must not bypass parent admission")).rejects.toMatchObject({
+			code: "forbidden",
+		});
+		viewer.disconnect();
+		expect(shutdownCalls).toBe(0);
 		expect(initial.transcript.cursor).toBe(history.length);
 		expect(initial.transcript.offset).toBeGreaterThan(0);
 		expect(initial.transcript.offset + initial.transcript.items.length).toBe(initial.transcript.cursor);

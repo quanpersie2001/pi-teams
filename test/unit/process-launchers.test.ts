@@ -61,7 +61,7 @@ function tmuxHarness(): Harness {
 			if (commandArgs[0] === "list-panes") {
 				if (commandArgs.includes("#{pane_id}"))
 					return { stdout: splitCreated && !paneMissing ? "%0\n%7\n" : "%0\n", stderr: "" };
-				const stdout = splitCreated && !paneMissing ? "%0 0 0 59 40\n%7 60 0 60 40\n" : "%0 0 0 120 40\n";
+				const stdout = splitCreated && !paneMissing ? "%0 0 0 60 40\n%7 61 0 59 40\n" : "%0 0 0 120 40\n";
 				return { stdout, stderr: "" };
 			}
 			if (commandArgs[0] === "split-window") {

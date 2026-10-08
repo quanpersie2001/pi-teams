@@ -14,6 +14,7 @@ import type {
 	PersistedRegistryEntry,
 	SubagentRunStore,
 } from "../../extension-src/pi-teams/app/run-registry.js";
+import { TeamService } from "../../extension-src/pi-teams/app/team-service.js";
 import type { SubagentsSettings } from "../../extension-src/pi-teams/domain/config.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
 import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
@@ -401,19 +402,30 @@ describe("AgentManager resume", () => {
 		const fixture = makeManager();
 		await load(fixture);
 
-		const original = await spawnBg(fixture.manager);
+		const original = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "scout",
+			color: "#abcdef",
+			prompt: "work",
+			run_in_background: true,
+		});
+		expect(original.teammateColor).toBe("#abcdef");
 		await settle(fixture.manager, 20);
-		fixture.backend.complete(original.id, "done", "/tmp/sessions/orig.jsonl");
+		fixture.backend.complete(original.id, "original outcome", "/tmp/sessions/orig.jsonl");
 		await fixture.manager.whenSettled(original.id);
+		await fixture.manager.release(original.id);
 
 		const resumed = await fixture.manager.resume(original.id, "keep going");
 		expect(resumed.id).not.toBe(original.id);
+		expect(resumed.teammateName).toBe("scout");
+		expect(resumed.teammateColor).toBe("#abcdef");
 		await settle(fixture.manager, 30);
 
-		expect(fixture.backend.resumes).toHaveLength(1);
-		expect(fixture.backend.resumes[0]?.sessionFile).toBe("/tmp/sessions/orig.jsonl");
-		expect(fixture.backend.resumes[0]?.prompt).toBe("keep going");
-		expect(fixture.manager.get(original.id)?.status).toBe("completed");
+		expect(fixture.manager.get(resumed.id)?.status).toBe("running");
+		fixture.backend.complete(resumed.id, "continued outcome");
+		await fixture.manager.whenSettled(resumed.id);
+		expect(fixture.manager.get(original.id)).toMatchObject({ status: "completed", result: "original outcome" });
+		expect(fixture.manager.get(resumed.id)).toMatchObject({ status: "completed", result: "continued outcome" });
 	});
 });
 
@@ -448,7 +460,7 @@ describe("AgentManager terminal cleanup failures", () => {
 });
 
 describe("AgentManager pane attachment capability", () => {
-	it("advertises native-pane attachment only for an owned native launcher handle", async () => {
+	it("reports attachment from live viewer availability, not execution launcher kind", async () => {
 		const headless = makeManager();
 		await load(headless);
 		const headlessRun = await spawnBg(headless.manager);
@@ -457,8 +469,11 @@ describe("AgentManager pane attachment capability", () => {
 		expect(await headless.manager.attachPane(headlessRun.id)).toBe(false);
 
 		const native = makeManager();
-		native.backend.launcherKind = "tmux";
+		native.backend.launcherKind = "headless";
+		native.backend.setViewer(true);
 		await load(native);
+		const capabilityEvents: string[] = [];
+		native.manager.subscribePresentation((agentId) => capabilityEvents.push(agentId));
 		const nativeRun = await spawnBg(native.manager);
 		await settle(native.manager);
 		expect(native.manager.canAttachPane(nativeRun.id)).toBe(true);
@@ -466,6 +481,7 @@ describe("AgentManager pane attachment capability", () => {
 		native.backend.complete(nativeRun.id, "finished");
 		await native.manager.whenSettled(nativeRun.id);
 		expect(native.manager.canAttachPane(nativeRun.id)).toBe(false);
+		expect(capabilityEvents).toContain(nativeRun.id);
 	});
 });
 
@@ -657,6 +673,79 @@ describe("teammate names (ADR 0007 §2)", () => {
 			run_in_background: true,
 		});
 		expect(fixture.manager.get(next.id)?.teammateName).toBe("scout");
+	});
+	it("freezes normalized teammate color and rejects changes before model admission", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		await expect(
+			fixture.manager.spawn({
+				type: "general-purpose",
+				color: "#abc",
+				prompt: "missing name",
+				run_in_background: true,
+			}),
+		).rejects.toThrow(/requires a named teammate/);
+		expect(fixture.backend.admissions).toHaveLength(0);
+		let stored: string | undefined;
+		const team = new TeamService({
+			sessionId: "session-main",
+			now: () => 5,
+			store: {
+				teamDir: "/tmp/team",
+				readRoster: () => (stored === undefined ? undefined : JSON.parse(stored)),
+				writeRoster: (roster) => {
+					stored = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+
+		const first = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "scout",
+			color: " #AbC ",
+			prompt: "first",
+			run_in_background: true,
+		});
+		expect(first.teammateColor).toBe("#aabbcc");
+		expect(team.current?.members).toMatchObject([{ name: "scout", color: "#aabbcc" }]);
+		await settle(fixture.manager);
+		expect(fixture.events.find((event) => event.event === "started")).toMatchObject({
+			teammateName: "scout",
+			teammateColor: "#aabbcc",
+		});
+		expect(fixture.backend.launches[0]?.team).toMatchObject({
+			teammateName: "scout",
+			teammateColor: "#aabbcc",
+		});
+		fixture.backend.complete(first.id, "done");
+		await fixture.manager.whenSettled(first.id);
+
+		const next = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "scout",
+			prompt: "again",
+			run_in_background: true,
+		});
+		expect(next.teammateColor).toBe("#aabbcc");
+		await settle(fixture.manager);
+		fixture.backend.complete(next.id, "done");
+		await fixture.manager.whenSettled(next.id);
+
+		const admissions = fixture.backend.admissions.length;
+		const launches = fixture.backend.launches.length;
+		await expect(
+			fixture.manager.spawn({
+				type: "general-purpose",
+				name: "scout",
+				color: "#123456",
+				prompt: "changed",
+				run_in_background: true,
+			}),
+		).rejects.toThrow(/cannot change/);
+		expect(fixture.backend.admissions).toHaveLength(admissions);
+		expect(fixture.backend.launches).toHaveLength(launches);
 	});
 });
 

@@ -13,6 +13,7 @@ export interface TeamBootstrapContext {
 	teamDir: string;
 	teamKey: string;
 	teammateName: string;
+	teammateColor?: string;
 }
 
 /** Input for launching a specialist agent in a child process. */
@@ -119,6 +120,12 @@ export interface AgentExecutionBackend {
 		input: { runId: string; prompt: string; maxTurns?: number; graceTurns?: number },
 	): Promise<AgentBackendHandle>;
 	attach?(handle: AgentBackendHandle): Promise<boolean>;
+	/** True only when a separate owned presentation viewer currently exists. */
+	hasViewer?(handle: AgentBackendHandle): boolean;
+	/** Notify when this run's optional viewer opens or closes. */
+	subscribePresentation?(handle: AgentBackendHandle, listener: (available: boolean) => void): () => void;
+	/** Suppress viewer recreation while the owning session is tearing down. */
+	setPresentationActive?(active: boolean): void;
 	dispose(handle: AgentBackendHandle): Promise<void>;
 	detach(handle: AgentBackendHandle): void;
 	/**

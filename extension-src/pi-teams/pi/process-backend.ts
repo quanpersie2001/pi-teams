@@ -23,6 +23,7 @@ import type { BackendMode, BackendSelector } from "../domain/config.js";
 import type { LauncherHandle, ProcessLauncher } from "../domain/process-launcher.js";
 import { ProcessLaunchCleanupPendingError } from "../domain/process-launcher.js";
 import type { TranscriptSnapshot } from "../domain/transcript.js";
+import { deriveViewerToken } from "./child-rpc-auth.js";
 import { ChildRpcClient } from "./child-rpc-client.js";
 import { createModelAdmission } from "./model-admission.js";
 import { createProcessLaunchers } from "./process-launchers.js";
@@ -36,11 +37,15 @@ interface ChildConnection {
 	runDir: string;
 	launcher: ProcessLauncher;
 	launcherHandle: LauncherHandle;
+	presentationLauncher?: ProcessLauncher;
+	viewerHandle?: LauncherHandle;
+	viewerBootstrapFile?: string;
 	modelFallback?: string;
 	client: ChildRpcClient;
 	snapshot?: ChildState;
 	connected: boolean;
 	detached: boolean;
+	presentationListeners: Set<(available: boolean) => void>;
 	closed: boolean;
 	identityFailure?: ChildProtocolError;
 	refreshing: boolean;
@@ -64,7 +69,7 @@ export interface ProcessBackendOptions {
 	launchers?: readonly ProcessLauncher[];
 	connectTimeoutMs?: number;
 	/** Built runtime entrypoints; overridable for independently launched integration fixtures. */
-	entryPaths?: { bridge: string; headless: string };
+	entryPaths?: { bridge: string; headless: string; viewer?: string };
 	piCommand?: string;
 	agentDir?: string;
 	getParentModel?: () => string | undefined;
@@ -89,17 +94,19 @@ export function resolveSessionLauncherHint(env: NodeJS.ProcessEnv, settingsBacke
 	return settingsBackend;
 }
 
-function entryPaths(): { bridge: string; headless: string } {
+function entryPaths(): { bridge: string; headless: string; viewer: string } {
 	const adjacent = {
 		bridge: fileURLToPath(new URL("./child-bridge.js", import.meta.url)),
 		headless: fileURLToPath(new URL("./headless-child.js", import.meta.url)),
+		viewer: fileURLToPath(new URL("./child-viewer.js", import.meta.url)),
 	};
-	if (existsSync(adjacent.bridge) && existsSync(adjacent.headless)) return adjacent;
+	if (existsSync(adjacent.bridge) && existsSync(adjacent.headless) && existsSync(adjacent.viewer)) return adjacent;
 	const built = {
 		bridge: fileURLToPath(new URL("../../../dist/extensions/child-bridge.js", import.meta.url)),
 		headless: fileURLToPath(new URL("../../../dist/extensions/headless-child.js", import.meta.url)),
+		viewer: fileURLToPath(new URL("../../../dist/extensions/child-viewer.js", import.meta.url)),
 	};
-	if (!existsSync(built.bridge) || !existsSync(built.headless))
+	if (!existsSync(built.bridge) || !existsSync(built.headless) || !existsSync(built.viewer))
 		throw new Error("Child runtime is not built. Run npm run build before launching subagents.");
 	return built;
 }
@@ -111,6 +118,9 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	private readonly options: ProcessBackendOptions;
 	private readonly admitModel: (input: ModelAdmissionInput) => Promise<ModelAdmission>;
 	private launcherHint: BackendSelector;
+	private readonly pendingChildren = new Set<string>();
+	private presentationQueue: Promise<void> = Promise.resolve();
+	private presentationActive = true;
 
 	constructor(options: ProcessBackendOptions = {}) {
 		this.options = options;
@@ -128,6 +138,9 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	/** Replace the launcher hint for future launches; started children keep theirs. */
 	setLauncherHint(hint: BackendSelector): void {
 		this.launcherHint = hint;
+	}
+	setPresentationActive(active: boolean): void {
+		this.presentationActive = active;
 	}
 	/** Launcher kind the current hint resolves to; rejects when none is available. */
 	async detectLauncherKind(): Promise<ProcessLauncher["kind"]> {
@@ -152,6 +165,115 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		}
 		throw new Error(`No available process launcher for "${hint}".`);
 	}
+	private async withPresentationLock<T>(operation: () => Promise<T>): Promise<T> {
+		const previous = this.presentationQueue;
+		let release!: () => void;
+		this.presentationQueue = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await operation();
+		} finally {
+			release();
+		}
+	}
+
+	private livingChildCount(): number {
+		let count = this.pendingChildren.size;
+		for (const [id, child] of this.children) if (!child.closed && !this.pendingChildren.has(id)) count += 1;
+		return count;
+	}
+
+	private async openViewer(child: ChildConnection): Promise<void> {
+		if (child.closed || child.viewerHandle || !child.presentationLauncher) return;
+		const paths = this.options.entryPaths ?? entryPaths();
+		if (!paths.viewer) throw new Error("Built child viewer runtime entrypoint is unavailable.");
+		const viewerBootstrapFile = join(child.runDir, "viewer-bootstrap.json");
+		writeFileSync(
+			viewerBootstrapFile,
+			JSON.stringify({
+				childId: child.bootstrap.childId,
+				token: deriveViewerToken(child.bootstrap.childId, child.bootstrap.token),
+				socketPath: child.bootstrap.socketPath,
+				cwd: child.bootstrap.cwd,
+				teammateName: child.bootstrap.teammateName,
+				teammateColor: child.bootstrap.teammateColor,
+				teamDir: child.bootstrap.teamDir,
+				teamKey: child.bootstrap.teamKey,
+			}),
+			{ mode: 0o600 },
+		);
+		const viewerSessionDir = join(child.runDir, "viewer-session");
+		mkdirSync(viewerSessionDir, { recursive: true, mode: 0o700 });
+		const viewerId = `${child.bootstrap.childId}-viewer`;
+		const command = this.options.piCommand
+			? [this.options.piCommand]
+			: [
+					process.execPath,
+					fileURLToPath(new URL("./bundle/cli.js", import.meta.resolve("@earendil-works/pi-coding-agent"))),
+				];
+		try {
+			child.viewerHandle = await child.presentationLauncher.launch({
+				childId: viewerId,
+				runDir: child.runDir,
+				cwd: child.bootstrap.cwd,
+				env: { PI_TEAMS_VIEWER: "1", PI_TEAMS_VIEWER_BOOTSTRAP: viewerBootstrapFile },
+				interactiveArgv: [
+					...command,
+					"--no-extensions",
+					"--extension",
+					paths.viewer,
+					"--session-dir",
+					viewerSessionDir,
+				],
+				headlessCommand: process.execPath,
+				headlessArgv: [],
+			});
+			child.viewerBootstrapFile = viewerBootstrapFile;
+			for (const listener of [...child.presentationListeners]) listener(true);
+		} catch (error) {
+			rmSync(viewerBootstrapFile, { force: true });
+			throw error;
+		}
+	}
+
+	private async closeViewer(child: ChildConnection): Promise<void> {
+		const handle = child.viewerHandle;
+		const launcher = child.presentationLauncher;
+		if (!handle || !launcher) return;
+		try {
+			await launcher.terminate(handle);
+		} catch (error) {
+			if (!(await launcher.cleanupExited(handle).catch(() => false))) throw error;
+		}
+		delete child.viewerHandle;
+		if (child.viewerBootstrapFile) rmSync(child.viewerBootstrapFile, { force: true });
+		delete child.viewerBootstrapFile;
+		for (const listener of [...child.presentationListeners]) listener(false);
+	}
+
+	private async reconcilePresentationLocked(): Promise<void> {
+		const withinThreshold = this.livingChildCount() <= 6;
+		for (const child of this.children.values()) {
+			if (child.closed || !child.presentationLauncher) continue;
+			if (child.viewerHandle) {
+				const exited = (await child.presentationLauncher.alive(child.viewerHandle).catch(() => undefined)) === false;
+				if (exited && (await child.presentationLauncher.cleanupExited(child.viewerHandle).catch(() => false))) {
+					delete child.viewerHandle;
+					if (child.viewerBootstrapFile) rmSync(child.viewerBootstrapFile, { force: true });
+					delete child.viewerBootstrapFile;
+					for (const listener of [...child.presentationListeners]) listener(false);
+				}
+			}
+			if (!this.presentationActive || !withinThreshold) await this.closeViewer(child);
+			else if (!child.viewerHandle) await this.openViewer(child);
+		}
+	}
+
+	private async reconcilePresentation(): Promise<void> {
+		await this.withPresentationLock(() => this.reconcilePresentationLocked());
+	}
 
 	async launch(input: AgentLaunchInput): Promise<AgentBackendHandle> {
 		return this.launchChild(input);
@@ -167,9 +289,12 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			model: admission.model,
 			...(admission.fallback !== undefined ? { modelFallback: admission.fallback } : {}),
 		};
-		const launcher = await this.chooseLauncher();
+		const configuredLauncher = await this.chooseLauncher();
+		const launcher = this.launchers.find((candidate) => candidate.kind === "headless");
+		if (!launcher) throw new Error("Native headless execution launcher is unavailable.");
 		const paths = this.options.entryPaths ?? entryPaths();
 		const childId = randomUUID();
+		const presentationLauncher = configuredLauncher.kind !== "headless" ? configuredLauncher : undefined;
 		const runDir = join(teamsArtifactDir(input.configCwd), "sessions", childId);
 		mkdirSync(runDir, { recursive: true, mode: 0o700 });
 		chmodSync(runDir, 0o700);
@@ -203,6 +328,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 						teamDir: input.team.teamDir,
 						teamKey: input.team.teamKey,
 						teammateName: input.team.teammateName,
+						...(input.team.teammateColor !== undefined ? { teammateColor: input.team.teammateColor } : {}),
 					}
 				: {}),
 		};
@@ -215,6 +341,10 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		let handle: LauncherHandle | undefined;
 		let child: ChildConnection | undefined;
 		try {
+			await this.withPresentationLock(async () => {
+				this.pendingChildren.add(childId);
+				await this.reconcilePresentationLocked();
+			});
 			const command = this.options.piCommand
 				? [this.options.piCommand]
 				: [
@@ -246,6 +376,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				runDir,
 				launcher,
 				launcherHandle: handle,
+				...(presentationLauncher ? { presentationLauncher } : {}),
 				...(input.modelFallback !== undefined ? { modelFallback: input.modelFallback } : {}),
 				client,
 				snapshot,
@@ -257,10 +388,16 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				unlisten: [],
 				focusListeners: new Set(),
 				assignmentListeners: new Set(),
+				presentationListeners: new Set(),
 				pendingAssignments: [],
 			};
 			this.verifyChildPid(handle, snapshot);
-			this.children.set(childId, child);
+			const registeredChild = child;
+			await this.withPresentationLock(async () => {
+				this.children.set(childId, registeredChild);
+				this.pendingChildren.delete(childId);
+				await this.reconcilePresentationLocked();
+			});
 			this.watchChild(child);
 			const run = this.createRun(input.runId, child);
 			await client.prompt(input.runId, input.prompt);
@@ -313,12 +450,21 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				}
 			}
 			if (child) {
+				try {
+					await this.closeViewer(child);
+				} catch (cleanupError) {
+					throw new AggregateError([failure, cleanupError], "Child launch failed and viewer cleanup was not verified.");
+				}
 				this.releaseChild(child);
 				this.children.delete(childId);
 				this.runs.delete(input.runId);
 			} else {
 				rmSync(controlDir, { recursive: true, force: true });
 			}
+			await this.withPresentationLock(async () => {
+				this.pendingChildren.delete(childId);
+				await this.reconcilePresentationLocked();
+			});
 			throw failure;
 		}
 	}
@@ -428,6 +574,9 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 									error: "Child process exited before an RPC outcome was recovered.",
 									detail: "Child process exited before an RPC outcome was recovered.",
 								});
+						await this.closeViewer(child);
+						this.releaseChild(child);
+						await this.reconcilePresentation();
 						return;
 					}
 					this.scheduleReconnect(child);
@@ -692,6 +841,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			if (isSettled(run.status)) return { ...run.status };
 		}
 		const snapshot = child.snapshot;
+		await this.closeViewer(child);
 		try {
 			await child.launcher.terminate(child.launcherHandle);
 		} catch (terminateError) {
@@ -707,6 +857,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			await child.launcher.forceKill(child.launcherHandle);
 		}
 		this.releaseChild(child);
+		await this.reconcilePresentation();
 		// The owned process group is gone: sibling runs sharing this child lost
 		// their resource; publish the verified-loss outcome honestly.
 		for (const other of this.runs.values()) {
@@ -766,12 +917,21 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		const transcript = run.child.snapshot?.transcript;
 		return transcript ? { ...transcript, items: [...transcript.items] } : { items: [], cursor: 0 };
 	}
+	hasViewer(handle: AgentBackendHandle): boolean {
+		return Boolean(this.requireRun(handle).child.viewerHandle);
+	}
+	subscribePresentation(handle: AgentBackendHandle, listener: (available: boolean) => void): () => void {
+		const child = this.requireRun(handle).child;
+		child.presentationListeners.add(listener);
+		listener(Boolean(child.viewerHandle));
+		return () => child.presentationListeners.delete(listener);
+	}
 	async attach(handle: AgentBackendHandle): Promise<boolean> {
 		const child = this.requireRun(handle).child;
 		if (child.closed) return false;
 		if (child.identityFailure) throw child.identityFailure;
-		if (!child.launcher.attach) return false;
-		await child.launcher.attach(child.launcherHandle);
+		if (!child.viewerHandle || !child.presentationLauncher?.attach) return false;
+		await child.presentationLauncher.attach(child.viewerHandle);
 		return true;
 	}
 	detach(handle: AgentBackendHandle): void {
@@ -791,7 +951,9 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			} catch (error) {
 				if (child.identityFailure) throw child.identityFailure;
 				if (await child.launcher.cleanupExited(child.launcherHandle)) {
+					await this.closeViewer(child);
 					this.releaseChild(child);
+					await this.reconcilePresentation();
 					return;
 				}
 				throw error;
@@ -801,7 +963,9 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		if (!child.connected || !child.snapshot) {
 			if (child.identityFailure) throw child.identityFailure;
 			if (await child.launcher.cleanupExited(child.launcherHandle)) {
+				await this.closeViewer(child);
 				this.releaseChild(child);
+				await this.reconcilePresentation();
 				return;
 			}
 			throw new Error("Cannot dispose a child without an authenticated current snapshot.");
@@ -810,8 +974,10 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			throw new Error("Cannot dispose a child while its native process is running another run.");
 		// Terminate while launcher identity is still verifiable. Headless SIGTERM
 		// closes the native session gracefully; an RPC shutdown first races PID exit.
+		await this.closeViewer(child);
 		await child.launcher.terminate(child.launcherHandle);
 		this.releaseChild(child);
+		await this.reconcilePresentation();
 	}
 	serializeHandle(handle: AgentBackendHandle, sessionFile?: string): SerializableBackendHandle | undefined {
 		const child = this.requireRun(handle).child;
@@ -823,6 +989,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			token: child.bootstrap.token,
 			runDir: child.runDir,
 			launcher: child.launcherHandle,
+			...(child.viewerHandle ? { viewer: child.viewerHandle } : {}),
 			...(sessionFile ? { sessionFile } : {}),
 		};
 	}
@@ -834,14 +1001,21 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		if (!existsSync(bootstrapFile)) return false;
 		const bootstrap = JSON.parse(readFileSync(bootstrapFile, "utf8")) as ChildBootstrap;
 		if (
-			serialized.launcher.kind !== launcher.kind ||
 			serialized.launcher.childId !== serialized.childId ||
 			bootstrap.childId !== serialized.childId ||
 			bootstrap.token !== serialized.token ||
-			bootstrap.socketPath !== serialized.socketPath
+			bootstrap.socketPath !== serialized.socketPath ||
+			(serialized.viewer !== undefined &&
+				(serialized.viewer.childId !== `${serialized.childId}-viewer` ||
+					(serialized.viewer.kind !== "herdr" && serialized.viewer.kind !== "tmux")))
 		)
 			return false;
 		launcher.restore?.(serialized.launcher);
+		const viewerLauncher = serialized.viewer
+			? this.launchers.find((candidate) => candidate.kind === serialized.viewer?.kind)
+			: undefined;
+		if (serialized.viewer && !viewerLauncher) return false;
+		if (serialized.viewer) viewerLauncher?.restore?.(serialized.viewer);
 		const client = new ChildRpcClient({
 			socketPath: serialized.socketPath,
 			childId: serialized.childId,
@@ -851,12 +1025,27 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		try {
 			const snapshot = await client.connect();
 			this.verifyChildPid(serialized.launcher, snapshot);
+			if (serialized.viewer && viewerLauncher) {
+				try {
+					await viewerLauncher.terminate(serialized.viewer);
+				} catch (error) {
+					if (!(await viewerLauncher.cleanupExited(serialized.viewer).catch(() => false))) throw error;
+				}
+			}
 			await launcher.terminate(serialized.launcher);
 			rmSync(dirname(serialized.socketPath), { recursive: true, force: true });
 			return true;
 		} catch (error) {
 			if (error instanceof ChildProtocolError && error.code === "identity_mismatch") throw error;
-			return launcher.cleanupExited(serialized.launcher);
+			if (!(await launcher.cleanupExited(serialized.launcher))) return false;
+			if (serialized.viewer && viewerLauncher) {
+				try {
+					await viewerLauncher.terminate(serialized.viewer);
+				} catch {
+					if (!(await viewerLauncher.cleanupExited(serialized.viewer).catch(() => false))) return false;
+				}
+			}
+			return true;
 		} finally {
 			client.disconnect();
 		}

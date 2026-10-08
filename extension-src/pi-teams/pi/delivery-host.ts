@@ -103,6 +103,7 @@ export function createPiDeliveryHost(pi: ExtensionAPI, getContext: () => Extensi
 					details: {
 						agentId: notification.agentId,
 						...(notification.teammateName !== undefined ? { teammateName: notification.teammateName } : {}),
+						...(notification.teammateColor !== undefined ? { color: notification.teammateColor } : {}),
 						description: notification.description,
 						status: notification.status,
 						outcome: notification.outcome,
@@ -120,7 +121,11 @@ export function createPiDeliveryHost(pi: ExtensionAPI, getContext: () => Extensi
 }
 
 /** Watch and inject lead mailbox messages as inert, provenance-labelled runtime messages. */
-export function installLeadMailbox(pi: ExtensionAPI, service: MailboxService): () => void {
+export function installLeadMailbox(
+	pi: ExtensionAPI,
+	service: MailboxService,
+	getTeammateColor?: (name: string) => string | undefined,
+): () => void {
 	mkdirSync(service.inboxDir, { recursive: true, mode: 0o700 });
 	chmodSync(service.inboxDir, 0o700);
 	let closed = false;
@@ -152,13 +157,19 @@ export function installLeadMailbox(pi: ExtensionAPI, service: MailboxService): (
 				if (messages.length > 0) drainAgain = true;
 				for (const message of messages) {
 					try {
+						const color = getTeammateColor?.(message.from);
 						pending.set(message.id, message);
 						pi.sendMessage(
 							{
 								customType: "teammate-message",
 								content: formatMailboxMessageForInjection(message),
 								display: true,
-								details: { messageId: message.id, from: message.from, untrusted: true },
+								details: {
+									messageId: message.id,
+									from: message.from,
+									untrusted: true,
+									...(color !== undefined ? { color } : {}),
+								},
 							},
 							{ deliverAs: "steer", triggerTurn: true },
 						);

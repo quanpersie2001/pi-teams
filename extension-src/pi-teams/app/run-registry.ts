@@ -18,6 +18,8 @@ export interface SerializableBackendHandle {
 	token: string;
 	runDir: string;
 	launcher: LauncherHandle;
+	/** Separate presentation pane; never the execution authority. */
+	viewer?: LauncherHandle;
 	sessionFile?: string;
 }
 
@@ -37,6 +39,8 @@ export interface AgentRegistryEntry {
 	description: string;
 	/** Teammate address this run was spawned under (ADR 0007 §2). */
 	teammateName?: string;
+	/** Effective teammate identity color, normalized to lowercase #RRGGBB. */
+	teammateColor?: string;
 	status: AgentRunStatus;
 	backend: "process";
 	handle?: SerializableBackendHandle;
@@ -141,6 +145,7 @@ export function toRegistryEntry(
 		isBackground: record.isBackground === true,
 	};
 	if (record.teammateName !== undefined) entry.teammateName = record.teammateName;
+	if (record.teammateColor !== undefined) entry.teammateColor = record.teammateColor;
 	if (record.handle !== undefined) {
 		const serialized = project?.(record.handle, record.sessionFile);
 		if (serialized !== undefined) entry.handle = serialized;
@@ -234,6 +239,16 @@ export function isSerializableBackendHandle(raw: unknown): raw is SerializableBa
 		typeof handle.launcher === "object" && handle.launcher !== null
 			? (handle.launcher as Record<string, unknown>)
 			: undefined;
+	const viewer =
+		typeof handle.viewer === "object" && handle.viewer !== null
+			? (handle.viewer as Record<string, unknown>)
+			: undefined;
+	const validLauncher = launcher !== undefined && ["herdr", "tmux", "headless"].includes(launcher.kind as string);
+	const validViewer =
+		handle.viewer === undefined ||
+		(viewer !== undefined &&
+			["herdr", "tmux"].includes(viewer.kind as string) &&
+			viewer.childId === `${handle.childId}-viewer`);
 	return (
 		handle.kind === "process" &&
 		typeof handle.childId === "string" &&
@@ -242,8 +257,8 @@ export function isSerializableBackendHandle(raw: unknown): raw is SerializableBa
 		typeof handle.token === "string" &&
 		handle.token.length > 0 &&
 		typeof handle.runDir === "string" &&
-		launcher !== undefined &&
-		["herdr", "tmux", "headless"].includes(launcher.kind as string) &&
-		launcher.childId === handle.childId
+		validLauncher &&
+		launcher?.childId === handle.childId &&
+		validViewer
 	);
 }
