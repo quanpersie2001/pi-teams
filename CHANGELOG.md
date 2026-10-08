@@ -4,6 +4,8 @@
 
 ### Added
 
+- GitHub CI and manual patch/minor/major/alpha/beta release automation, matching the `pi-style` workflow convention with reproducible installs, tracked lockfile version bumps and explicit npm publication failure handling.
+
 - Creation-time teammate color: `Agent(name:, color:)` accepts short/full hex, freezes normalized instance identity in the current-team roster, and propagates effective identity to native viewers, Agent receipts, notifications and peer-message details. Color is not agent-definition frontmatter; conflicting requests fail before model admission, and cold continuation cannot revive an old team's identity.
 
 - Optional per-run time budgets: `defaultTimeout`/`defaultIdleTimeout` settings (seconds, `0` = unlimited) with definition frontmatter (`timeout`, `idle_timeout`/`idle-timeout`) and `Agent` invocation overrides (`timeout`, `idle_timeout`). Precedence is invocation > definition > settings; malformed values fail instead of falling back to unlimited. Expiry triggers the cooperative abort with a bounded window, then verified force-termination of the owned child process group (visible failure instead of fabricated outcome when enforcement is refused); the result identifies the exhausted budget, the limit in seconds and possibly incomplete partial work. Resume re-applies the same effective budgets on fresh clocks.
@@ -21,10 +23,16 @@
 
 ### Changed
 
+- Load Main's actual optional `pi-style` source in native HerdR/tmux children through an exact package allowlist, including temporary `-e` sources. Keep SDK-only children free of UI extensions, exclude unrelated Main extensions, and preserve session-local editor/footer styling when panes disappear and reattach.
+- Close multiplexer panes whenever native execution becomes idle, retaining named worker PID/context/style. Reopen only running assignments, leave other active panes intact, and keep idle workers in the existing six-live-child threshold without presenting them.
+
+- Keep idle named teammates in the Agents Hub only, not the inline bottom panel. The bottom panel shows active assignments and unconfirmed cleanup; idle execution/context retention is unchanged.
+- Compact Hub/inline rows show teammate identity, description and right-aligned elapsed time/token usage instead of specialist/process labels, result previews and tool/turn counts. Preserve abort and uncertain-cleanup warnings; detailed transcript views remain available.
+
 - Rename the product to `pi-teams` (ADR 0008): package `@quandev104/pi-teams`, source tree `extension-src/pi-teams/`, settings `teams.json`, command `/teams-backend`, environment variables `PI_TEAMS_*`, notification customType `teammate-notification`, and artifact root `.pi/teams/` (`registry.json`, `history.json`, `sessions/<child-id>/`, future `t/<team-id>/`). Model tool names (`Agent`, `get_subagent_result`, `steer_subagent`), child protocol v2 and integration events v3 channels are unchanged. Existing local `.pi/subagents/` state is not migrated — delete it manually.
 
 - Remove live-child restoration machinery (ADR 0007 §5, roadmap T4): archive-only startup reconciliation, no re-adoption, live-run quarantine queue, deferred active cleanup or status-driven session reattachment. Stale owned rows archive stopped with honest cleanup notes; terminal outcomes and cold JSONL/worktree/result artifacts remain intact. Foreign-owner and incompatible rows remain untouched. Session switching now awaits old-team teardown before manager re-arm.
-- Target Pi peers >=1.0.4 <1.1.0 and Node >=22.19; package parent, bridge, headless and viewer entrypoints.
+- Target Pi peers >=1.0.4 <1.1.0 and Node >=22.19; package parent, bridge, headless-worker and raw-terminal-client entrypoints.
 - Close anonymous owned children/panes after settlement; named teammates retain idle native processes until teardown. Keep Hub history and explicit cleanup uncertainty; cold continuation uses persisted native JSONL in a new process.
 - Separate native SDK execution from multiplexer presentation. Count all live children (including unnamed active and named idle), excluding Main: zero Main-only, 1–3 two horizontal partitions, 4–6 three equal horizontal partitions with child rows 2+2/3+2/3+3, above six all-headless, and lossless viewer restoration when returning to at most six. Persist separate execution/viewer receipts and refresh pane attachment availability.
 - Down from an empty Main editor enters inline navigation; double Left at document start opens Hub without intercepting native menus, dialogs or cursor movement.
@@ -34,6 +42,8 @@
 - Load the complete package in development/live-smoke commands so its native skill is discoverable alongside the extension.
 
 ### Fixed
+
+- Restore actual native Pi `InteractiveMode` in HerdR/tmux panes instead of mounting the custom Child View overlay in a separate Pi CLI. Keep the SDK session, execution PID, transcript, editor and active assignment in the worker across pane removal/recreation; same-size reattachment forces native repaint without replay. Native idle input remains parent-admitted and fails closed when admission is unavailable.
 
 - Refused retained-teammate assignments now fail and release capacity instead of parking in `starting`; pre-admission ownership rolls back to the idle child. Lost prompt acknowledgements reconcile the new assignment's own handle against native state without inheriting an earlier assignment's result or counters.
 - Keep Main's document-start gestures (double Left → Hub, Down → inline navigation) working when a foreign custom editor still preserves native `Editor` semantics (e.g. pi-style's `CustomEditor` subclass); defer only to opaque custom editors whose cursor/autocomplete state cannot be observed. `/agents` and Alt+G remain available in every mode.

@@ -30,6 +30,10 @@ export interface ChildBootstrap {
 	childId: string;
 	token: string;
 	socketPath: string;
+	/** Native InteractiveMode terminal transport; absent for SDK-only headless execution. */
+	terminalSocketPath?: string;
+	/** Loaded Main extension paths; native workers allowlist pi-style, never orchestration. */
+	presentationExtensionPaths?: string[];
 	sessionDir: string;
 	sessionFile?: string;
 	cwd: string;
@@ -132,8 +136,6 @@ export interface ChildIdentity {
 	protocolVersion: typeof CHILD_PROTOCOL_VERSION;
 	childId: string;
 	token: string;
-	/** Owner controls execution lifetime; viewer sockets are presentation-only. */
-	role?: "owner" | "viewer";
 }
 
 export interface ChildRequest {
@@ -215,14 +217,10 @@ export function parseChildIdentity(value: unknown): ChildIdentity {
 	if (value.protocolVersion !== CHILD_PROTOCOL_VERSION) {
 		throw new ChildProtocolError("protocol_mismatch", "Unsupported child protocol version");
 	}
-	const role = value.role === undefined ? "owner" : value.role;
-	if (role !== "owner" && role !== "viewer")
-		throw new ChildProtocolError("unauthorized", "Invalid child identity role");
 	return {
 		protocolVersion: CHILD_PROTOCOL_VERSION,
 		childId: requireString(value.childId, "childId"),
 		token: requireString(value.token, "token", 512),
-		role,
 	};
 }
 

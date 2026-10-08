@@ -1,7 +1,7 @@
 // Every independent child process carries PI_TEAMS_CHILD=1. The parent
 // extension must not install recursive orchestration, UI or lifecycle hooks
-// if loaded there. Interactive children load only the bridge extension;
-// headless children load no extensions and expose only specialist tools.
+// if loaded there. Workers expose only specialist tools and child coordination;
+// native panes add identity/session policies, never the parent orchestration UI.
 
 /** Environment variable marking a child specialist session. */
 export const CHILD_SESSION_ENV_VAR = "PI_TEAMS_CHILD";

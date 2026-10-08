@@ -69,10 +69,11 @@ export interface ProcessBackendOptions {
 	launchers?: readonly ProcessLauncher[];
 	connectTimeoutMs?: number;
 	/** Built runtime entrypoints; overridable for independently launched integration fixtures. */
-	entryPaths?: { bridge: string; headless: string; viewer?: string };
-	piCommand?: string;
+	entryPaths?: { headless: string; terminalClient: string };
 	agentDir?: string;
 	getParentModel?: () => string | undefined;
+	/** Public loaded Main resource paths, including temporary CLI extensions. */
+	getParentExtensionPaths?: () => readonly string[];
 }
 
 export function resolveLauncherHint(env: NodeJS.ProcessEnv = process.env): BackendSelector {
@@ -94,19 +95,17 @@ export function resolveSessionLauncherHint(env: NodeJS.ProcessEnv, settingsBacke
 	return settingsBackend;
 }
 
-function entryPaths(): { bridge: string; headless: string; viewer: string } {
+function entryPaths(): { headless: string; terminalClient: string } {
 	const adjacent = {
-		bridge: fileURLToPath(new URL("./child-bridge.js", import.meta.url)),
 		headless: fileURLToPath(new URL("./headless-child.js", import.meta.url)),
-		viewer: fileURLToPath(new URL("./child-viewer.js", import.meta.url)),
+		terminalClient: fileURLToPath(new URL("./terminal-client.js", import.meta.url)),
 	};
-	if (existsSync(adjacent.bridge) && existsSync(adjacent.headless) && existsSync(adjacent.viewer)) return adjacent;
+	if (existsSync(adjacent.headless) && existsSync(adjacent.terminalClient)) return adjacent;
 	const built = {
-		bridge: fileURLToPath(new URL("../../../dist/extensions/child-bridge.js", import.meta.url)),
 		headless: fileURLToPath(new URL("../../../dist/extensions/headless-child.js", import.meta.url)),
-		viewer: fileURLToPath(new URL("../../../dist/extensions/child-viewer.js", import.meta.url)),
+		terminalClient: fileURLToPath(new URL("../../../dist/extensions/terminal-client.js", import.meta.url)),
 	};
-	if (!existsSync(built.bridge) || !existsSync(built.headless) || !existsSync(built.viewer))
+	if (!existsSync(built.headless) || !existsSync(built.terminalClient))
 		throw new Error("Child runtime is not built. Run npm run build before launching subagents.");
 	return built;
 }
@@ -188,45 +187,25 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	private async openViewer(child: ChildConnection): Promise<void> {
 		if (child.closed || child.viewerHandle || !child.presentationLauncher) return;
 		const paths = this.options.entryPaths ?? entryPaths();
-		if (!paths.viewer) throw new Error("Built child viewer runtime entrypoint is unavailable.");
-		const viewerBootstrapFile = join(child.runDir, "viewer-bootstrap.json");
+		if (!child.bootstrap.terminalSocketPath) throw new Error("Native child terminal transport is unavailable.");
+		const viewerBootstrapFile = join(child.runDir, "terminal-bootstrap.json");
 		writeFileSync(
 			viewerBootstrapFile,
 			JSON.stringify({
 				childId: child.bootstrap.childId,
 				token: deriveViewerToken(child.bootstrap.childId, child.bootstrap.token),
-				socketPath: child.bootstrap.socketPath,
-				cwd: child.bootstrap.cwd,
-				teammateName: child.bootstrap.teammateName,
-				teammateColor: child.bootstrap.teammateColor,
-				teamDir: child.bootstrap.teamDir,
-				teamKey: child.bootstrap.teamKey,
+				socketPath: child.bootstrap.terminalSocketPath,
 			}),
 			{ mode: 0o600 },
 		);
-		const viewerSessionDir = join(child.runDir, "viewer-session");
-		mkdirSync(viewerSessionDir, { recursive: true, mode: 0o700 });
 		const viewerId = `${child.bootstrap.childId}-viewer`;
-		const command = this.options.piCommand
-			? [this.options.piCommand]
-			: [
-					process.execPath,
-					fileURLToPath(new URL("./bundle/cli.js", import.meta.resolve("@earendil-works/pi-coding-agent"))),
-				];
 		try {
 			child.viewerHandle = await child.presentationLauncher.launch({
 				childId: viewerId,
 				runDir: child.runDir,
 				cwd: child.bootstrap.cwd,
-				env: { PI_TEAMS_VIEWER: "1", PI_TEAMS_VIEWER_BOOTSTRAP: viewerBootstrapFile },
-				interactiveArgv: [
-					...command,
-					"--no-extensions",
-					"--extension",
-					paths.viewer,
-					"--session-dir",
-					viewerSessionDir,
-				],
+				env: { PI_TEAMS_TERMINAL_BOOTSTRAP: viewerBootstrapFile },
+				interactiveArgv: [process.execPath, paths.terminalClient],
 				headlessCommand: process.execPath,
 				headlessArgv: [],
 			});
@@ -266,7 +245,8 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 					for (const listener of [...child.presentationListeners]) listener(false);
 				}
 			}
-			if (!this.presentationActive || !withinThreshold) await this.closeViewer(child);
+			if (!this.presentationActive || !withinThreshold || child.snapshot?.execution !== "running")
+				await this.closeViewer(child);
 			else if (!child.viewerHandle) await this.openViewer(child);
 		}
 	}
@@ -311,6 +291,10 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			childId,
 			token: randomBytes(32).toString("hex"),
 			socketPath: join(controlDir, "control.sock"),
+			...(presentationLauncher ? { terminalSocketPath: join(controlDir, "terminal.sock") } : {}),
+			...(presentationLauncher && this.options.getParentExtensionPaths
+				? { presentationExtensionPaths: [...this.options.getParentExtensionPaths()] }
+				: {}),
 			sessionDir: sessionFile ? dirname(sessionFile) : runDir,
 			cwd: input.cwd,
 			configCwd: input.configCwd,
@@ -334,10 +318,6 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		};
 		const configFile = join(runDir, "bootstrap.json");
 		writeFileSync(configFile, JSON.stringify(bootstrap), { mode: 0o600 });
-		const interactiveArgv = ["--no-extensions", "--extension", paths.bridge, "--session-dir", bootstrap.sessionDir];
-		if (sessionFile) interactiveArgv.push("--session", sessionFile);
-		if (!sessionFile && input.model) interactiveArgv.push("--model", input.model);
-		if (!sessionFile && input.thinking) interactiveArgv.push("--thinking", input.thinking);
 		let handle: LauncherHandle | undefined;
 		let child: ChildConnection | undefined;
 		try {
@@ -345,12 +325,6 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				this.pendingChildren.add(childId);
 				await this.reconcilePresentationLocked();
 			});
-			const command = this.options.piCommand
-				? [this.options.piCommand]
-				: [
-						process.execPath,
-						fileURLToPath(new URL("./bundle/cli.js", import.meta.resolve("@earendil-works/pi-coding-agent"))),
-					];
 			handle = await launcher.launch({
 				childId,
 				runDir,
@@ -360,7 +334,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 					PI_TEAMS_CHILD: "1",
 					...(this.options.agentDir !== undefined ? { PI_CODING_AGENT_DIR: this.options.agentDir } : {}),
 				},
-				interactiveArgv: [...command, ...interactiveArgv],
+				interactiveArgv: [],
 				headlessCommand: process.execPath,
 				headlessArgv: [paths.headless],
 			});
@@ -528,7 +502,9 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 					if (child.assignmentListeners.size === 0) child.pendingAssignments.push(assignment);
 					else for (const listener of [...child.assignmentListeners]) listener(assignment);
 				}
-				void this.refreshChild(child);
+				void this.refreshChild(child).catch((error: unknown) => {
+					console.error("Native child pane reconciliation failed:", error);
+				});
 			}),
 		);
 		child.unlisten.push(
@@ -558,8 +534,9 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			delete child.reconnectTimer;
 			void child.client
 				.connect()
-				.then((snapshot) => {
+				.then(async (snapshot) => {
 					this.acceptSnapshot(child, snapshot);
+					await this.refreshChild(child);
 				})
 				.catch(async () => {
 					if (child.identityFailure) return;
@@ -604,6 +581,14 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		} finally {
 			child.refreshing = false;
 		}
+		if (
+			child.presentationLauncher &&
+			!child.closed &&
+			!child.identityFailure &&
+			Boolean(child.viewerHandle) !==
+				(this.presentationActive && this.livingChildCount() <= 6 && child.snapshot?.execution === "running")
+		)
+			await this.reconcilePresentation();
 	}
 	private updateRun(run: RunConnection): void {
 		if (isSettled(run.status)) return;

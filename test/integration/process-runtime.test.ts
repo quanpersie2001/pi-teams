@@ -2,9 +2,10 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
 import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
 import type { SerializableBackendHandle, SubagentRunStore } from "../../extension-src/pi-teams/app/run-registry.js";
@@ -19,6 +20,8 @@ import type {
 } from "../../extension-src/pi-teams/domain/backend.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
 import type { LauncherHandle, ProcessLauncher } from "../../extension-src/pi-teams/domain/process-launcher.js";
+import { deriveViewerToken } from "../../extension-src/pi-teams/pi/child-rpc-auth.js";
+import { ChildRpcClient } from "../../extension-src/pi-teams/pi/child-rpc-client.js";
 import { ProcessAgentExecutionBackend } from "../../extension-src/pi-teams/pi/process-backend.js";
 import { createProcessLaunchers } from "../../extension-src/pi-teams/pi/process-launchers.js";
 import { createSubagentRunStore } from "../../extension-src/pi-teams/pi/registry-host.js";
@@ -49,9 +52,12 @@ interface LocalProvider {
 	requests: string[];
 	firstRequest: Promise<void>;
 	releaseFirst(): void;
+	releaseRequest(index: number): void;
 }
 
-async function localProvider(options: { holdFirst?: boolean; createTeamTask?: boolean } = {}): Promise<LocalProvider> {
+async function localProvider(
+	options: { holdFirst?: boolean; holdRequests?: number[]; createTeamTask?: boolean } = {},
+): Promise<LocalProvider> {
 	const root = await mkdtemp(join(tmpdir(), "teams-process-runtime-"));
 	tempRoots.push(root);
 	const agentDir = join(root, "agent");
@@ -63,6 +69,7 @@ async function localProvider(options: { holdFirst?: boolean; createTeamTask?: bo
 	const requests: string[] = [];
 	const firstRequest = Promise.withResolvers<void>();
 	const released = Promise.withResolvers<void>();
+	const heldRequests = new Map((options.holdRequests ?? []).map((index) => [index, Promise.withResolvers<void>()]));
 	const server = createServer((request, response) => {
 		let body = "";
 		request.setEncoding("utf8");
@@ -70,11 +77,13 @@ async function localProvider(options: { holdFirst?: boolean; createTeamTask?: bo
 			body += chunk;
 		});
 		request.on("end", async () => {
+			const requestIndex = requests.length;
 			requests.push(body);
 			if (requests.length === 1) {
 				firstRequest.resolve();
 				if (options.holdFirst) await released.promise;
 			}
+			await heldRequests.get(requestIndex)?.promise;
 			response.writeHead(200, {
 				"content-type": "text/event-stream",
 				"cache-control": "no-cache",
@@ -138,7 +147,13 @@ async function localProvider(options: { holdFirst?: boolean; createTeamTask?: bo
 		}),
 		"utf8",
 	);
-	return { cwd, requests, firstRequest: firstRequest.promise, releaseFirst: released.resolve };
+	return {
+		cwd,
+		requests,
+		firstRequest: firstRequest.promise,
+		releaseFirst: released.resolve,
+		releaseRequest: (index) => heldRequests.get(index)?.resolve(),
+	};
 }
 
 function launchInput(runId: string, cwd: string): AgentLaunchInput {
@@ -527,6 +542,324 @@ function observedHeadlessLauncher(): {
 }
 
 describe("real process runtime", () => {
+	it("closes idle panes and reopens the same native worker for its next assignment", async () => {
+		const provider = await localProvider({ holdRequests: [0, 1, 2] });
+		const panes = new Map<string, LauncherHandle>();
+		let nextPane = 0;
+		const presentation: ProcessLauncher = {
+			kind: "tmux",
+			available: async () => true,
+			launch: async (spec) => {
+				const handle: LauncherHandle = {
+					kind: "tmux",
+					childId: spec.childId,
+					paneId: `%integration-${nextPane++}`,
+				};
+				panes.set(handle.paneId ?? "", handle);
+				return handle;
+			},
+			alive: async (handle) => panes.get(handle.paneId ?? "") === handle,
+			cleanupExited: async (handle) => !panes.has(handle.paneId ?? ""),
+			terminate: async (handle) => {
+				panes.delete(handle.paneId ?? "");
+			},
+		};
+		const { launcher } = observedHeadlessLauncher();
+		const backend = new ProcessAgentExecutionBackend({
+			launcherHint: "tmux",
+			launchers: [presentation, launcher],
+			connectTimeoutMs: 15_000,
+		});
+		let worker: AgentBackendHandle | undefined;
+		let other: AgentBackendHandle | undefined;
+		let unsubscribe = () => {};
+		let viewerAvailable = false;
+		try {
+			worker = await backend.launch(launchInput("idle-pane-first", provider.cwd));
+			const firstWorker = worker;
+			await provider.firstRequest;
+			unsubscribe = backend.subscribePresentation(worker, (available) => {
+				viewerAvailable = available;
+			});
+			await vi.waitFor(() => expect(backend.hasViewer(firstWorker)).toBe(true), { timeout: 10_000 });
+			const running = await backend.status(worker);
+			const initial = backend.serializeHandle(worker);
+			if (!initial?.launcher.pid || !initial.viewer?.paneId || !running.sessionFile)
+				throw new Error("Held native worker omitted its execution, viewer, or session identity");
+			const pid = initial.launcher.pid;
+			const sessionFile = running.sessionFile;
+			const firstPaneId = initial.viewer.paneId;
+			expect(running.state).toBe("running");
+			expect(pid).not.toBe(process.pid);
+			expect(viewerAvailable).toBe(true);
+			expect(backend.hasViewer(worker)).toBe(true);
+			expect(panes.has(initial.viewer.paneId)).toBe(true);
+
+			other = await backend.launch(launchInput("idle-pane-other-active", provider.cwd));
+			const otherWorker = other;
+			await vi.waitFor(() => expect(provider.requests).toHaveLength(2), { timeout: 10_000 });
+			await vi.waitFor(() => expect(backend.hasViewer(otherWorker)).toBe(true), { timeout: 10_000 });
+			expect((await backend.status(other)).state).toBe("running");
+			const otherIdentity = backend.serializeHandle(other);
+			if (!otherIdentity?.viewer?.paneId) throw new Error("Other active worker omitted its viewer");
+			expect(panes.size).toBe(2);
+
+			provider.releaseRequest(0);
+			const completed = await waitForTerminal(backend, worker);
+			expect(completed.state).toBe("completed");
+			expect(completed.result).toContain("process-child-ok");
+			expect(completed.sessionFile).toBe(sessionFile);
+			await vi.waitFor(
+				() => {
+					expect(backend.serializeHandle(firstWorker)?.viewer).toBeUndefined();
+					expect(backend.hasViewer(firstWorker)).toBe(false);
+					expect(viewerAvailable).toBe(false);
+					expect(panes.has(firstPaneId)).toBe(false);
+				},
+				{ timeout: 10_000 },
+			);
+			const idle = backend.serializeHandle(worker);
+			expect(idle?.childId).toBe(initial.childId);
+			expect(idle?.launcher.pid).toBe(pid);
+			process.kill(pid, 0);
+			expect((await backend.status(worker)).sessionFile).toBe(sessionFile);
+			expect(backend.hasViewer(other)).toBe(true);
+			expect(panes.has(otherIdentity.viewer.paneId)).toBe(true);
+			expect(panes.size).toBe(1);
+
+			worker = await backend.assign(worker, {
+				runId: "idle-pane-second",
+				prompt: "Continue the first assignment and return process-child-ok again.",
+				maxTurns: 1,
+			});
+			const secondWorker = worker;
+			await vi.waitFor(() => expect(provider.requests).toHaveLength(3), { timeout: 10_000 });
+			await vi.waitFor(
+				() => {
+					expect(backend.hasViewer(secondWorker)).toBe(true);
+					expect(viewerAvailable).toBe(true);
+					expect(backend.serializeHandle(secondWorker)?.viewer?.paneId).toBeDefined();
+				},
+				{ timeout: 10_000 },
+			);
+			const reassigned = backend.serializeHandle(worker);
+			if (!reassigned?.viewer?.paneId) throw new Error("Reassigned native worker omitted its viewer");
+			const secondPaneId = reassigned.viewer.paneId;
+			expect(reassigned.childId).toBe(initial.childId);
+			expect(reassigned.launcher.pid).toBe(pid);
+			expect(reassigned.viewer.paneId).not.toBe(initial.viewer.paneId);
+			expect(panes.has(reassigned.viewer.paneId)).toBe(true);
+			expect(panes.has(otherIdentity.viewer.paneId)).toBe(true);
+			expect(panes.size).toBe(2);
+			const secondRunning = await backend.status(worker);
+			expect(secondRunning.state).toBe("running");
+			expect(secondRunning.sessionFile).toBe(sessionFile);
+			const continuation = JSON.parse(provider.requests[2] ?? "{}") as {
+				messages: Array<{ role: string; content: unknown }>;
+			};
+			expect(
+				continuation.messages.some(
+					(message) => message.role === "user" && JSON.stringify(message.content).includes("idle-pane-first"),
+				),
+			).toBe(true);
+			expect(
+				continuation.messages.some(
+					(message) => message.role === "assistant" && JSON.stringify(message.content).includes("process-child-ok"),
+				),
+			).toBe(true);
+
+			provider.releaseRequest(2);
+			const secondCompleted = await waitForTerminal(backend, worker);
+			expect(secondCompleted.state).toBe("completed");
+			expect(secondCompleted.sessionFile).toBe(sessionFile);
+			await vi.waitFor(
+				() => {
+					expect(backend.serializeHandle(secondWorker)?.viewer).toBeUndefined();
+					expect(backend.hasViewer(secondWorker)).toBe(false);
+					expect(viewerAvailable).toBe(false);
+					expect(panes.has(secondPaneId)).toBe(false);
+				},
+				{ timeout: 10_000 },
+			);
+			expect(backend.serializeHandle(worker)?.childId).toBe(initial.childId);
+			expect(backend.serializeHandle(worker)?.launcher.pid).toBe(pid);
+			process.kill(pid, 0);
+			expect(backend.hasViewer(other)).toBe(true);
+			expect((await backend.status(other)).state).toBe("running");
+			expect(panes.has(otherIdentity.viewer.paneId)).toBe(true);
+			expect(panes.size).toBe(1);
+		} finally {
+			unsubscribe();
+			for (const index of [0, 1, 2]) provider.releaseRequest(index);
+			const retainedWorkers = [worker, other].filter((handle): handle is AgentBackendHandle => handle !== undefined);
+			await Promise.all(
+				retainedWorkers.map(async (handle) => {
+					await waitForTerminal(backend, handle);
+					await backend.dispose(handle);
+				}),
+			);
+		}
+	}, 60_000);
+
+	it("reattaches the real native UI at the same size without replacing or replaying active execution", async () => {
+		const provider = await localProvider({ holdFirst: true });
+		const controlDir = await mkdtemp("/tmp/teams-native-terminal-");
+		tempRoots.push(controlDir);
+		const sessionDir = join(provider.cwd, "native-sessions");
+		await mkdir(sessionDir, { mode: 0o700 });
+		const bootstrap = {
+			childId: "native-ui-child",
+			token: "native-ui-owner-token-with-enough-length",
+			socketPath: join(controlDir, "control.sock"),
+			terminalSocketPath: join(controlDir, "terminal.sock"),
+			sessionDir,
+			cwd: provider.cwd,
+			configCwd: provider.cwd,
+			systemPrompt: "",
+			promptMode: "append",
+			model: "local-test/local-model",
+			tools: [],
+		};
+		const bootstrapFile = join(controlDir, "bootstrap.json");
+		await writeFile(bootstrapFile, JSON.stringify(bootstrap), { mode: 0o600 });
+		const child = spawn(process.execPath, [join(process.cwd(), "dist/extensions/headless-child.js")], {
+			cwd: provider.cwd,
+			env: { ...process.env, PI_TEAMS_CHILD: "1", PI_TEAMS_BOOTSTRAP: bootstrapFile, PI_OFFLINE: "1" },
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		let stderr = "";
+		child.stderr?.on("data", (data) => {
+			stderr += String(data);
+		});
+		const owner = new ChildRpcClient({
+			socketPath: bootstrap.socketPath,
+			childId: bootstrap.childId,
+			token: bootstrap.token,
+			connectTimeoutMs: 15_000,
+		});
+		const sockets: Socket[] = [];
+		async function attach() {
+			const socket = connect(bootstrap.terminalSocketPath);
+			sockets.push(socket);
+			let output = "";
+			let buffer = "";
+			socket.setEncoding("utf8");
+			socket.on("data", (data: string) => {
+				buffer += data;
+				let newline = buffer.indexOf("\n");
+				while (newline !== -1) {
+					const frame = JSON.parse(buffer.slice(0, newline)) as { type: string; data?: string };
+					buffer = buffer.slice(newline + 1);
+					if (frame.type === "output" && frame.data) output += Buffer.from(frame.data, "base64").toString("utf8");
+					newline = buffer.indexOf("\n");
+				}
+			});
+			socket.on("error", () => {});
+			await new Promise<void>((resolve, reject) => {
+				socket.once("connect", resolve);
+				socket.once("error", reject);
+			});
+			socket.write(
+				`${JSON.stringify({
+					type: "auth",
+					childId: bootstrap.childId,
+					token: deriveViewerToken(bootstrap.childId, bootstrap.token),
+				})}\n`,
+			);
+			socket.write(`${JSON.stringify({ type: "resize", columns: 120, rows: 40 })}\n`);
+			return { socket, output: () => output };
+		}
+		try {
+			const initial = await owner.connect().catch((error: unknown) => {
+				throw new Error(`Native child failed: ${stderr}`, { cause: error });
+			});
+			const first = await attach();
+			await owner.prompt("native-ui-run", "NATIVE_ACTIVE_ASSIGNMENT");
+			await provider.firstRequest;
+			await vi.waitFor(() => expect(first.output()).toContain("NATIVE_ACTIVE_ASSIGNMENT"), { timeout: 10_000 });
+			await new Promise<void>((resolve) => {
+				first.socket.once("close", resolve);
+				first.socket.destroy();
+			});
+			const disconnected = await owner.state();
+			expect(disconnected.execution).toBe("running");
+			expect(disconnected.pid).toBe(initial.pid);
+			const reopened = await attach();
+			await vi.waitFor(() => expect(reopened.output()).toContain("NATIVE_ACTIVE_ASSIGNMENT"), { timeout: 10_000 });
+			expect((await owner.state()).sessionFile).toBe(initial.sessionFile);
+			expect(provider.requests).toHaveLength(1);
+			provider.releaseFirst();
+			await vi.waitFor(async () => expect((await owner.state()).lastOutcome?.status).toBe("completed"), {
+				timeout: 10_000,
+			});
+			for (const data of ["/model", "\r"]) {
+				reopened.socket.write(
+					`${JSON.stringify({
+						type: "input",
+						data: Buffer.from(data).toString("base64"),
+						final: true,
+						kittyProtocolActive: false,
+					})}\n`,
+				);
+			}
+			await vi.waitFor(() => expect(reopened.output()).toContain("Model Name:"), { timeout: 10_000 });
+			expect(provider.requests).toHaveLength(1);
+			expect((await owner.state()).pid).toBe(initial.pid);
+			await new Promise<void>((resolve) => {
+				reopened.socket.once("data", () => resolve());
+				reopened.socket.write(
+					`${JSON.stringify({
+						type: "input",
+						data: Buffer.from("\u001b").toString("base64"),
+						final: true,
+						kittyProtocolActive: false,
+					})}\n`,
+				);
+			});
+			for (const data of ["REQUIRES_PARENT_ADMISSION", "\r"]) {
+				reopened.socket.write(
+					`${JSON.stringify({
+						type: "input",
+						data: Buffer.from(data).toString("base64"),
+						final: true,
+						kittyProtocolActive: false,
+					})}\n`,
+				);
+			}
+			await vi.waitFor(() => expect(reopened.output()).toContain("no parent-owned mailbox"), { timeout: 10_000 });
+			expect((await owner.state()).execution).toBe("idle");
+			expect(provider.requests).toHaveLength(1);
+			const sessionEntries = (await readFile(initial.sessionFile, "utf8"))
+				.trim()
+				.split("\n")
+				.map((line: string) => JSON.parse(line));
+			expect(
+				sessionEntries.some(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message?.role === "user" &&
+						entry.message.content.some(
+							(part: { type: string; text?: string }) =>
+								part.type === "text" && part.text?.includes("REQUIRES_PARENT_ADMISSION"),
+						),
+				),
+			).toBe(false);
+		} finally {
+			provider.releaseFirst();
+			for (const socket of sockets) socket.destroy();
+			await owner.shutdown().catch(() => {
+				child.kill("SIGTERM");
+			});
+			owner.disconnect();
+			if (child.exitCode === null && child.signalCode === null) {
+				await new Promise<void>((resolve) => {
+					child.once("exit", resolve);
+					child.kill("SIGTERM");
+				});
+			}
+		}
+	}, 60_000);
+
 	it("rejects missing native auth before allocating a run, process, or artifacts", async () => {
 		const provider = await localProvider();
 		const previousEnv = process.env;
@@ -657,7 +990,11 @@ describe("real process runtime", () => {
 			await expect(disposer.disposePersisted(mismatched)).rejects.toThrow(/PID/);
 		} finally {
 			provider.releaseFirst();
-			if (originalHandle) await original.dispose(originalHandle);
+			if (originalHandle) {
+				// Releasing the provider is not the SDK's idle boundary.
+				const handle = originalHandle;
+				await vi.waitFor(() => original.dispose(handle), { timeout: 10_000 });
+			}
 		}
 	}, 60_000);
 	it("self-terminates a detached child through control-socket loss (ADR 0007)", async () => {

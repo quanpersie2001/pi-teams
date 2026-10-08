@@ -18,7 +18,6 @@ export interface ChildRpcClientOptions {
 	socketPath: string;
 	childId: string;
 	token: string;
-	role?: "owner" | "viewer";
 	connectTimeoutMs?: number;
 }
 
@@ -36,7 +35,6 @@ export class ChildRpcClient {
 	private readonly socketPath: string;
 	private readonly childId: string;
 	private readonly token: string;
-	private readonly role: "owner" | "viewer";
 	private readonly connectTimeoutMs: number;
 	private socket: Socket | undefined;
 	private frameBuffer = Buffer.alloc(0);
@@ -56,7 +54,6 @@ export class ChildRpcClient {
 		this.socketPath = options.socketPath;
 		this.childId = options.childId;
 		this.token = options.token;
-		this.role = options.role ?? "owner";
 		this.connectTimeoutMs = options.connectTimeoutMs ?? 5_000;
 		if (!Number.isFinite(this.connectTimeoutMs) || this.connectTimeoutMs <= 0)
 			throw new Error("connectTimeoutMs must be a positive finite number");
@@ -216,7 +213,6 @@ export class ChildRpcClient {
 					protocolVersion: CHILD_PROTOCOL_VERSION,
 					childId: this.childId,
 					token: this.token,
-					role: this.role,
 				})
 					.then((reply) => {
 						const state = this.readStateEnvelope(reply);

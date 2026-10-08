@@ -30,7 +30,6 @@ import {
 } from "../domain/child-protocol.js";
 import type { TranscriptItem } from "../domain/transcript.js";
 import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
-import { deriveViewerToken } from "./child-rpc-auth.js";
 import { createTeamTaskTools } from "./team-task-tools.js";
 
 const MAX_TRANSCRIPT_ITEMS = 256;
@@ -152,6 +151,19 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 			`Child socketPath must be absolute and fit in ${MAX_SOCKET_PATH_BYTES} UTF-8 bytes`,
 		);
 	}
+	const terminalSocketPath = parseOptionalString(value, "terminalSocketPath", 4_096);
+	if (
+		terminalSocketPath !== undefined &&
+		(!isAbsolute(terminalSocketPath) ||
+			Buffer.byteLength(terminalSocketPath) > MAX_SOCKET_PATH_BYTES ||
+			dirname(terminalSocketPath) !== dirname(socketPath) ||
+			terminalSocketPath === socketPath)
+	) {
+		throw new ChildProtocolError(
+			"invalid_bootstrap",
+			"terminalSocketPath must be a distinct short absolute socket path in the child control directory",
+		);
+	}
 	const sessionDir = requireString(value.sessionDir, "sessionDir", 4_096);
 	const cwd = requireString(value.cwd, "cwd", 4_096);
 	const configCwd = requireString(value.configCwd, "configCwd", 4_096);
@@ -172,6 +184,22 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 	const sessionFile = parseOptionalString(value, "sessionFile", 4_096);
 	if (sessionFile !== undefined && !isAbsolute(sessionFile))
 		throw new ChildProtocolError("invalid_bootstrap", "sessionFile must be an absolute path");
+	let presentationExtensionPaths: string[] | undefined;
+	if (value.presentationExtensionPaths !== undefined) {
+		if (
+			!Array.isArray(value.presentationExtensionPaths) ||
+			value.presentationExtensionPaths.length > 128 ||
+			!value.presentationExtensionPaths.every(
+				(path) => typeof path === "string" && path.length <= 4_096 && isAbsolute(path),
+			)
+		) {
+			throw new ChildProtocolError(
+				"invalid_bootstrap",
+				"presentationExtensionPaths must contain at most 128 absolute paths",
+			);
+		}
+		presentationExtensionPaths = [...new Set(value.presentationExtensionPaths as string[])];
+	}
 	let tools: string[] | undefined;
 	if (value.tools !== undefined) {
 		if (
@@ -211,6 +239,8 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 		childId,
 		token,
 		socketPath,
+		...(terminalSocketPath !== undefined ? { terminalSocketPath } : {}),
+		...(presentationExtensionPaths !== undefined ? { presentationExtensionPaths } : {}),
 		sessionDir,
 		cwd,
 		configCwd,
@@ -1160,16 +1190,14 @@ async function openChildSocket(bootstrap: ChildBootstrap, runtime: ChildRuntime)
 			bootstrap,
 			runtime,
 			cache,
-			(role) => {
-				if (role === "owner") {
-					ownerConnections++;
-					cancelControlLossWatch();
-				}
+			() => {
+				ownerConnections++;
+				cancelControlLossWatch();
 			},
-			(role) => {
+			(authenticated) => {
 				connections--;
 				clients.delete(socket);
-				if (role === "owner") {
+				if (authenticated) {
 					ownerConnections--;
 					if (ownerConnections === 0) armControlLossWatch();
 				}
@@ -1239,11 +1267,10 @@ function attachClient(
 	bootstrap: ChildBootstrap,
 	runtime: ChildRuntime,
 	cache: Map<string, CachedCommand>,
-	onAuthenticated: (role: "owner" | "viewer") => void,
-	onClose: (role: "owner" | "viewer" | undefined) => void,
+	onAuthenticated: () => void,
+	onClose: (authenticated: boolean) => void,
 ): void {
 	let authenticated = false;
-	let role: "owner" | "viewer" | undefined;
 	let buffer = Buffer.alloc(0);
 	let closed = false;
 	const unsubscribe = runtime.subscribe((event) => {
@@ -1262,7 +1289,7 @@ function attachClient(
 		closed = true;
 		clearTimeout(authTimer);
 		unsubscribe();
-		onClose(role);
+		onClose(authenticated);
 	});
 	socket.on("error", () => {
 		closed = true;
@@ -1297,12 +1324,10 @@ function attachClient(
 				runtime,
 				cache,
 				() => authenticated,
-				() => role,
-				(nextRole) => {
-					if (role !== undefined) return;
+				() => {
+					if (authenticated) return;
 					authenticated = true;
-					role = nextRole;
-					onAuthenticated(nextRole);
+					onAuthenticated();
 				},
 				(value, afterReply) => {
 					if (closed || socket.destroyed) return;
@@ -1328,8 +1353,7 @@ async function handleSocketRequest(
 	runtime: ChildRuntime,
 	cache: Map<string, CachedCommand>,
 	isAuthenticated: () => boolean,
-	getRole: () => "owner" | "viewer" | undefined,
-	markAuthenticated: (role: "owner" | "viewer") => void,
+	markAuthenticated: () => void,
 	respond: (value: unknown, afterReply?: () => void) => void,
 ): Promise<void> {
 	const failure = (code: string, message: string): ChildReply => ({
@@ -1341,9 +1365,7 @@ async function handleSocketRequest(
 		try {
 			const identity = parseChildIdentity(request.params);
 			const given = Buffer.from(identity.token);
-			const expected = Buffer.from(
-				identity.role === "viewer" ? deriveViewerToken(bootstrap.childId, bootstrap.token) : bootstrap.token,
-			);
+			const expected = Buffer.from(bootstrap.token);
 			if (
 				identity.childId !== bootstrap.childId ||
 				given.byteLength !== expected.byteLength ||
@@ -1352,7 +1374,7 @@ async function handleSocketRequest(
 				respond(failure("unauthorized", "Child identity was rejected"));
 				return;
 			}
-			markAuthenticated(identity.role ?? "owner");
+			markAuthenticated();
 			respond({
 				id: request.id,
 				ok: true,
@@ -1373,13 +1395,6 @@ async function handleSocketRequest(
 	}
 	if (!isAuthenticated()) {
 		respond(failure("unauthorized", "Child RPC handshake is required"));
-		return;
-	}
-	if (
-		getRole() === "viewer" &&
-		(request.method === "shutdown" || request.method === "admit_assignment" || request.method === "prompt")
-	) {
-		respond(failure("forbidden", "Viewer connections cannot change child lifetime or assignment admission"));
 		return;
 	}
 	const commandFingerprint = fingerprint(request.method, request.params);

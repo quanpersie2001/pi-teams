@@ -4,6 +4,14 @@
 	"description": "Specialist team runtime extension for Pi: independent-process teammates, agent definitions, run lifecycle, backends, steer/stop/resume and inline UI.",
 	"license": "MIT",
 	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/quanpersie2001/pi-teams.git"
+	},
+	"homepage": "https://github.com/quanpersie2001/pi-teams#readme",
+	"bugs": {
+		"url": "https://github.com/quanpersie2001/pi-teams/issues"
+	},
 	"keywords": [
 		"pi-package",
 		"pi",
@@ -37,7 +45,7 @@
 		"test": "npm run build && vitest run",
 		"test:watch": "npm run build && vitest",
 		"build": "tsup",
-		"package:smoke": "node --input-type=module -e \"await import('./dist/extensions/pi-teams.js'); await import('./dist/extensions/child-bridge.js'); await import('./dist/extensions/child-viewer.js'); const { access } = await import('node:fs/promises'); await access('./dist/extensions/headless-child.js'); console.log('package smoke: parent, bridge and viewer load; headless entry packaged');\"",
+		"package:smoke": "node --input-type=module -e \"await import('./dist/extensions/pi-teams.js'); await import('./dist/extensions/child-bridge.js'); await import('./dist/extensions/terminal-client.js'); const { access } = await import('node:fs/promises'); await access('./dist/extensions/headless-child.js'); console.log('package smoke: parent, bridge and terminal client load; execution entry packaged');\"",
 		"dev": "tsup --watch",
 		"dev:pi": "node ./node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js -ne -e .",
 		"smoke:live": "node ./node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js -ne -e . -p \"Reply with exactly: OK\"",
@@ -54,6 +62,7 @@
 		"@biomejs/biome": "^2.5.0",
 		"@types/node": "^24.0.0",
 		"dependency-cruiser": "^17.4.3",
+		"git-cliff": "2.13.1",
 		"tsup": "^8.5.0",
 		"typescript": "^5.8.3",
 		"vitest": "^4.1.8"

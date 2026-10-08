@@ -66,7 +66,7 @@ Steering is a command, not a lifecycle state. Backend `disconnected` is unknown 
 
 `Agent.prepareLoadout` exposes canonical enabled specialist names/effective descriptions before each model turn. `pi/agent-mention-autocomplete.ts` wraps public `ctx.ui.addAutocompleteProvider`, merges native/agent suggestions and delegates acceptance to the owning provider. It neither replaces the editor nor launches children.
 
-Build emits `dist/extensions/pi-teams.js`, `child-bridge.js`, `headless-child.js`, `child-viewer.js` and shared chunks. Multiplexer viewers resolve the installed supported Pi peer's CLI, not global `pi` from PATH.
+Build emits `dist/extensions/pi-teams.js`, `child-bridge.js`, `headless-child.js`, `terminal-client.js` and shared chunks. Multiplexer panes run the packaged terminal client; their UI comes from the installed supported Pi peer's public `InteractiveMode`, not a custom Child View or a second Pi session.
 
 ## 5. AgentManager
 
@@ -92,25 +92,30 @@ Interactive native `sendUserMessage` is fire-and-forget: preflight failure may h
 
 Launchers create, inspect liveness, attach and terminate; they do not execute/control the task through terminal input.
 
-- **HerdR:** native Pi viewer, separate from execution. Shell-quoted command is passed as one `pane run` argument because that CLI joins command arguments. Ownership uses saved socket/pane/terminal, PID birth time and foreground process group. Process title/environment are not durable ownership evidence; `process-info` exposes `pid`/`argv0`, not an argv array. Attachment focuses only verified owned panes.
-- **tmux:** native Pi viewer, separate from execution. Saved server socket/PID, pane PID and owner-marked startup command prevent targeting a reused pane or another server.
-- **Headless:** every assignment executes in a detached independent Node process with a native SDK session, owner-marked process identity/group and private diagnostic log. Its PID, child ID, native context and control connection survive presentation changes.
+- **HerdR:** raw terminal client for the worker's native Pi UI. Shell-quoted command is passed as one `pane run` argument because that CLI joins command arguments. Ownership uses saved socket/pane/terminal, PID birth time and foreground process group. Process title/environment are not durable ownership evidence; `process-info` exposes `pid`/`argv0`, not an argv array. Attachment focuses only verified owned panes.
+- **tmux:** raw terminal client for the worker's native Pi UI. Saved server socket/PID, pane PID and owner-marked startup command prevent targeting a reused pane or another server.
+- **Headless execution:** every assignment executes in a detached independent Node process with a native SDK session, owner-marked process identity/group and private diagnostic log. Multiplexer-configured workers additionally run Pi's real `InteractiveMode` against a stable `Terminal`; explicit headless-only workers remain SDK-only. Execution PID, child ID, native context and owner control connection survive presentation changes.
+
+Presentation reconciles against authenticated native execution: only `running` children get panes. Idle settlement tears down the terminal client/pane, not the named native worker; reassignment reconnects to the same UI/context/style. The six-child suppression threshold still counts every live worker, including idle teammates; geometry counts only visible panes.
 
 Launchers never paste steer messages, press Enter for control, infer settlement from pane text/badges, or silently switch implementation after launch failure. Unavailable transport is unknown liveness, never authority to kill an unverified resource.
 
 ## 8. Child control bridge
 
-`domain/child-protocol.ts`, `pi/child-rpc-client.ts` and `pi/child-bridge.ts` define child protocol **v2**, separate from public integration v3. `headless-child.ts` hosts execution; `child-viewer.ts` presents its native transcript and controls through RPC without admitting assignments directly.
+`domain/child-protocol.ts`, `pi/child-rpc-client.ts` and `pi/child-bridge.ts` define child protocol **v2**, separate from public integration v3. `headless-child.ts` hosts execution and, when configured for multiplexer presentation, the native `AgentSessionRuntime`/`InteractiveMode` loop. `native-terminal.ts` implements Pi's public `Terminal`; `terminal-client.ts` relays raw output, keyboard input and dimensions without constructing a session or custom UI. Native identity adds only a colored name widget.
 
-- Authenticated Unix socket with NDJSON requests/replies/events and child ID. Owner and viewer credentials are distinct: the viewer token is HMAC-derived and cannot authenticate as owner. Viewers may inspect/steer/control but cannot call `prompt`, `admit_assignment` or `shutdown`; idle named composition routes through the signed mailbox and parent capacity admission.
+Interactive child resource loaders allowlist `@quandev104/pi-style` alongside the inline identity/session hooks. Main supplies actual loaded extension paths from public command `sourceInfo`; an empty snapshot means no style. Standalone backends resolve enabled configured package resources without installing missing sources. Package identity is checked before loading; other Main extensions and orchestration never execute in children. Explicit SDK-only workers skip style discovery entirely.
+
+- Owner-only authenticated Unix socket with NDJSON requests/replies/events and child ID. Presentation uses a separate private terminal socket and HMAC-derived token that cannot authenticate owner RPC. Idle named composition routes through the signed mailbox and parent capacity admission; failed admission stays handled with native feedback rather than falling through to an untracked prompt.
 - Newly created private directories use `0700`; bootstrap/socket files use `0600`. Short OS-temp socket paths avoid Unix pathname limits.
-- Frames are bounded to 1 MiB. Transcript previews carry absolute cursor/offset and truncation metadata; full history remains in native JSONL.
+- Owner RPC frames are bounded to 1 MiB. Terminal frames are bounded to 64 KiB, with ordered output/backpressure and chunked input events validated as complete UTF-8. Transcript previews carry absolute cursor/offset and truncation metadata; full history remains in native JSONL.
 - At settlement the bridge writes the complete final assistant text to an immutable `result.md` (0600): the first assignment uses `sessions/<child-id>/result.md`, subsequent assignments use `sessions/<child-id>/runs/<sha256(run-id)>/result.md`. `ChildOutcome.resultFile` carries the full-result pointer; the inline copy stays 8 KiB-bounded. Write failure degrades honestly to the inline copy without blocking native settlement.
-- Orphan self-termination (ADR 0007 §1): losing the last authenticated owner arms the control-loss watch; viewers cannot keep an orphan alive. A silent window past reconnect grace means the parent died. The runtime aborts the active run through the native path, gives settlement a bounded window to persist the annotated partial result, then stops the host process. Viewer disconnection alone never aborts execution.
+- Orphan self-termination (ADR 0007 §1): losing the last authenticated owner arms the control-loss watch; terminal clients cannot keep an orphan alive. A silent window past reconnect grace means the parent died. The runtime aborts the active run through the native path, gives settlement a bounded window to persist the annotated partial result, then stops the host process. Presentation disconnection alone never aborts execution.
 - Sequenced focus state carries native cwd/model/thinking/context/capabilities. Stable transcript IDs/revisions permit partial upserts; stale/wrong-run projections cannot rewind focus.
 - Replay/deduplication prevents duplicate prompt admission and request-ID reuse with different contents.
 - Native `agent_settled`, not `agent_end`, final text, pane disappearance or a sentinel, owns settlement. A natural final answer at the turn limit completes; continuing tool loops obey soft/grace/hard limits.
 - Child messaging infers the sender from authenticated runtime context; children never install parent orchestration or the full-thread inspector.
+- Native `/new`, `/resume` and `/fork` cannot replace the parent-owned child session; cancellable native hooks report the restriction. Parent Agent admission and explicit cold continuation own session replacement.
 
 Incompatible live receipts are preserved without adopting their control credentials or terminating their resources.
 

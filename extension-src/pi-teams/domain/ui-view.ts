@@ -44,6 +44,8 @@ export interface AgentListRow {
 	resourceState: AgentResourceState;
 	id: string;
 	type: string;
+	/** Current-team identity, preferred over the specialist type in compact rows. */
+	teammateName?: string;
 	description: string;
 	status: AgentRunStatus;
 	backend: "process";
@@ -51,6 +53,8 @@ export interface AgentListRow {
 	completedAt?: number;
 	toolUses: number;
 	turns: number;
+	/** Authoritative per-run token usage, excluding cache reads. */
+	totalTokens: number;
 	/** One-line latest activity (e.g. `read login.ts`); absent when unknown. */
 	activity?: string;
 	/** Worktree branch when the runs executes in isolation. */

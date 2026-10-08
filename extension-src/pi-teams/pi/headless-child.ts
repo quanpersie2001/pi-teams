@@ -1,12 +1,19 @@
+import { readFileSync } from "node:fs";
 import { lstat, mkdir } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	type AgentSession,
+	AgentSessionRuntime,
+	type AgentSessionServices,
 	type CreateAgentSessionOptions,
+	type CreateAgentSessionRuntimeFactory,
 	createAgentSession,
+	createAgentSessionFromServices,
+	createAgentSessionServices,
 	DefaultResourceLoader,
 	getAgentDir,
+	InteractiveMode,
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
@@ -24,6 +31,7 @@ import {
 	startChildBridge,
 } from "./child-bridge.js";
 import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
+import { deriveViewerToken } from "./child-rpc-auth.js";
 import { createTeamTaskTools } from "./team-task-tools.js";
 
 const CHILD_ENV = "PI_TEAMS_CHILD";
@@ -100,6 +108,13 @@ function validateSessionFile(path: string | undefined, sessionDir: string): stri
 	}
 	return absoluteFile;
 }
+function rosterContainsParticipant(value: unknown, target: string): boolean {
+	if (typeof value !== "object" || value === null || !("members" in value) || !Array.isArray(value.members))
+		return false;
+	return value.members.some(
+		(member: unknown) => typeof member === "object" && member !== null && "name" in member && member.name === target,
+	);
+}
 
 async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOptions): Promise<HeadlessChildHandle> {
 	if (process.env[CHILD_ENV] !== "1")
@@ -107,6 +122,56 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 	const sessionDir = resolve(bootstrap.sessionDir);
 	await validateSessionDirectory(sessionDir);
 	const requestedSessionFile = validateSessionFile(bootstrap.sessionFile, sessionDir);
+	// Keep SDK-only workers free of the native TUI transport and extension graph.
+	const nativeTerminalModule = bootstrap.terminalSocketPath ? await import("./native-terminal.js") : undefined;
+	const nativeExtensionModule = bootstrap.terminalSocketPath
+		? await import("./native-runtime-extension.js")
+		: undefined;
+	const terminal =
+		nativeTerminalModule && bootstrap.terminalSocketPath
+			? await nativeTerminalModule.createNativeTerminal({
+					socketPath: bootstrap.terminalSocketPath,
+					childId: bootstrap.childId,
+					token: deriveViewerToken(bootstrap.childId, bootstrap.token),
+				})
+			: undefined;
+	let mailboxService: MailboxService | undefined;
+	const nativeExtension =
+		terminal &&
+		nativeExtensionModule?.createNativeRuntimeExtension({
+			childId: bootstrap.childId,
+			...(bootstrap.teammateName !== undefined ? { name: bootstrap.teammateName } : {}),
+			...(bootstrap.teammateColor !== undefined ? { color: bootstrap.teammateColor } : {}),
+			terminal,
+			routeNativeInput: (text, idle) => {
+				if (!mailboxService || !bootstrap.teammateName) {
+					if (idle) throw new Error("This child has no parent-owned mailbox for a new assignment.");
+					return false;
+				}
+				const addressed = /^@([A-Za-z0-9][A-Za-z0-9._-]{0,63})\s+([\s\S]+)$/.exec(text);
+				const target = addressed?.[1];
+				const message = addressed?.[2];
+				if (target && message && bootstrap.teamDir) {
+					let authorized = false;
+					try {
+						const roster: unknown = JSON.parse(readFileSync(join(bootstrap.teamDir, "config.json"), "utf8"));
+						authorized = target === "lead" || rosterContainsParticipant(roster, target);
+					} catch {
+						// An unavailable roster cannot authorize a target.
+					}
+					if (authorized) {
+						const result = mailboxService.send(target, message);
+						if (!result.delivered) throw new Error(`Could not route native assignment: ${result.error}`);
+						return true;
+					}
+				}
+				// Unresolved mentions stay intact as ordinary input to this child.
+				if (!idle) return false;
+				const result = mailboxService.send(bootstrap.teammateName, text);
+				if (!result.delivered) throw new Error(`Could not admit native assignment: ${result.error}`);
+				return true;
+			},
+		});
 	const agentDir = getAgentDir();
 	const settingsManager = SettingsManager.create(bootstrap.configCwd, agentDir);
 	const modelRuntime =
@@ -120,20 +185,47 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		...(bootstrap.promptMode === "append" && bootstrap.systemPrompt.length > 0 ? [bootstrap.systemPrompt] : []),
 		...(bootstrap.instructions ? [bootstrap.instructions] : []),
 	];
+	let styleExtensionPaths: string[] = [];
+	if (terminal) {
+		try {
+			const { resolveChildStyleExtensions } = await import("./child-style-extensions.js");
+			styleExtensionPaths = await resolveChildStyleExtensions({
+				cwd: bootstrap.configCwd,
+				agentDir,
+				settingsManager,
+				...(bootstrap.presentationExtensionPaths !== undefined
+					? { parentExtensionPaths: bootstrap.presentationExtensionPaths }
+					: {}),
+			});
+		} catch (error) {
+			await terminal.close();
+			throw error;
+		}
+	}
+	const childExtensionOptions = {
+		noExtensions: true,
+		...(nativeExtension ? { extensionFactories: [nativeExtension] } : {}),
+		...(styleExtensionPaths.length > 0 ? { additionalExtensionPaths: styleExtensionPaths } : {}),
+	};
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: bootstrap.configCwd,
 		agentDir,
 		settingsManager,
-		noExtensions: true,
+		...childExtensionOptions,
 		...(bootstrap.promptMode === "replace" ? { systemPromptOverride: () => bootstrap.systemPrompt } : {}),
 		appendSystemPromptOverride: (existing) => [...existing, ...appendChildPrompts],
 	});
-	await resourceLoader.reload();
+	try {
+		await resourceLoader.reload();
+	} catch (error) {
+		await terminal?.close();
+		throw error;
+	}
 	const sessionManager = requestedSessionFile
 		? SessionManager.open(requestedSessionFile, sessionDir, bootstrap.cwd)
 		: SessionManager.create(bootstrap.cwd, sessionDir);
 
-	const mailboxService =
+	mailboxService =
 		bootstrap.teamDir && bootstrap.teamKey && bootstrap.teammateName
 			? new MailboxService({ teamDir: bootstrap.teamDir, teamKey: bootstrap.teamKey, self: bootstrap.teammateName })
 			: undefined;
@@ -163,9 +255,16 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		...(!requestedSessionFile && bootstrap.thinking !== undefined ? { thinkingLevel: bootstrap.thinking } : {}),
 		...(tools !== undefined ? { tools } : {}),
 	};
-	const { session } = await createAgentSession(sessionOptions);
+	let session: AgentSession;
+	try {
+		session = (await createAgentSession(sessionOptions)).session;
+	} catch (error) {
+		await terminal?.close();
+		throw error;
+	}
 	if (!session.model) {
 		session.dispose();
+		await terminal?.close();
 		throw new ChildProtocolError(
 			"model_unavailable",
 			"No authenticated native Pi model is selected for the child session",
@@ -176,27 +275,72 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		const unsupported = bootstrap.tools.find((tool) => !availableTools.has(tool));
 		if (unsupported !== undefined) {
 			session.dispose();
+			await terminal?.close();
 			throw new ChildProtocolError(
 				"unsupported_tool",
 				`Configured tool ${unsupported} is not available in the native Pi child runtime`,
 			);
 		}
 	}
+	let runtime: AgentSessionRuntime | undefined;
+	if (terminal) {
+		const currentServices: AgentSessionServices = {
+			cwd: bootstrap.cwd,
+			agentDir,
+			modelRuntime,
+			settingsManager,
+			resourceLoader,
+			diagnostics: [],
+		};
+		const createRuntimeFactory: CreateAgentSessionRuntimeFactory = async ({
+			cwd,
+			agentDir: runtimeAgentDir,
+			sessionManager: runtimeSessionManager,
+			sessionStartEvent,
+		}) => {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir: runtimeAgentDir,
+				settingsManager,
+				modelRuntime,
+				resourceLoaderOptions: {
+					...childExtensionOptions,
+					...(bootstrap.promptMode === "replace" ? { systemPromptOverride: () => bootstrap.systemPrompt } : {}),
+					appendSystemPromptOverride: (existing) => [...existing, ...appendChildPrompts],
+				},
+			});
+			const created = await createAgentSessionFromServices({
+				services,
+				sessionManager: runtimeSessionManager,
+				...(sessionStartEvent !== undefined ? { sessionStartEvent } : {}),
+				...(model ? { model } : {}),
+				...(customTools ? { customTools } : {}),
+				...(tools !== undefined ? { tools } : {}),
+			});
+			return { ...created, services, diagnostics: services.diagnostics };
+		};
+		runtime = new AgentSessionRuntime(session, currentServices, createRuntimeFactory);
+	}
 	try {
-		await session.bindExtensions({
-			mode: "rpc",
-			onError: (error) => console.error("Pi child extension runtime error:", error.error),
-		});
+		if (!terminal) {
+			await session.bindExtensions({
+				mode: "rpc",
+				onError: (error) => console.error("Pi child extension runtime error:", error.error),
+			});
+		}
 	} catch (error) {
 		session.dispose();
+		await terminal?.close();
 		throw error;
 	}
+	let interactiveMode: InteractiveMode | undefined;
 	let bridge: ChildBridgeHandle | undefined;
 	let mailbox: ChildMailboxHandle | undefined;
 	let unsubscribe = () => {};
 	let closePromise: Promise<void> | undefined;
 	const closeRuntime = (): Promise<void> =>
 		(closePromise ??= (async () => {
+			interactiveMode?.stop();
 			try {
 				await session.abort();
 			} finally {
@@ -205,7 +349,11 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 				try {
 					await bridge?.close();
 				} finally {
-					session.dispose();
+					try {
+						await terminal?.close();
+					} finally {
+						session.dispose();
+					}
 				}
 			}
 		})());
@@ -323,11 +471,13 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 	};
 	if (!session.sessionFile) {
 		session.dispose();
+		await terminal?.close();
 		throw new ChildProtocolError("session_not_persisted", "Pi did not create a persistent child session file");
 	}
 	const expectedSessionFile = requestedSessionFile;
 	if (expectedSessionFile && resolve(session.sessionFile) !== expectedSessionFile) {
 		session.dispose();
+		await terminal?.close();
 		throw new ChildProtocolError(
 			"session_mismatch",
 			"Pi opened a different session file than the child bootstrap requested",
@@ -338,6 +488,11 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		if (nativeEvent) bridge?.publishNativeEvent(nativeEvent);
 	});
 	try {
+		if (terminal) {
+			if (!runtime) throw new Error("Native terminal was created without its AgentSessionRuntime");
+			interactiveMode = new InteractiveMode(runtime, { terminal });
+			await interactiveMode.init();
+		}
 		bridge = await startChildBridge(bootstrap, host);
 		if (bootstrap.teamDir && bootstrap.teamKey && bootstrap.teammateName) {
 			const activeBridge = bridge;
@@ -350,10 +505,14 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 				steer: (text) => host.steer(text),
 			});
 		}
+		if (interactiveMode) {
+			void interactiveMode.run().catch((error: unknown) => {
+				console.error("Pi child native interactive mode failed:", error);
+				void closeRuntime();
+			});
+		}
 	} catch (error) {
-		mailbox?.close();
-		unsubscribe();
-		session.dispose();
+		await closeRuntime();
 		throw error;
 	}
 	return {

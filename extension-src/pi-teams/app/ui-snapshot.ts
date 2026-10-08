@@ -39,6 +39,7 @@ export function agentRowFromRecord(
 	const row: AgentListRow = {
 		id: record.id,
 		type: record.type,
+		...(record.teammateName !== undefined ? { teammateName: record.teammateName } : {}),
 		description: record.description,
 		status: record.status,
 		backend: record.backend,
@@ -47,6 +48,7 @@ export function agentRowFromRecord(
 		...(record.completedAt !== undefined ? { completedAt: record.completedAt } : {}),
 		toolUses: record.toolUses,
 		turns: record.turns,
+		totalTokens: record.usage.totalTokens,
 		isBackground: record.isBackground === true,
 		capabilities,
 	};

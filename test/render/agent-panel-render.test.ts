@@ -23,6 +23,7 @@ function row(overrides: Partial<AgentListRow> = {}): AgentListRow {
 		completedAt: undefined,
 		toolUses: 3,
 		turns: 5,
+		totalTokens: 146_500,
 		isBackground: true,
 		capabilities: { attachable: false, viewable: true, steerable: true, stoppable: true, resumable: false },
 		...overrides,
@@ -81,36 +82,34 @@ describe("agent panel rendering", () => {
 		}
 	});
 
-	it("shows the selected row's stop-armed state and run stats", () => {
-		const selectedRow = row({ id: "sel", backend: "process" });
-		const lines = renderAgentPanel(
-			{ view: view([selectedRow, row()]), selection: "sel", stopArmedFor: "sel" },
-			fg,
-			100,
-			NOW,
-		);
-		const joined = lines.join("\n");
-		expect(joined).toContain("main");
-		expect(joined).toContain("60s");
-		expect(joined).toContain("3 tools");
+	it("preserves teammate identity and frozen elapsed/token stats when a long description is truncated", () => {
+		const named = row({
+			teammateName: "lat1-mechanical",
+			description: "Lát 1 mechanical caller adaptation ".repeat(10),
+			status: "completed",
+			completedAt: 1_508_000,
+			activity: "RESULT_PREVIEW_MUST_NOT_APPEAR",
+		});
+		const lines = renderAgentPanel({ view: view([named]), selection: null, stopArmedFor: null }, fg, 100, 9_000_000);
+		const text = lines.join("\n");
+		expect(text).toContain("lat1-mechanical");
+		expect(text).toContain("25m 7s · ↓ 146.5k tokens");
+		expect(text).not.toContain("RESULT_PREVIEW_MUST_NOT_APPEAR");
 		assertWidthSafe(lines, 100);
 	});
-	it("labels verified closed resources and unconfirmed cleanup receipts honestly", () => {
-		const lines = renderAgentPanel(
-			{
-				view: view([
-					row({ status: "completed", resourceState: "closed", completedAt: 2_000 }),
-					row({ id: "uncertain", status: "completed", resourceState: "cleanup-unconfirmed", completedAt: 2_000 }),
-				]),
-				selection: "main",
-				stopArmedFor: null,
-			},
-			fg,
-			180,
-			NOW,
-		);
-		expect(lines.join("\n")).toContain("Pi process closed");
-		expect(lines.join("\n")).toContain("Pi process close unconfirmed");
+
+	it("keeps abort and unconfirmed cleanup warnings visible on narrow rows", () => {
+		for (const armed of [false, true]) {
+			const selected = row({ id: "uncertain", resourceState: "cleanup-unconfirmed" });
+			const lines = renderAgentPanel(
+				{ view: view([selected]), selection: selected.id, stopArmedFor: armed ? selected.id : null },
+				fg,
+				40,
+				NOW,
+			);
+			expect(lines.join("\n")).toContain(armed ? "x again to ABORT" : "cleanup unconfirmed");
+			assertWidthSafe(lines, 40);
+		}
 	});
 
 	it("windows long lists with more-indicators and keeps widths bounded", () => {

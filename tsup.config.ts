@@ -5,7 +5,7 @@ export default defineConfig({
 		"pi-teams": "extension-src/pi-teams/pi/index.ts",
 		"child-bridge": "extension-src/pi-teams/pi/child-bridge.ts",
 		"headless-child": "extension-src/pi-teams/pi/headless-child.ts",
-		"child-viewer": "extension-src/pi-teams/pi/child-viewer.ts",
+		"terminal-client": "extension-src/pi-teams/pi/terminal-client.ts",
 	},
 	format: ["esm"],
 	dts: false,

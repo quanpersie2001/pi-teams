@@ -828,10 +828,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			});
 			inlineListView = {
 				...listView,
-				rows: listView.rows.filter(
-					(row) =>
-						isActiveStatus(row.status) || row.resourceState === "idle" || row.resourceState === "cleanup-unconfirmed",
-				),
+				rows: listView.rows.filter((row) => isActiveStatus(row.status) || row.resourceState === "cleanup-unconfirmed"),
 			};
 
 			updateStatusLine();

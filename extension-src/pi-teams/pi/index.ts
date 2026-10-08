@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { createAgentFocusPort } from "../app/focus-service.js";
@@ -21,7 +22,7 @@ import { createPiTranscriptSource } from "./transcript-host.js";
 import { installSubagentsUi, type SubagentsUiHandle } from "./ui-host.js";
 import { createGitRunner, worktreeTmpRoot } from "./worktree-host.js";
 
-/** Parent extension. Child sessions load only their explicit control bridge. */
+/** Parent extension. Children load only specialist tools and allowlisted presentation extensions. */
 export default function (pi: ExtensionAPI): void {
 	if (shouldSkipExtensionInChildSession()) return;
 	const configCwd = process.cwd();
@@ -29,6 +30,14 @@ export default function (pi: ExtensionAPI): void {
 	let latestCtx: ExtensionContext | undefined;
 	const backend = new ProcessAgentExecutionBackend({
 		launcherHint: resolveLauncherHint(),
+		getParentExtensionPaths: () => [
+			...new Set(
+				pi
+					.getCommands()
+					.filter((command) => command.source === "extension" && isAbsolute(command.sourceInfo.path))
+					.map((command) => command.sourceInfo.path),
+			),
+		],
 		getParentModel: () => {
 			const model = latestCtx?.model;
 			return model ? `${model.provider}/${model.id}` : undefined;

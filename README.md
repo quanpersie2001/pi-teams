@@ -1,12 +1,13 @@
 # @quandev104/pi-teams
 
+[![CI](https://github.com/quanpersie2001/pi-teams/actions/workflows/ci.yml/badge.svg)](https://github.com/quanpersie2001/pi-teams/actions/workflows/ci.yml)
 [![Pi compatibility](https://img.shields.io/badge/Pi-%3E%3D1.0.4%20%3C1.1.0-8b5cf6)](https://pi.dev)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.19-339933)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
 > Specialist agents in independent Pi processes — with live steering, native session history, and a shared Agents Hub.
 
-Delegate implementation, local exploration, external research, and code review without hosting child `AgentSession`s in the parent. Each agent executes in an independent native Pi SDK process; optional HerdR/tmux viewers present and control it without owning execution.
+Delegate implementation, local exploration, external research, and code review without hosting child `AgentSession`s in the parent. Each agent executes in an independent native Pi SDK process. HerdR/tmux panes attach to Pi's real `InteractiveMode` in that same process through a detachable terminal transport.
 
 [Install](#install) · [Quick start](#quick-start) · [Bundled agents](#bundled-agents) · [Configuration](#configuration) · [Documentation](#documentation) · [Related extensions](#related-extensions)
 
@@ -14,7 +15,7 @@ Delegate implementation, local exploration, external research, and code review w
 
 ## Features
 
-- **Independent execution** — native SDK workers with separate native Pi viewers in HerdR or tmux; presentation changes never restart execution.
+- **Independent execution and native UI** — SDK workers host Pi's own transcript, editor, footer and menus in HerdR/tmux; presentation changes never restart execution. Explicit headless workers do not initialize the TUI.
 - **Live control** — launch, inspect, steer, and stop runs over an authenticated, owner-only Unix socket. Live state never depends on terminal input or JSONL polling.
 - **Opt-in time budgets** — optional `timeout`/`idle_timeout` limits in seconds hard-stop runaway children; the idle clock refreshes on child output only, and enforcement stops when the parent session shuts down.
 - **One Agents Hub** — Main and child conversations share navigation, while keeping drafts, scroll positions, and tool expansion independent.
@@ -112,7 +113,7 @@ Children do not inherit the parent's conversation automatically. For change revi
 
 Native menus, dialogs, and ordinary cursor movement retain their arrows. The document-start gestures (double Left, Down from an empty prompt) work alongside editor-styling extensions whose custom editor still preserves native `Editor` semantics (such as `pi-style`); with an opaque custom editor they defer and `/agents`/Alt+G remain the entry points. Child `/model <provider/id>` and `/thinking <level>` commands affect only the focused live child. Unsupported commands preserve the draft and report an error; `/compact` is intentionally unavailable because native compaction aborts the active turn.
 
-HerdR/tmux count every live runtime-owned child, including unnamed active children and named idle teammates, excluding Main. Zero leaves Main alone; 1–3 use two horizontal partitions, with children stacked on the right; 4–6 use three equal horizontal partitions, with child rows 2+2, 3+2 and 3+3. Above six, all children are headless with no viewer panes. Returning to at most six restores viewers while preserving native execution PID, child ID, context and active assignment. Layout changes preserve focus and unrelated panes; unverified ownership/geometry is rejected.
+HerdR/tmux's six-child threshold counts every live runtime-owned child, including named idle teammates, excluding Main. Above six, every child pane closes; returning to at most six restores panes only for running assignments, preserving execution PID, child ID, context and style. Idle children never keep a pane. Layout uses the visible child panes: zero leaves Main alone; 1–3 use two horizontal partitions; 4–6 use three equal horizontal partitions, with child rows 2+2, 3+2 and 3+3. Layout changes preserve focus and unrelated panes; unverified ownership/geometry is rejected.
 
 ### Model-facing tools
 
@@ -127,7 +128,7 @@ HerdR/tmux count every live runtime-owned child, including unnamed active childr
 | `team_task_list` | List current-team tasks with their current `blockedBy` dependency IDs |
 | `team_task_get` | Read one current-team task by ID |
 
-Named teammates stay alive while idle. A new assignment under the same name reuses its native child and specialist role; mailbox messages start an assignment when idle or steer the active turn. The bridge watches its inbox automatically—models never poll. In the main composer, `@name message` routes directly to a live teammate; unresolved mentions retain normal inline behavior.
+Named teammates stay alive while idle, but their multiplexer panes close. A new assignment under the same name reuses its native child and specialist role and reopens its pane when presentation is eligible; mailbox messages start an assignment when idle or steer the active turn. The bridge watches its inbox automatically—models never poll. In the main composer, `@name message` routes directly to a live teammate; unresolved mentions retain normal inline behavior.
 `Agent(name: "review-api", color: "#e879f9")` sets an optional creation-time color (`#RGB` or `#RRGGBB`). Identity is stored in the team roster, not agent frontmatter. Later assignments inherit the existing color; attempts to change it fail before model admission. Native viewers and companion renderers receive the effective name/color; cold continuation never automatically restores another team's identity.
 Cold continuation from an older run is refused while another assignment retains that teammate's native child; assign the retained child or explicitly release it first.
 
@@ -156,7 +157,7 @@ Override operational settings in `.pi/teams.json` or globally in `~/.pi/agent/te
 }
 ```
 
-`backend` selects presentation: `auto` (default) detects HerdR → tmux and falls back to no viewer; `headless` never attaches a multiplexer. Precedence for new children: `/teams-backend <mode>` (current session) > `PI_TEAMS_BACKEND` > settings `backend` > `auto`. The env variable does not override a session switch, and switching affects only new children. Existing children retain their selected viewer launcher, subject to the all-headless threshold above six. Every child executes headlessly regardless of presentation. A forced unavailable viewer launcher fails explicitly.
+`backend` selects presentation: `auto` (default) detects HerdR → tmux and falls back to no pane; `headless` never attaches a multiplexer. Precedence for new children: `/teams-backend <mode>` (current session) > `PI_TEAMS_BACKEND` > settings `backend` > `auto`. The env variable does not override a session switch, and switching affects only new children. Existing children retain their selected presentation launcher, subject to the all-headless presentation threshold above six. Execution and native UI state remain in the same independent worker when panes close or reopen. A forced unavailable launcher fails explicitly.
 
 Global paths follow Pi's agent-directory override. Settings merge per key with project values winning. Agent definitions resolve in this order:
 
@@ -245,7 +246,7 @@ Worktree runs retain commits/checkouts for manual review and cherry-pick. Cleanu
 
 Cleanup refuses dirty/unpreserved changes and retains preserved branches. There is no automatic merge, cherry-pick, or force-prune. Worktrees isolate filesystems, not tools running as the same OS user.
 
-Anonymous children and their viewers close after durable finalization; named teammates retain idle execution until explicit release or session teardown. Closed rows leave the inline panel but remain in Hub history. Uncertain cleanup stays visible and retains its receipt; cold resume requires persisted native history and starts a new execution process.
+Anonymous children close after durable finalization; named teammates retain idle execution until explicit release or session teardown. Multiplexer panes close at native idle settlement and reopen on a new assignment without replacing retained workers or their context/style. Settled closed and idle rows leave the inline panel but remain in Hub history. Hub and inline rows show a compact name, description, elapsed time and token count. Uncertain cleanup stays visible and retains its receipt; cold resume requires persisted native history and starts a new execution process.
 
 ---
 
@@ -272,9 +273,19 @@ npm run check   # typecheck, lint, layer checks, build/tests, package smoke
 npm run dev:pi  # load the extension and skill with the installed peer CLI
 ```
 
-Source follows `shared → domain → features → app → pi`, enforced by dependency-cruiser. Parent, bridge, and headless entrypoints build into `dist/extensions/`.
+Source follows `shared → domain → features → app → pi`, enforced by dependency-cruiser. Parent, bridge, headless-worker and raw-terminal-client entrypoints build into `dist/extensions/`.
 
 Lifecycle/terminal changes also need isolated native-process smokes; UI changes need observation in the actual Pi TUI. Unit tests alone do not establish terminal compatibility. Native terminal/UI verification has used macOS; those smokes do not establish commercial-provider auth/quota or Linux/Windows behavior.
+
+GitHub **CI** runs on pushes and pull requests to `main` with Node 22, `npm ci`, typecheck, lint, dependency boundaries, serialized integration tests and package smoke. Hosted CI does not replace the native multiplexer smokes above.
+
+The manual **Release** workflow mirrors `pi-style`'s patch/minor/major/alpha/beta channels. Configure the repository Actions secret `NPM_TOKEN` with publish access to `@quandev104/pi-teams` (including unattended/2FA authorization). Repository rules must allow the release job's `contents: write` token to push its version commit and annotated tag. Secrets are repository-specific; an existing `pi-style` secret is not automatically inherited.
+
+```bash
+gh workflow run publish.yml --repo quanpersie2001/pi-teams --ref main -f version=patch
+```
+
+Release checks run before version changes; the workflow updates `package.json`, `package-lock.json` and the generated changelog, pushes the version commit/tag, publishes npm's `latest`/`alpha`/`beta` channel, then creates the GitHub Release. Failed npm publication fails the workflow rather than reporting a successful GitHub Release. Ordinary pushes run CI only; they do not publish.
 
 ---
 
@@ -290,7 +301,7 @@ Install `pi-style` separately to customize Pi's visual surfaces:
 pi install npm:@quandev104/pi-style
 ```
 
-`pi-style` is an optional companion, not a dependency of `pi-teams`.
+`pi-style` is an optional companion, not a dependency of `pi-teams`. Native HerdR/tmux children load Main's already-loaded `pi-style` source, including temporary `-e` sources, without loading other Main extensions. SDK-only/headless children do not load UI extensions. Closing and reattaching panes preserves the same native editor, footer and session-local style.
 
 ---
 

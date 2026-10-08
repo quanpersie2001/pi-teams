@@ -66,6 +66,16 @@ describe("child bridge over an owner-only Unix socket", () => {
 		expect(() => parseChildBootstrap({ ...bootstrap, thinking: "instant" })).toThrow(
 			"thinking must be a supported Pi thinking level",
 		);
+		for (const terminalSocketPath of [bootstrap.socketPath, "relative.sock", "/tmp/foreign-terminal.sock"]) {
+			expect(() => parseChildBootstrap({ ...bootstrap, terminalSocketPath })).toThrow();
+		}
+		for (const presentationExtensionPaths of [
+			"not-an-array",
+			["relative.ts"],
+			Array.from({ length: 129 }, () => "/tmp/style.ts"),
+		]) {
+			expect(() => parseChildBootstrap({ ...bootstrap, presentationExtensionPaths })).toThrow();
+		}
 		const history: TranscriptItem[] = Array.from({ length: 300 }, (_, index) => ({
 			kind: "assistant",
 			timestamp: index,
@@ -116,13 +126,6 @@ describe("child bridge over an owner-only Unix socket", () => {
 		const connectionTransitions: boolean[] = [];
 		first.subscribeConnection((connected) => connectionTransitions.push(connected));
 		clients.push(first, second, intruder);
-		const viewer = new ChildRpcClient({
-			socketPath: bootstrap.socketPath,
-			childId: bootstrap.childId,
-			token: deriveViewerToken(bootstrap.childId, TOKEN),
-			role: "viewer",
-		});
-		clients.push(viewer);
 		const initialConnection = first.connect();
 		void initialConnection.catch(() => undefined); // Awaited below after the server starts.
 		const childBridge = await startChildBridge(bootstrap, host);
@@ -131,20 +134,13 @@ describe("child bridge over an owner-only Unix socket", () => {
 		await expect(intruder.connect()).rejects.toMatchObject({ code: "unauthorized" });
 		const initial = await initialConnection;
 		await second.connect();
-		await viewer.connect();
-		const elevatedViewer = new ChildRpcClient({
+		const terminalClient = new ChildRpcClient({
 			socketPath: bootstrap.socketPath,
 			childId: bootstrap.childId,
 			token: deriveViewerToken(bootstrap.childId, TOKEN),
-			role: "owner",
 		});
-		clients.push(elevatedViewer);
-		await expect(elevatedViewer.connect()).rejects.toMatchObject({ code: "unauthorized" });
-		await expect(viewer.shutdown()).rejects.toMatchObject({ code: "forbidden" });
-		await expect(viewer.prompt("viewer-bypass", "Must not bypass parent admission")).rejects.toMatchObject({
-			code: "forbidden",
-		});
-		viewer.disconnect();
+		clients.push(terminalClient);
+		await expect(terminalClient.connect()).rejects.toMatchObject({ code: "unauthorized" });
 		expect(shutdownCalls).toBe(0);
 		expect(initial.transcript.cursor).toBe(history.length);
 		expect(initial.transcript.offset).toBeGreaterThan(0);

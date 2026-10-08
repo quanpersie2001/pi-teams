@@ -162,9 +162,11 @@ Selection precedence for new launches:
     > auto
 ```
 
-`auto` selects the first available viewer launcher — HerdR, then tmux, otherwise no viewer. Every assignment executes through native SDK in its own independent headless child, never the parent. `/teams-backend` without arguments reports the current mode, auto detection and any env override; switching affects future children and resets at the next session start. Existing children keep their selected viewer launcher. Above six live runtime-owned children, every viewer closes; returning to at most six restores presentation without relaunching execution. A forced unavailable viewer launcher fails explicitly.
+`auto` selects the first available presentation launcher — HerdR, then tmux, otherwise no pane. Every assignment executes through native SDK in its own independent child, never the parent. Multiplexer-configured workers host Pi's actual interactive UI; explicit headless workers remain SDK-only. `/teams-backend` without arguments reports the current mode, auto detection and any env override; switching affects future children and resets at the next session start. Existing children keep their selected presentation launcher. Idle settlement closes the pane while retaining named execution/context/style; a new assignment reopens it. Above six live runtime-owned children (including idle teammates), every pane closes; returning to at most six reattaches only running assignments to the same execution and native UI without replaying input. A forced unavailable launcher fails explicitly.
 
-Requires Node >=22.19, Unix sockets and Pi peers >=1.0.4 <1.1.0. Interactive launchers use the installed peer's CLI, not global `pi` from PATH. Headless supports the same parent Hub/focus without terminal attachment.
+Requires Node >=22.19, Unix sockets and Pi peers >=1.0.4 <1.1.0. Interactive presentation uses the installed peer's public `InteractiveMode` APIs and the packaged raw terminal client, not global `pi` from PATH or a second Pi CLI session. Headless supports the same parent Hub/focus without terminal attachment.
+
+Optional `pi-style`: native children reuse its actual loaded Main source (installed/configured packages or temporary `-e` sources), not a hardcoded installation path. Other Main extensions are excluded. Standalone backend callers without a Main source snapshot resolve enabled configured `pi-style` resources locally; missing packages are not installed. SDK-only/headless children stay unstyled. Child tool pins remain authoritative even when `pi-style` normally enables its read-only tools.
 
 ## 7. Persistence artifacts
 

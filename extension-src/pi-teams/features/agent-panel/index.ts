@@ -38,10 +38,17 @@ function rightAlign(left: string, right: string, width: number): string {
 
 function formatAgentRowStats(row: AgentListRow, now: number): string {
 	const elapsedMs = Math.max(0, (row.completedAt ?? now) - row.startedAt);
-	const parts = [formatElapsedMs(elapsedMs)];
-	if (row.toolUses > 0) parts.push(`${row.toolUses} tool${row.toolUses === 1 ? "" : "s"}`);
-	if (row.turns > 0) parts.push(`${row.turns} turn${row.turns === 1 ? "" : "s"}`);
-	return parts.join(" · ");
+	const elapsed =
+		elapsedMs >= 60_000
+			? `${Math.floor(elapsedMs / 60_000)}m ${Math.floor(elapsedMs / 1_000) % 60}s`
+			: formatElapsedMs(elapsedMs);
+	const tokens =
+		row.totalTokens >= 1_000_000
+			? `${(row.totalTokens / 1_000_000).toFixed(1)}m`
+			: row.totalTokens >= 1_000
+				? `${(row.totalTokens / 1_000).toFixed(1)}k`
+				: String(row.totalTokens);
+	return `${elapsed} · ↓ ${tokens} tokens`;
 }
 
 function renderRunRow(
@@ -53,35 +60,21 @@ function renderRunRow(
 	now: number,
 ): string {
 	const badge = statusBadge(row.status);
-	const bullet = selected ? fg("accent", "●") : fg("dim", "○");
-	const statusIcon = fg(badge.color, badge.icon);
-	const name = selected ? fg("text", row.type) : fg("muted", row.type);
-	const tags: string[] = [];
-	if (row.ownerRef !== undefined) tags.push(fg("dim", row.ownerRef));
-	if (row.branch !== undefined) tags.push(fg("dim", `⎇ ${row.branch}`));
-	if (row.backend === "process") {
-		const processLabel =
-			row.resourceState === "closed"
-				? "Pi process closed"
-				: row.resourceState === "cleanup-unconfirmed"
-					? "Pi process close unconfirmed"
-					: row.resourceState === "idle"
-						? "Pi process idle"
-						: "Pi process";
-		tags.push(fg("dim", processLabel));
-	}
-	const tagText = tags.length > 0 ? ` ${tags.join(" ")}` : "";
+	const bullet = selected ? fg("accent", "⏺") : fg(badge.color, "◯");
+	const label = row.teammateName ?? row.type;
+	const name = selected ? fg("text", label) : fg("muted", label);
 	const description = selected ? fg("text", row.description) : row.description;
-	const activitySuffix = row.activity !== undefined ? fg("dim", ` · ${row.activity}`) : "";
-	const left = `  ${bullet} ${statusIcon} ${name}${tagText} — ${description}${activitySuffix}`;
+	const left = `  ${bullet} ${name}  ${description}`;
 	// The armed-stop warning replaces the stats on the right so it can never
 	// be truncated away on narrow viewports.
 	const statsRight =
 		selected && stopArmed
 			? fg("error", "x again to ABORT")
-			: selected
-				? fg("text", formatAgentRowStats(row, now))
-				: fg("dim", formatAgentRowStats(row, now));
+			: row.resourceState === "cleanup-unconfirmed"
+				? fg("error", "cleanup unconfirmed")
+				: selected
+					? fg("text", formatAgentRowStats(row, now))
+					: fg("dim", formatAgentRowStats(row, now));
 	return rightAlign(left, statsRight, width);
 }
 
@@ -99,8 +92,8 @@ export function renderAgentPanel(data: AgentPanelData, fg: ThemeFg, width: numbe
 	lines.push(truncateToWidth(` agents (${agents.length}) — ${fg("dim", hint)}`, width));
 	lines.push("");
 
-	const mainSelected = data.selection !== null && index === 0;
-	const mainBullet = mainSelected ? fg("accent", "●") : fg("dim", "○");
+	const mainSelected = data.selection === null || index === 0;
+	const mainBullet = mainSelected ? fg("accent", "⏺") : fg("dim", "◯");
 	const mainLabel = mainSelected ? fg("text", "main") : fg("dim", "main");
 	lines.push(truncateToWidth(`  ${mainBullet} ${mainLabel}`, width));
 

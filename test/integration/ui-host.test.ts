@@ -3,6 +3,9 @@
 // §5 keyboard table, composer routing, stop/dismiss, and settings/ownership.
 // Child-process execution and model requests are outside this host test.
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { EditorFactory } from "@earendil-works/pi-coding-agent";
 import { type Component, Editor, type TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
@@ -11,6 +14,7 @@ import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/p
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
 import type { AgentViewOverlay } from "../../extension-src/pi-teams/features/agent-view/index.js";
 import { registerAgentsCommand } from "../../extension-src/pi-teams/pi/commands.js";
+import { createPiTeamStore } from "../../extension-src/pi-teams/pi/teams-host.js";
 import { createPiTranscriptSource } from "../../extension-src/pi-teams/pi/transcript-host.js";
 import { installSubagentsUi, type SubagentsUiHandle } from "../../extension-src/pi-teams/pi/ui-host.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
@@ -31,7 +35,7 @@ interface Fixture {
 }
 
 async function makeFixture(
-	options: { agentPanel?: boolean; initialEditor?: EditorFactory; now?: () => number } = {},
+	options: { agentPanel?: boolean; initialEditor?: EditorFactory; now?: () => number; teamCwd?: string } = {},
 ): Promise<Fixture> {
 	const host = new FakePiHost({
 		mode: "tui",
@@ -40,6 +44,7 @@ async function makeFixture(
 	});
 	const backend = new FakeBackend();
 	let nextId = 0;
+	const teamCwd = options.teamCwd;
 	const app = createPiSubagentsApp({
 		sources: [],
 		loader: async () => [],
@@ -50,6 +55,7 @@ async function makeFixture(
 		backends: [backend],
 		cwd: "/tmp/project",
 		configCwd: "/tmp/project",
+		...(teamCwd ? { createTeamStore: (sessionId: string) => createPiTeamStore(teamCwd, sessionId) } : {}),
 		managerOverrides: {
 			idFactory: () => {
 				nextId += 1;
@@ -188,13 +194,48 @@ describe("inline UI installation", () => {
 			fx.backend.complete(second, "SECOND_FINISHED");
 			await fx.app.manager.waitForAll();
 			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(false));
-			fx.ui.openHub();
-			const hub = await fx.host.waitForOverlayOpen();
-			expect(hub.component?.render(120).join("\n")).toContain("FIRST_FINISHED");
-			expect(hub.component?.render(120).join("\n")).toContain("SECOND_FINISHED");
 		} finally {
 			fx.ui.dispose();
 			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("keeps an idle named teammate in the Hub but not inline beside active siblings", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-teams-idle-panel-"));
+		const fx = await makeFixture({ teamCwd: root });
+		try {
+			const named = await fx.app.manager.spawn({
+				type: "explore",
+				name: "idle-peer",
+				description: "RETAINED_PEER",
+				prompt: "read only",
+				run_in_background: true,
+			});
+			await vi.waitFor(() => expect(fx.app.manager.get(named.id)?.status).toBe("running"));
+			const active = await fx.spawn("ACTIVE_SIBLING");
+			fx.backend.complete(named.id, "PEER_FINISHED");
+			await vi.waitFor(() => {
+				const factory = fx.host.componentFactories.get("teams-agents");
+				const text = factory?.({ requestRender() {} }, fx.host.theme)
+					.render(120)
+					.join("\n");
+				expect(text).toContain("ACTIVE_SIBLING");
+				expect(text).not.toContain("RETAINED_PEER");
+			});
+			expect(fx.app.manager.get(named.id)?.handle).toBeDefined();
+			fx.backend.complete(active, "SIBLING_FINISHED");
+			await fx.app.manager.waitForAll();
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(false));
+			fx.ui.openHub();
+			const hub = await fx.host.waitForOverlayOpen();
+			const text = hub.component?.render(120).join("\n");
+			expect(text).toContain("RETAINED_PEER");
+			expect(text).toContain("idle-peer");
+			expect(fx.app.manager.get(named.id)?.handle).toBeDefined();
+		} finally {
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 
@@ -227,18 +268,15 @@ describe("keyboard table via onTerminalInput", () => {
 		expect(fx.host.emitTerminalInput("q")).toBe(false);
 	});
 
-	it("paints inline selection without opening Hub and drops it when a dialog takes focus", async () => {
+	it("keeps inline navigation out of the Hub and defers when a dialog takes focus", async () => {
 		const fx = await makeFixture();
 		await fx.spawn();
-		const { tui, panel } = mountMainEditor(fx);
-		expect(panel.render(100)[2]).toContain("○");
+		const { tui } = mountMainEditor(fx);
 		expect(fx.host.emitTerminalInput(DOWN)).toBe(true);
-		expect(panel.render(100)[2]).toContain("●");
 		expect(fx.host.overlays).toHaveLength(0);
 		tui.focusedComponent = { render: () => [], invalidate() {} };
 		expect(fx.host.emitTerminalInput(DOWN)).toBe(false);
 		expect(fx.host.emitTerminalInput(ENTER)).toBe(false);
-		expect(panel.render(100)[2]).toContain("○");
 	});
 
 	it("leaves slash/autocomplete, nonempty and multiline editor navigation to Pi", async () => {
@@ -286,10 +324,9 @@ describe("keyboard table via onTerminalInput", () => {
 	it("opens Hub with Left-left while inline bottom navigation is active", async () => {
 		const fx = await makeFixture();
 		await fx.spawn();
-		const { panel } = mountMainEditor(fx);
+		mountMainEditor(fx);
 		expect(fx.host.emitTerminalInput(DOWN)).toBe(true);
 		expect(fx.host.emitTerminalInput(LEFT)).toBe(false);
-		expect(panel.render(100)[2]).toContain("●");
 		expect(fx.host.overlays).toHaveLength(0);
 		expect(fx.host.emitTerminalInput(LEFT)).toBe(true);
 		await fx.host.waitForOverlayOpen();
@@ -520,11 +557,10 @@ describe("foreign editor that preserves Editor semantics (e.g. pi-style)", () =>
 		const foreignEditor: EditorFactory = () => ({ render: () => [] }) as never;
 		const fx = await makeFixture({ initialEditor: foreignEditor });
 		await fx.spawn();
-		const { editor, panel } = mountMainEditor(fx, (tui) => new StyledForeignEditor(tui, EDITOR_THEME));
+		const { editor } = mountMainEditor(fx, (tui) => new StyledForeignEditor(tui, EDITOR_THEME));
 
 		expect(editor.getText()).toBe("");
 		expect(fx.host.emitTerminalInput(DOWN)).toBe(true); // activation consumed
-		expect(panel.render(100)[2]).toContain("●");
 		expect(fx.host.emitTerminalInput(ESC)).toBe(true); // leave navigation
 		// Unhandled typing still flows to the foreign editor.
 		expect(fx.host.emitTerminalInput("q")).toBe(false);

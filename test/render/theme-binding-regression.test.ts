@@ -81,6 +81,7 @@ function panelRow(overrides: Partial<AgentListRow> = {}): AgentListRow {
 		completedAt: undefined,
 		toolUses: 3,
 		turns: 5,
+		totalTokens: 100,
 		isBackground: true,
 		capabilities: { attachable: false, viewable: true, steerable: true, stoppable: true, resumable: false },
 		...overrides,
