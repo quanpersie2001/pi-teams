@@ -3,6 +3,7 @@ import type { Component, Focusable, TUI, TuiMouseEvent, TuiMouseEventResult } fr
 import { CURSOR_MARKER, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentFocusSnapshot, AgentTranscriptView } from "../../domain/ui-view.js";
 import { formatElapsedMs } from "../../shared/elapsed.js";
+import { identityColor } from "../../shared/identity-color.js";
 import { statusBadge } from "../../shared/status.js";
 import type { AgentTranscriptPane } from "./transcript-pane.js";
 
@@ -59,22 +60,6 @@ function fitEditorViewport(lines: string[], maxRows: number): string[] {
 	return lines.slice(start, start + maxRows);
 }
 
-function restoreOverlayBackground(line: string, bgStart: string): string {
-	// biome-ignore lint/suspicious/noControlCharactersInRegex: CSI SGR escapes are the protocol being parsed.
-	return line.replace(/\x1b\[([0-9;]*)m/g, (sequence, parameters: string) => {
-		const codes = parameters === "" ? [0] : parameters.split(";").map(Number);
-		for (let index = 0; index < codes.length; index++) {
-			const code = codes[index];
-			if (code === 0 || code === 49) return `${sequence}${bgStart}`;
-			if (code === 38 || code === 48 || code === 58) {
-				if (codes[index + 1] === 5) index += 2;
-				else if (codes[index + 1] === 2) index += 4;
-			}
-		}
-		return sequence;
-	});
-}
-
 export function createAgentViewOverlay(options: {
 	tui: TUI;
 	theme: Theme;
@@ -84,7 +69,6 @@ export function createAgentViewOverlay(options: {
 	host: AgentViewOverlayHost;
 }): AgentViewOverlay {
 	const { tui, theme, keybindings, pane, editor, host } = options;
-	const bgStart = theme.bg("customMessageBg", "").replace("\x1b[49m", "");
 	let disposed = false;
 	let focused = true;
 	let abortArmed = false;
@@ -151,7 +135,8 @@ export function createAgentViewOverlay(options: {
 						? " · Pi process idle (retained teammate)"
 						: "";
 		const usage = `${view.usage.inputTokens} in / ${view.usage.outputTokens} out`;
-		const title = ` ${color(badge.color, badge.icon)} ${view.type} · ${usage} — ${view.description} · ${stats.join(" · ")}${state}`;
+		const name = view.teammateName ? identityColor(theme, view.teammateColor, `@${view.teammateName}`) : view.type;
+		const title = ` ${color(badge.color, badge.icon)} ${name} · ${usage} — ${view.description} · ${stats.join(" · ")}${state}`;
 		const truncation = focus?.truncatedHead || view.truncatedHead ? " · transcript is a bounded tail" : "";
 		return truncateToWidth(`${title}${truncation}`, width);
 	}
@@ -197,7 +182,7 @@ export function createAgentViewOverlay(options: {
 	function maskLine(line: string, width: number): string {
 		const clipped = truncateToWidth(line, width);
 		const padded = `${clipped}${" ".repeat(Math.max(0, width - visibleWidth(clipped)))}`;
-		return restoreOverlayBackground(theme.bg("customMessageBg", padded), bgStart);
+		return `\x1b[49m${padded}`;
 	}
 
 	function handleInput(data: string): void {

@@ -192,6 +192,8 @@ export function buildAgentTranscriptView(
 	return {
 		agentId: record.id,
 		type: record.type,
+		...(record.teammateName !== undefined ? { teammateName: record.teammateName } : {}),
+		...(record.teammateColor !== undefined ? { teammateColor: record.teammateColor } : {}),
 		description: record.description,
 		status: record.status,
 		backend: record.backend,

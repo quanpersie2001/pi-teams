@@ -55,7 +55,7 @@ The `Agent` tool's native `prepareLoadout` hook supplies the live enabled catalo
 
 Native user/assistant/tool components render normalized transcript items. A matched tool call/result renders **once** with the native result; orphan results remain visible in bounded history. Cached tool components update when output changes. Replayed completed tools do not invent an execution start or display a synthetic `Took 0.0s`.
 
-The header shows status, specialist/description, elapsed time, per-run tools/turns and input/output totals, followed by the child's model, thinking, native context usage and cwd when available. Unknown child state is not replaced by Main's state. The overlay fills the visible viewport and reapplies its background after ANSI resets.
+The header shows status, specialist/description, elapsed time, per-run tools/turns and input/output totals, followed by the child's model, thinking, native context usage and cwd when available. Unknown child state is not replaced by Main's state. The overlay fills the visible viewport with terminal-default background so Main remains hidden without recoloring the entire view. Its header and editor use the selected teammate's name and identity color; an optional pi-style detached editor uses the same identity and live style configuration without borrowing Main's snapshot.
 
 | Input | Action |
 |---|---|

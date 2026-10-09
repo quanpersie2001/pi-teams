@@ -185,7 +185,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 						read: () => (viewRunId === runId ? (viewData?.view.items ?? []) : []),
 						signature: () => `${runId}:${viewRevision}`,
 					});
-					const editor = createAgentSteerEditor(overlayTui, theme, keybindings);
+					const editor = createAgentSteerEditor(overlayTui, theme, keybindings, viewData?.view);
 					editor.setText(viewDrafts.get(runId) ?? "");
 					pane.restoreState(viewUiState.get(runId));
 					const component = createAgentViewOverlay({

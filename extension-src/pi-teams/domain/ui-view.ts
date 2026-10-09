@@ -82,6 +82,8 @@ export interface AgentListView {
 export interface AgentTranscriptView {
 	agentId: string;
 	type: string;
+	teammateName?: string;
+	teammateColor?: string;
 	description: string;
 	status: AgentRunStatus;
 	backend: "process";

@@ -234,6 +234,7 @@ describe("fullscreen agent transcript", () => {
 		const fixture = makeOverlay(messages);
 		const initial = fixture.overlay.render(80);
 		expect(initial).toHaveLength(24);
+		expect(initial.every((line) => line.startsWith("\x1b[49m"))).toBe(true);
 		expect(initial.every((line) => visibleWidth(line) === 80)).toBe(true);
 		const initialText = stripTerminalSequences(initial.join("\n"));
 		expect(initialText).toContain("message-79");
@@ -249,6 +250,13 @@ describe("fullscreen agent transcript", () => {
 		fixture.overlay.handleInput(PAGE_DOWN);
 		const returnedToTail = stripTerminalSequences(fixture.overlay.render(80).join("\n"));
 		expect(returnedToTail).toContain("LATEST_RPC_OUTPUT");
+		fixture.overlay.dispose();
+	});
+
+	it("shows the selected teammate's own name and color rather than Main's identity", () => {
+		const fixture = makeOverlay([], { teammateName: "scout", teammateColor: "#12ab34" });
+		const header = fixture.overlay.render(80)[0];
+		expect(header).toContain("\x1b[38;2;18;171;52m@scout\x1b[39m");
 		fixture.overlay.dispose();
 	});
 

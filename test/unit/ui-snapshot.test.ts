@@ -237,6 +237,14 @@ describe("activityFromTranscript", () => {
 });
 
 describe("buildAgentTranscriptView", () => {
+	it("projects the current run's teammate identity without borrowing a previous one", () => {
+		const named = buildAgentTranscriptView(makeRun({ teammateName: "scout", teammateColor: "#12ab34" }), []);
+		const anonymous = buildAgentTranscriptView(makeRun(), []);
+		expect(named).toMatchObject({ teammateName: "scout", teammateColor: "#12ab34" });
+		expect(anonymous.teammateName).toBeUndefined();
+		expect(anonymous.teammateColor).toBeUndefined();
+	});
+
 	it("keeps only the tail window and flags truncation", () => {
 		const run = makeRun();
 		const items: TranscriptItem[] = Array.from({ length: TRANSCRIPT_TAIL_ITEMS + 10 }, (_, i) =>
