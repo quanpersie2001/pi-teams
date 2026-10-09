@@ -14,20 +14,17 @@ it("loads child and native UI from an isolated Pi package without installing hos
 		if (!native) throw new Error("Native runtime chunk was not built");
 		const hostEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
 		const script = `await import(${JSON.stringify(pathToFileURL(join(dist, native)).href)}); await import(${JSON.stringify(pathToFileURL(join(dist, "headless-child.js")).href)});`;
-		const args = ["--import", join(dist, "child-module-loader.js"), "--input-type=module", "-e", script];
+		const loaderURL = pathToFileURL(join(dist, "child-module-loader.js")).href;
+		const args = ["--import", loaderURL, "--input-type=module", "-e", script];
 		const result = spawnSync(process.execPath, args, {
 			env: { ...process.env, PI_TEAMS_HOST_MODULE: hostEntry },
 			encoding: "utf8",
 		});
 		expect(result.status, result.stderr).toBe(0);
-		const viewer = spawnSync(
-			process.execPath,
-			["--import", join(dist, "child-module-loader.js"), join(dist, "terminal-client.js")],
-			{
-				env: { ...process.env, PI_TEAMS_HOST_MODULE: hostEntry, PI_TEAMS_TERMINAL_BOOTSTRAP: "" },
-				encoding: "utf8",
-			},
-		);
+		const viewer = spawnSync(process.execPath, ["--import", loaderURL, join(dist, "terminal-client.js")], {
+			env: { ...process.env, PI_TEAMS_HOST_MODULE: hostEntry, PI_TEAMS_TERMINAL_BOOTSTRAP: "" },
+			encoding: "utf8",
+		});
 		expect(viewer.status).toBe(1);
 		expect(viewer.stderr).toContain("PI_TEAMS_TERMINAL_BOOTSTRAP is required");
 	} finally {
