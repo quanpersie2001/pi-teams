@@ -20,6 +20,16 @@ it("loads child and native UI from an isolated Pi package without installing hos
 			encoding: "utf8",
 		});
 		expect(result.status, result.stderr).toBe(0);
+		const viewer = spawnSync(
+			process.execPath,
+			["--import", join(dist, "child-module-loader.js"), join(dist, "terminal-client.js")],
+			{
+				env: { ...process.env, PI_TEAMS_HOST_MODULE: hostEntry, PI_TEAMS_TERMINAL_BOOTSTRAP: "" },
+				encoding: "utf8",
+			},
+		);
+		expect(viewer.status).toBe(1);
+		expect(viewer.stderr).toContain("PI_TEAMS_TERMINAL_BOOTSTRAP is required");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

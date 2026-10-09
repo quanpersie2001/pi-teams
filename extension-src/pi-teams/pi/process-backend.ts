@@ -240,8 +240,8 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				childId: viewerId,
 				runDir: child.runDir,
 				cwd: child.bootstrap.cwd,
-				env: { PI_TEAMS_TERMINAL_BOOTSTRAP: viewerBootstrapFile },
-				interactiveArgv: [process.execPath, paths.terminalClient],
+				env: { PI_TEAMS_TERMINAL_BOOTSTRAP: viewerBootstrapFile, PI_TEAMS_HOST_MODULE: hostModuleEntry() },
+				interactiveArgv: [process.execPath, "--import", paths.moduleLoader, paths.terminalClient],
 				headlessCommand: process.execPath,
 				headlessArgv: [],
 			});

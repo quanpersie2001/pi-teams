@@ -546,10 +546,14 @@ describe("real process runtime", () => {
 		const provider = await localProvider({ holdRequests: [0, 1, 2] });
 		const panes = new Map<string, LauncherHandle>();
 		let nextPane = 0;
+		let viewerArgv: readonly string[] = [];
+		let viewerHostModule: string | undefined;
 		const presentation: ProcessLauncher = {
 			kind: "tmux",
 			available: async () => true,
 			launch: async (spec) => {
+				viewerArgv = spec.interactiveArgv;
+				viewerHostModule = spec.env.PI_TEAMS_HOST_MODULE;
 				const handle: LauncherHandle = {
 					kind: "tmux",
 					childId: spec.childId,
@@ -593,6 +597,13 @@ describe("real process runtime", () => {
 			expect(pid).not.toBe(process.pid);
 			expect(viewerAvailable).toBe(true);
 			expect(backend.hasViewer(worker)).toBe(true);
+			expect(viewerArgv).toEqual([
+				process.execPath,
+				"--import",
+				expect.stringContaining("child-module-loader.js"),
+				expect.stringContaining("terminal-client.js"),
+			]);
+			expect(viewerHostModule).toContain("pi-coding-agent");
 			expect(panes.has(initial.viewer.paneId)).toBe(true);
 
 			other = await backend.launch(launchInput("idle-pane-other-active", provider.cwd));
