@@ -61,8 +61,14 @@ function renderRunRow(
 ): string {
 	const badge = statusBadge(row.status);
 	const bullet = selected ? fg("accent", "⏺") : fg(badge.color, "◯");
-	const label = row.teammateName ?? row.type;
-	const name = selected ? fg("text", label) : fg("muted", label);
+	const label = row.teammateName ? `@${row.teammateName}` : row.type;
+	const color = row.teammateColor;
+	const name =
+		color && /^#[\da-f]{6}$/i.test(color)
+			? `\u001b[38;2;${Number.parseInt(color.slice(1, 3), 16)};${Number.parseInt(color.slice(3, 5), 16)};${Number.parseInt(color.slice(5, 7), 16)}m${label}\u001b[39m`
+			: selected
+				? fg("text", label)
+				: fg("muted", label);
 	const description = selected ? fg("text", row.description) : row.description;
 	const left = `  ${bullet} ${name}  ${description}`;
 	// The armed-stop warning replaces the stats on the right so it can never
@@ -82,14 +88,14 @@ function renderRunRow(
  * Render the whole panel. Returns [] when there is nothing to show — the host
  * then removes the widget entirely.
  */
-export function renderAgentPanel(data: AgentPanelData, fg: ThemeFg, width: number, now: number): string[] {
+export function renderAgentPanel(data: AgentPanelData, fg: ThemeFg, width: number, now: number, hub = false): string[] {
 	const agents = data.view.rows;
 	if (agents.length === 0 || width < 8) return [];
 	const index = selectionIndex(data.selection, agents) ?? 0;
 
 	const hint = data.selection !== null ? "↑↓ select · enter view · esc back · ←← hub" : "←← hub · ↓ to manage";
 	const lines: string[] = [];
-	lines.push(truncateToWidth(` agents (${agents.length}) — ${fg("dim", hint)}`, width));
+	lines.push(truncateToWidth(` team (${agents.length})${hub ? " — Team Hub" : ""} — ${fg("dim", hint)}`, width));
 	lines.push("");
 
 	const mainSelected = data.selection === null || index === 0;
@@ -192,7 +198,7 @@ export function createAgentHubComponent(
 			const content =
 				data.view.rows.length === 0
 					? [
-							" agents (0) — Agents Hub",
+							" team (0) — Team Hub",
 							"",
 							"  ● main",
 							"",
@@ -201,7 +207,7 @@ export function createAgentHubComponent(
 							"  click a child or use ↑↓ / Enter · Esc returns",
 						]
 					: [
-							...renderAgentPanel(data, fg, width, getNow()),
+							...renderAgentPanel(data, fg, width, getNow(), true),
 							"",
 							"  click a child or use ↑↓ / Enter · Esc returns · Alt+G closes",
 						];

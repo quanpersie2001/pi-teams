@@ -16,6 +16,11 @@
 - *(teams)* Freeze instance identity and reconcile native viewers
 - *(teams)* Restore styled native panes and close idle viewers
 
+### Fixed
+
+- Install Pi SDK/core/AI/TUI packages and TypeBox as direct runtime dependencies so standalone native children resolve their imports outside a development checkout.
+- Show one row per named teammate in the Team Hub instead of duplicating rows for mailbox assignments.
+
 ### Miscellaneous Tasks
 
 - Use supported Node 24 action runtimes
@@ -23,4 +28,3 @@
 ### Other
 
 - Pi-subagents → pi-teams (ADR 0008)
-

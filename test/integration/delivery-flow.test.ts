@@ -10,6 +10,7 @@ import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js"
 import { TEAMMATE_NOTIFICATION_TYPE } from "../../extension-src/pi-teams/domain/delivery.js";
 import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
 import { createPiDeliveryHost } from "../../extension-src/pi-teams/pi/delivery-host.js";
+import { registerSubagentTools } from "../../extension-src/pi-teams/pi/tools.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 import { FakePiHost } from "../helpers/fake-pi-host.js";
 
@@ -20,12 +21,16 @@ interface Fixture {
 	piEvents: Array<{ channel: string; payload: AgentLifecycleEvent }>;
 }
 
-async function makeFixture(sessionView?: {
-	sessionId?: string;
-	leafId?: string | null;
-	branch?: Array<{ id: string }>;
-}): Promise<Fixture> {
-	const host = new FakePiHost({ mode: "rpc", sessionView });
+async function makeFixture(
+	sessionView?: {
+		sessionId?: string;
+		leafId?: string | null;
+		branch?: Array<{ id: string }>;
+	},
+	holdMs = 0,
+	mode: "rpc" | "tui" = "rpc",
+): Promise<Fixture> {
+	const host = new FakePiHost({ mode, sessionView });
 	const latestCtx = host.extensionContext;
 	const backend = new FakeBackend();
 	let nextId = 0;
@@ -38,6 +43,7 @@ async function makeFixture(sessionView?: {
 		cwd: "/tmp/project",
 		configCwd: "/tmp/project",
 		deliveryHost: createPiDeliveryHost(host.extensionApi, () => latestCtx),
+		deliveryOptions: { holdMs },
 		managerOverrides: {
 			idFactory: () => {
 				nextId += 1;
@@ -95,6 +101,22 @@ describe("delivery host integration", () => {
 		fixture.app.delivery?.dispose();
 	});
 
+	it("clears notifications pending during session shutdown", async () => {
+		const fixture = await makeFixture({ sessionId: "session-a" }, 40);
+		const record = await fixture.app.manager.spawn({
+			type: "general-purpose",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(20);
+		fixture.backend.complete(record.id, "completed before shutdown");
+		await fixture.app.manager.waitForAll();
+		await fixture.app.sessionShutdown();
+		await settle(60);
+		expect(fixture.host.sentMessages).toHaveLength(0);
+		fixture.app.delivery?.dispose();
+	});
+
 	it("injects a teammate-notification custom message into the conversation on completion", async () => {
 		const fixture = await makeFixture({ sessionId: "session-a" });
 		const record = await fixture.app.manager.spawn({
@@ -126,6 +148,83 @@ describe("delivery host integration", () => {
 			status: "completed",
 			resultFile: "/tmp/teams/sessions/child-1/result.md",
 		});
+	});
+
+	it("groups actual parallel Agent tool calls rather than unrelated manager runs", async () => {
+		const fixture = await makeFixture({ sessionId: "session-a" }, 0, "tui");
+		registerSubagentTools(fixture.host.extensionApi, fixture.app.manager, fixture.app.registry, fixture.app.delivery);
+		const agent = (
+			fixture.host.registeredTools as Array<{
+				name: string;
+				execute: (
+					id: string,
+					params: Record<string, unknown>,
+					signal: undefined,
+					update: undefined,
+					ctx: unknown,
+				) => Promise<unknown>;
+			}>
+		).find((tool) => tool.name === "Agent");
+		if (!agent) throw new Error("Agent tool not registered");
+		const launch = (name: string, color: string) =>
+			agent.execute(
+				name,
+				{
+					subagent_type: "general-purpose",
+					name,
+					color,
+					description: "map project",
+					prompt: "explore",
+					run_in_background: true,
+				},
+				undefined,
+				undefined,
+				fixture.host.extensionContext,
+			);
+		const receipts = await Promise.all([launch("alpha", "#aabbcc"), launch("beta", "#bbccdd")]);
+		expect(receipts.map((result) => (result as { terminate?: boolean }).terminate)).toEqual([true, true]);
+		fixture.app.delivery?.finishSpawnBatch(); // pi/index.ts wires this to turn_end.
+		await settle(20);
+		fixture.backend.complete("run-1", "first result");
+		fixture.backend.complete("run-2", "second result");
+		await settle();
+		expect(fixture.host.sentMessages).toHaveLength(1);
+		expect(String(fixture.host.sentMessages[0]?.message.content)).toContain("@alpha");
+		expect(String(fixture.host.sentMessages[0]?.message.content)).toContain("@beta");
+	});
+
+	it("injects one model-visible notification for a batch, including each result path", async () => {
+		const fixture = await makeFixture({ sessionId: "session-a" });
+		const first = await fixture.app.manager.spawn({
+			type: "general-purpose",
+			name: "scout",
+			prompt: "explore",
+			run_in_background: true,
+		});
+		const second = await fixture.app.manager.spawn({
+			type: "general-purpose",
+			name: "reviewer",
+			prompt: "review",
+			run_in_background: true,
+		});
+		fixture.app.delivery?.trackSpawn(first.id);
+		fixture.app.delivery?.trackSpawn(second.id);
+		fixture.app.delivery?.finishSpawnBatch();
+		await settle(20);
+		fixture.backend.complete(first.id, "exploration result", undefined, { resultFile: "/tmp/scout/result.md" });
+		fixture.backend.complete(second.id, "review result", undefined, { resultFile: "/tmp/reviewer/result.md" });
+		await settle();
+		expect(fixture.host.sentMessages).toHaveLength(1);
+		const sent = fixture.host.sentMessages[0];
+		if (!sent) throw new Error("missing grouped notification");
+		expect(sent.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+		expect(String(sent.message.content)).toContain(
+			"@scout (completed):\nexploration result\nfull result: /tmp/scout/result.md",
+		);
+		expect(String(sent.message.content)).toContain(
+			"@reviewer (completed):\nreview result\nfull result: /tmp/reviewer/result.md",
+		);
+		expect(sent.message.details).toMatchObject({ agentId: first.id, others: [{ agentId: second.id }] });
 	});
 
 	it("addresses the completion notification by teammate name", async () => {

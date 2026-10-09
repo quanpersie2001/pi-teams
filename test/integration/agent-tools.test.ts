@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import { createPiDeliveryHost } from "../../extension-src/pi-teams/pi/delivery-host.js";
 import { registerSubagentTools } from "../../extension-src/pi-teams/pi/tools.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 import { FakePiHost } from "../helpers/fake-pi-host.js";
@@ -12,6 +13,8 @@ import { FakePiHost } from "../helpers/fake-pi-host.js";
 interface ToolLike {
 	name: string;
 	parameters?: { properties?: Record<string, { description?: string }> };
+	promptSnippet?: string;
+	renderCall?: (args: Record<string, unknown>) => { render: (width: number) => string[] };
 	prepareLoadout?: () => { descriptions?: Record<string, string> } | undefined;
 	execute: (
 		toolCallId: string,
@@ -19,7 +22,11 @@ interface ToolLike {
 		signal: AbortSignal | undefined,
 		onUpdate: unknown,
 		ctx: unknown,
-	) => Promise<{ content: Array<{ type: string; text?: string }>; details: Record<string, unknown> }>;
+	) => Promise<{
+		content: Array<{ type: string; text?: string }>;
+		details: Record<string, unknown>;
+		terminate?: boolean;
+	}>;
 }
 
 interface Fixture {
@@ -35,8 +42,9 @@ async function makeFixture(
 		sources: string[],
 	) => Promise<Array<{ sourcePath: string; frontmatter: Record<string, unknown>; body: string }>> = async () => [],
 	now?: () => number,
+	options: { mode?: "tui" | "rpc" | "json" | "print"; delivery?: boolean } = {},
 ): Promise<Fixture> {
-	const host = new FakePiHost({ mode: "rpc" });
+	const host = new FakePiHost({ mode: options.mode ?? "tui" });
 	const backend = new FakeBackend();
 	let nextId = 0;
 	const app = createPiSubagentsApp({
@@ -46,6 +54,12 @@ async function makeFixture(
 		backends: [backend],
 		cwd: "/tmp/project",
 		configCwd: "/tmp/project",
+		...(options.delivery
+			? {
+					deliveryHost: createPiDeliveryHost(host.extensionApi, () => host.extensionContext),
+					deliveryOptions: { holdMs: 0 },
+				}
+			: {}),
 		managerOverrides: {
 			idFactory: () => {
 				nextId += 1;
@@ -56,7 +70,7 @@ async function makeFixture(
 	});
 	// Load agent definitions (bundled defaults) so spawns can resolve types.
 	await app.sessionStart();
-	const registrations = registerSubagentTools(host.extensionApi, app.manager, app.registry);
+	const registrations = registerSubagentTools(host.extensionApi, app.manager, app.registry, app.delivery);
 	expect(registrations.map((entry) => entry.skipped ?? false)).toEqual([false, false, false]);
 	const tools = new Map<string, ToolLike>();
 	for (const tool of host.registeredTools as ToolLike[]) tools.set(tool.name, tool);
@@ -71,6 +85,7 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 }
 
 const NO_SIGNAL = undefined;
+const NAMED = { name: "worker", color: "#47a3e8" };
 
 describe("tool registration", () => {
 	it("declares the live enabled catalog with canonical names and effective descriptions", async () => {
@@ -95,6 +110,9 @@ describe("tool registration", () => {
 		expect(catalog).toContain("general-purpose");
 		expect(catalog).toContain("Project-selected specialist");
 		expect(catalog).not.toContain("hidden-specialist");
+		expect(catalog).toContain("Every NEW spawn MUST include a unique name");
+		expect(catalog).toContain("When the user asks to spawn subagents/teammates");
+		expect(agent?.promptSnippet).toContain("Spawn named, colored subagents");
 	});
 
 	it("skips registration when another party already claimed a name (collision gate)", async () => {
@@ -123,6 +141,51 @@ describe("tool registration", () => {
 });
 
 describe("Agent tool", () => {
+	it("explains the fields required for a new spawn without allocating a run", async () => {
+		const fixture = await makeFixture();
+		const agent = fixture.tools.get("Agent");
+		if (!agent) throw new Error("Agent tool not registered");
+		const result = await agent.execute(
+			"missing-role",
+			{ prompt: "work", name: "worker", color: "#47a3e8" },
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		expect(textOf(result)).toContain("requires subagent_type and description");
+		expect(result.terminate).toBeUndefined();
+		expect(fixture.app.manager.list()).toHaveLength(0);
+	});
+
+	it("refuses anonymous or colorless new spawns before model admission", async () => {
+		const fixture = await makeFixture();
+		const agent = fixture.tools.get("Agent");
+		if (!agent) throw new Error("Agent tool is not registered");
+		for (const identity of [{}, { name: "worker" }, { color: "#47a3e8" }]) {
+			const result = await agent.execute(
+				"missing-identity",
+				{ prompt: "work", description: "work", subagent_type: "general-purpose", ...identity },
+				NO_SIGNAL,
+				undefined,
+				fixture.host.extensionContext,
+			);
+			expect(textOf(result)).toContain("requires both name and color");
+		}
+		expect(fixture.backend.admissions).toHaveLength(0);
+		expect(fixture.app.manager.list()).toHaveLength(0);
+	});
+
+	it("renders the teammate's name and color in the launch call", async () => {
+		const fixture = await makeFixture();
+		const call = fixture.tools.get("Agent")?.renderCall?.({
+			...NAMED,
+			subagent_type: "explore",
+			description: "Map modules",
+		});
+		expect(call?.render(100).join("\n")).toContain("@worker");
+		expect(call?.render(100).join("\n")).toContain("38;2;71;163;232m");
+	});
+
 	it("withholds the started acknowledgement and run allocation until model admission resolves", async () => {
 		const fixture = await makeFixture();
 		const gate = Promise.withResolvers<void>();
@@ -134,7 +197,7 @@ describe("Agent tool", () => {
 		const pending = agentTool
 			.execute(
 				"pending-admission",
-				{ prompt: "work", description: "work", subagent_type: "general-purpose", run_in_background: true },
+				{ prompt: "work", description: "work", subagent_type: "general-purpose", ...NAMED, run_in_background: true },
 				NO_SIGNAL,
 				undefined,
 				fixture.host.extensionContext,
@@ -150,12 +213,50 @@ describe("Agent tool", () => {
 		expect(fixture.backend.launches).toEqual([]);
 		gate.resolve();
 		const result = await pending;
-		expect(textOf(result)).toBe("{agent:run-1 started}");
+		expect(textOf(result)).toBe("{agent:run-1 started as @worker}");
 		expect(result.details).toMatchObject({
 			agentId: "run-1",
 			model: "fake/fallback",
 			modelFallback: "Pinned model has no credentials",
 		});
+	});
+
+	it("pure interactive background launches terminate the coordinator batch, not the children", async () => {
+		const fixture = await makeFixture({}, async () => [], undefined, { delivery: true });
+		const agent = fixture.tools.get("Agent");
+		if (!agent) throw new Error("Agent tool not registered");
+		const launch = (name: string, color: string) =>
+			agent.execute(
+				`launch-${name}`,
+				{
+					prompt: "work",
+					description: "review",
+					subagent_type: "general-purpose",
+					name,
+					color,
+					run_in_background: true,
+				},
+				NO_SIGNAL,
+				undefined,
+				fixture.host.extensionContext,
+			);
+		const results = await Promise.all([launch("one", "#47a3e8"), launch("two", "#e879f9")]);
+		expect(results.map((result) => result.terminate)).toEqual([true, true]);
+		expect(fixture.app.manager.hasRunning()).toBe(true);
+		fixture.app.delivery?.finishSpawnBatch();
+		await new Promise<void>((resolve) => {
+			const poll = (): void => {
+				if (fixture.backend.launches.length === 2) resolve();
+				else setTimeout(poll, 5);
+			};
+			poll();
+		});
+		for (const launched of fixture.backend.launches)
+			fixture.backend.complete(launched.runId, `answer ${launched.runId}`);
+		await fixture.app.manager.waitForAll();
+		expect(fixture.host.sentMessages).toHaveLength(1);
+		expect(String(fixture.host.sentMessages[0]?.message.content)).toContain("@one");
+		expect(String(fixture.host.sentMessages[0]?.message.content)).toContain("@two");
 	});
 
 	it("returns admission failure without an ID, row or child launch", async () => {
@@ -165,7 +266,7 @@ describe("Agent tool", () => {
 		if (!agentTool) throw new Error("Agent tool is not registered");
 		const result = await agentTool.execute(
 			"rejected-admission",
-			{ prompt: "work", description: "work", subagent_type: "general-purpose", run_in_background: true },
+			{ prompt: "work", description: "work", subagent_type: "general-purpose", ...NAMED, run_in_background: true },
 			NO_SIGNAL,
 			undefined,
 			fixture.host.extensionContext,
@@ -183,6 +284,28 @@ describe("Agent tool", () => {
 		expect(admitted.id).toBe("run-1");
 	});
 
+	it.each(["rpc", "json", "print"] as const)("forces a background request inline in %s mode", async (mode) => {
+		const fixture = await makeFixture({}, async () => [], undefined, { mode, delivery: true });
+		const agent = fixture.tools.get("Agent");
+		if (!agent) throw new Error("Agent tool not registered");
+		const launched = fixture.backend.nextLaunch();
+		const pending = agent.execute(
+			"headless-call",
+			{ prompt: "work", description: "review", subagent_type: "general-purpose", ...NAMED, run_in_background: true },
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		const run = await launched;
+		expect(run.background).toBe(false);
+		fixture.backend.complete(run.runId, "inline result");
+		const result = await pending;
+		expect(textOf(result)).toBe("inline result");
+		expect(result.terminate).toBeUndefined();
+		expect(fixture.app.manager.get(run.runId)?.resultConsumed).toBe(true);
+		expect(fixture.host.sentMessages).toHaveLength(0);
+	});
+
 	it("foreground call blocks and returns the agent's output inline", async () => {
 		const fixture = await makeFixture();
 		const agent = fixture.tools.get("Agent");
@@ -191,7 +314,7 @@ describe("Agent tool", () => {
 
 		const pending = agent.execute(
 			"call-1",
-			{ prompt: "explore the code", description: "exploration", subagent_type: "general-purpose" },
+			{ prompt: "explore the code", description: "exploration", subagent_type: "general-purpose", ...NAMED },
 			NO_SIGNAL,
 			undefined,
 			fixture.host.extensionContext,
@@ -221,19 +344,44 @@ describe("Agent tool", () => {
 		expect(reread).toContain("foreground answer");
 	});
 
+	it("a foreground call cannot terminate the coordinator turn", async () => {
+		const fixture = await makeFixture({}, async () => [], undefined, { delivery: true });
+		const agent = fixture.tools.get("Agent");
+		if (!agent) throw new Error("Agent tool not registered");
+		const launched = fixture.backend.nextLaunch();
+		const pending = agent.execute(
+			"foreground-call",
+			{ prompt: "work", description: "review", subagent_type: "general-purpose", ...NAMED, run_in_background: false },
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		const run = await launched;
+		fixture.backend.complete(run.runId, "foreground result");
+		const result = await pending;
+		expect(textOf(result)).toBe("foreground result");
+		expect(result.terminate).toBeUndefined();
+	});
+
 	it("background call returns a started handle immediately", async () => {
 		const fixture = await makeFixture();
 		const agent = fixture.tools.get("Agent");
 
 		const result = await agent.execute(
 			"call-2",
-			{ prompt: "long work", description: "detached", subagent_type: "general-purpose", run_in_background: true },
+			{
+				prompt: "long work",
+				description: "detached",
+				subagent_type: "general-purpose",
+				...NAMED,
+				run_in_background: true,
+			},
 			NO_SIGNAL,
 			undefined,
 			fixture.host.extensionContext,
 		);
 
-		expect(textOf(result)).toMatch(/^\{agent:run-\d+ started\}$/);
+		expect(textOf(result)).toMatch(/^\{agent:run-\d+ started as @worker\}$/);
 		expect(result.details.background).toBe(true);
 	});
 
@@ -248,6 +396,7 @@ describe("Agent tool", () => {
 				description: "detached",
 				subagent_type: "general-purpose",
 				name: "scout",
+				color: "#e879f9",
 				run_in_background: true,
 			},
 			NO_SIGNAL,
@@ -257,6 +406,7 @@ describe("Agent tool", () => {
 
 		expect(textOf(result)).toMatch(/^\{agent:run-\d+ started as @scout\}$/);
 		expect(result.details.teammateName).toBe("scout");
+		expect(result.details.color).toBe("#e879f9");
 		expect(fixture.app.manager.get(String(result.details.agentId))?.teammateName).toBe("scout");
 	});
 
@@ -265,12 +415,73 @@ describe("Agent tool", () => {
 		const agent = fixture.tools.get("Agent");
 		const result = await agent.execute(
 			"call-3",
-			{ prompt: "x", description: "x", subagent_type: "no-such-agent" },
+			{ prompt: "x", description: "x", subagent_type: "no-such-agent", ...NAMED },
 			NO_SIGNAL,
 			undefined,
 			fixture.host.extensionContext,
 		);
 		expect(textOf(result)).toMatch(/Unknown, disabled, or ambiguous agent type/);
+	});
+});
+
+describe("cold resume tool", () => {
+	it("accepts resume and prompt without new-spawn-only schema fields", async () => {
+		const fixture = await makeFixture({}, async () => [], undefined, { delivery: true });
+		const firstLaunch = fixture.backend.nextLaunch();
+		const original = await fixture.app.manager.spawn({
+			type: "general-purpose",
+			name: "worker",
+			color: "#47a3e8",
+			prompt: "first",
+			run_in_background: true,
+		});
+		await firstLaunch;
+		fixture.backend.complete(original.id, "first result", "/tmp/sessions/first.jsonl");
+		await fixture.app.manager.whenSettled(original.id);
+		const agent = fixture.tools.get("Agent");
+		if (!agent) throw new Error("Agent tool not registered");
+		expect(agent.parameters).toMatchObject({ required: ["prompt"] });
+		const result = await agent.execute(
+			"resume",
+			{ resume: original.id, prompt: "continue", run_in_background: true },
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		expect(textOf(result)).toContain(`resumed from ${original.id}`);
+		expect(result.terminate).toBe(true);
+		expect(fixture.backend.resumes).toHaveLength(1);
+	});
+
+	it("waits for a cold resume inline when there is no interactive parent turn", async () => {
+		const fixture = await makeFixture({}, async () => [], undefined, { mode: "rpc", delivery: true });
+		const firstLaunch = fixture.backend.nextLaunch();
+		const original = await fixture.app.manager.spawn({
+			type: "general-purpose",
+			prompt: "first",
+			run_in_background: false,
+		});
+		await firstLaunch;
+		fixture.backend.complete(original.id, "first result", "/tmp/sessions/first.jsonl");
+		await fixture.app.manager.whenSettled(original.id);
+		const previousNotifications = fixture.host.sentMessages.length;
+		const agent = fixture.tools.get("Agent");
+		if (!agent) throw new Error("Agent tool not registered");
+		const nextLaunch = fixture.backend.nextLaunch();
+		const pending = agent.execute(
+			"resume",
+			{ resume: original.id, prompt: "continue", run_in_background: true },
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		const resumed = await nextLaunch;
+		expect(resumed.background).toBe(false);
+		fixture.backend.complete(resumed.runId, "continued inline");
+		const result = await pending;
+		expect(textOf(result)).toBe("continued inline");
+		expect(result.terminate).toBeUndefined();
+		expect(fixture.host.sentMessages).toHaveLength(previousNotifications);
 	});
 });
 
@@ -369,7 +580,7 @@ describe("Agent tool time budgets", () => {
 		if (!agent) throw new Error("Agent tool is not registered");
 		const result = await agent.execute(
 			"bad-budget",
-			{ prompt: "work", description: "work", subagent_type: "general-purpose", timeout: 0 },
+			{ prompt: "work", description: "work", subagent_type: "general-purpose", ...NAMED, timeout: 0 },
 			NO_SIGNAL,
 			undefined,
 			fixture.host.extensionContext,
@@ -377,7 +588,7 @@ describe("Agent tool time budgets", () => {
 		expect(textOf(result)).toMatch(/invalid timeout/);
 		const idleResult = await agent.execute(
 			"bad-idle",
-			{ prompt: "work", description: "work", subagent_type: "general-purpose", idle_timeout: 2.5 },
+			{ prompt: "work", description: "work", subagent_type: "general-purpose", ...NAMED, idle_timeout: 2.5 },
 			NO_SIGNAL,
 			undefined,
 			fixture.host.extensionContext,
@@ -394,7 +605,7 @@ describe("Agent tool time budgets", () => {
 
 		const pending = agent.execute(
 			"budgeted-foreground",
-			{ prompt: "long work", description: "budgeted", subagent_type: "general-purpose", timeout: 1 },
+			{ prompt: "long work", description: "budgeted", subagent_type: "general-purpose", ...NAMED, timeout: 1 },
 			NO_SIGNAL,
 			undefined,
 			fixture.host.extensionContext,
@@ -436,6 +647,7 @@ describe("Agent tool time budgets", () => {
 				prompt: "long work",
 				description: "detached",
 				subagent_type: "general-purpose",
+				...NAMED,
 				run_in_background: true,
 				idle_timeout: 1,
 			},
@@ -443,7 +655,7 @@ describe("Agent tool time budgets", () => {
 			undefined,
 			fixture.host.extensionContext,
 		);
-		expect(textOf(result)).toMatch(/^\{agent:run-\d+ started\}$/);
+		expect(textOf(result)).toMatch(/^\{agent:run-\d+ started as @worker\}$/);
 
 		await advance(1_100);
 		fixture.backend.settleStopped("run-1");

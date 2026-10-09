@@ -65,6 +65,21 @@ afterEach(async () => {
 });
 
 describe("native terminal Unix transport", () => {
+	it("supports Pi 1.1 program status reports during interactive startup", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "pi-teams-terminal-"));
+		terminal = await createNativeTerminal({
+			socketPath: join(tempDir, "terminal.sock"),
+			childId: "child-native-1",
+			token: TOKEN,
+		});
+		const socket = await attach();
+		const output = nextFrame(socket);
+		terminal.setProgramStatus({ state: "idle", app: "pi" });
+		expect(Buffer.from(String((await output).data), "base64").toString("utf8")).toBe(
+			"\u001b]7501;state=idle:app=pi\u001b\\",
+		);
+	});
+
 	it("rejects an unauthenticated replacement without interrupting the authorized presentation", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "pi-teams-terminal-"));
 		terminal = await createNativeTerminal({

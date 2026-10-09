@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -1052,6 +1052,32 @@ describe("real process runtime", () => {
 			if (handle && !disposed) await backend.dispose(handle);
 		}
 	}, 60_000);
+	it("runs a real headless child from an isolated package without installed host peers", async () => {
+		const provider = await localProvider();
+		const packageRoot = await mkdtemp(join(tmpdir(), "teams-isolated-package-"));
+		tempRoots.push(packageRoot);
+		const dist = join(packageRoot, "dist/extensions");
+		await cp(join(process.cwd(), "dist/extensions"), dist, { recursive: true });
+		const backend = new ProcessAgentExecutionBackend({
+			launcherHint: "headless",
+			connectTimeoutMs: 15_000,
+			entryPaths: {
+				headless: join(dist, "headless-child.js"),
+				terminalClient: join(dist, "terminal-client.js"),
+				moduleLoader: join(dist, "child-module-loader.js"),
+			},
+		});
+		let handle: AgentBackendHandle | undefined;
+		try {
+			handle = await backend.launch(launchInput("isolated-package-run", provider.cwd));
+			const status = await waitForTerminal(backend, handle);
+			expect(status.state).toBe("completed");
+			expect(status.result).toContain("process-child-ok");
+		} finally {
+			if (handle) await backend.dispose(handle);
+		}
+	}, 60_000);
+
 	it("cold-resumes a native Pi child from the original persisted session", async () => {
 		const provider = await localProvider();
 		const cwd = provider.cwd;

@@ -1013,7 +1013,11 @@ export class AgentManager {
 		}
 		if (source.handle !== undefined) {
 			const recovery = source.recoveryError ? ` ${source.recoveryError}` : "";
-			throw new Error(`Agent "${agentId}" still has a retained child; resolve its cleanup before resuming.${recovery}`);
+			const nextStep =
+				source.teammateName !== undefined && !source.recoveryError
+					? ` Named teammate @${source.teammateName} keeps its idle child: send_message to ${source.teammateName} or start a new Agent assignment with the same name/color. Cold resume requires releasing the child first.`
+					: " Release the retained child before cold resume; check recovery details if cleanup failed.";
+			throw new Error(`Agent "${agentId}" still has a retained child.${nextStep}${recovery}`);
 		}
 		if (source.sessionFile === undefined) {
 			throw new Error(`Agent "${agentId}" has no persisted session to resume from.`);

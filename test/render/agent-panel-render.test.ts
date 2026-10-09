@@ -85,6 +85,7 @@ describe("agent panel rendering", () => {
 	it("preserves teammate identity and frozen elapsed/token stats when a long description is truncated", () => {
 		const named = row({
 			teammateName: "lat1-mechanical",
+			teammateColor: "#e879f9",
 			description: "Lát 1 mechanical caller adaptation ".repeat(10),
 			status: "completed",
 			completedAt: 1_508_000,
@@ -92,7 +93,8 @@ describe("agent panel rendering", () => {
 		});
 		const lines = renderAgentPanel({ view: view([named]), selection: null, stopArmedFor: null }, fg, 100, 9_000_000);
 		const text = lines.join("\n");
-		expect(text).toContain("lat1-mechanical");
+		expect(text).toContain("@lat1-mechanical");
+		expect(text).toContain("\u001b[38;2;232;121;249m");
 		expect(text).toContain("25m 7s · ↓ 146.5k tokens");
 		expect(text).not.toContain("RESULT_PREVIEW_MUST_NOT_APPEAR");
 		assertWidthSafe(lines, 100);

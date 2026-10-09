@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { lstat, mkdir } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -33,6 +33,7 @@ import {
 import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
 import { deriveViewerToken } from "./child-rpc-auth.js";
 import { createTeamTaskTools } from "./team-task-tools.js";
+import { supportsTeammateStyleColor, syncTeammateStyleColor } from "./teammate-style-color.js";
 
 const CHILD_ENV = "PI_TEAMS_CHILD";
 
@@ -136,6 +137,7 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 				})
 			: undefined;
 	let mailboxService: MailboxService | undefined;
+	let styleExtensionPaths: string[] = [];
 	const nativeExtension =
 		terminal &&
 		nativeExtensionModule?.createNativeRuntimeExtension({
@@ -143,6 +145,7 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 			...(bootstrap.teammateName !== undefined ? { name: bootstrap.teammateName } : {}),
 			...(bootstrap.teammateColor !== undefined ? { color: bootstrap.teammateColor } : {}),
 			terminal,
+			showIdentityWidget: () => styleExtensionPaths.length === 0,
 			routeNativeInput: (text, idle) => {
 				if (!mailboxService || !bootstrap.teammateName) {
 					if (idle) throw new Error("This child has no parent-owned mailbox for a new assignment.");
@@ -185,7 +188,6 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		...(bootstrap.promptMode === "append" && bootstrap.systemPrompt.length > 0 ? [bootstrap.systemPrompt] : []),
 		...(bootstrap.instructions ? [bootstrap.instructions] : []),
 	];
-	let styleExtensionPaths: string[] = [];
 	if (terminal) {
 		try {
 			const { resolveChildStyleExtensions } = await import("./child-style-extensions.js");
@@ -262,6 +264,20 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 		await terminal?.close();
 		throw error;
 	}
+	// Pi-style reads the native session name for its right-hand editor-frame label.
+	// Set it before binding extensions, without touching specialist definitions.
+	// A cold continuation without current-team identity must not show an old
+	// teammate's @name from the persisted child session.
+	if (bootstrap.teammateName && styleExtensionPaths.length > 0) {
+		if (session.sessionName !== `@${bootstrap.teammateName}`) session.setSessionName(`@${bootstrap.teammateName}`);
+	} else if (requestedSessionFile && !bootstrap.teammateName && session.sessionName?.startsWith("@")) {
+		session.setSessionName("");
+	}
+	syncTeammateStyleColor(session.sessionManager, {
+		...(bootstrap.teammateColor ? { color: bootstrap.teammateColor } : {}),
+		styleEnabled: supportsTeammateStyleColor(styleExtensionPaths),
+		resumingWithoutTeammate: Boolean(requestedSessionFile && !bootstrap.teammateName),
+	});
 	if (!session.model) {
 		session.dispose();
 		await terminal?.close();
@@ -546,7 +562,7 @@ async function runAsProcess(): Promise<void> {
 }
 
 const entryPath = process.argv[1];
-if (entryPath && import.meta.url === pathToFileURL(resolve(entryPath)).href) {
+if (entryPath && import.meta.url === pathToFileURL(realpathSync(resolve(entryPath))).href) {
 	void runAsProcess().catch((error: unknown) => {
 		console.error("Failed to start Pi child runtime:", error);
 		process.exitCode = 1;

@@ -1,8 +1,8 @@
-# Agents Hub and remote child focus
+# Team Hub and remote child focus
 
 ## Layout and ownership
 
-The inline panel stays below Main's native editor. Down from an empty Main prompt selects inline bottom navigation at Main without opening an overlay. `/agents`, Alt+G or two consecutive Left presses within 500 ms at the start of Main's document opens the native Agents Hub with Main and current runs; an empty Hub still exposes Main. Selecting a child opens an opaque remote-focus overlay with native transcript components and its own composer. There is one parent renderer: no child InteractiveMode is mounted. Returning preserves Main's draft. `agentPanel: false` hides the UI without stopping children.
+The inline panel stays below Main's native editor. Down from an empty Main prompt selects inline bottom navigation at Main without opening an overlay. `/agents`, Alt+G or two consecutive Left presses within 500 ms at the start of Main's document opens the native Team Hub with Main and current teammates/runs; an empty Hub still exposes Main. Selecting a child opens an opaque remote-focus overlay with native transcript components and its own composer. There is one parent renderer: no child InteractiveMode is mounted. Returning preserves Main's draft. `agentPanel: false` hides the UI without stopping children.
 
 ```text
 Main: conversation → native editor → agents panel → native footer
@@ -19,18 +19,18 @@ Every launcher uses the same independent-process backend. Live state/transcript 
 `AgentManager` owns lifecycle and authoritative focus subscriptions; `app/focus-service.ts` projects native child snapshots without borrowing Main's model, thinking or cwd. Transcript adapters supply closed history, `pi/ui-host.ts` owns installation/routing, and feature renderers consume immutable snapshots and emit intent without filesystem, Git or backend I/O. Rendered lines fit the available visible width.
 
 Initial projection is rendered immediately after registry restore. Per-run turns/tool uses and input/output token totals come from authoritative AgentRun counters, not the whole resumed session history. Active transcript activity is bounded to one line; settled rows retain their own result/error even when a continuation appends to the same JSONL.
-Live focus adds native model, thinking, cwd and context usage plus capability-gated controls. Sequenced snapshots and partial-item upserts avoid duplicate streaming text on reconnect. Closed runs expose history and cold continuation, not live controls. The Hub lists the current manager projection, not every archived run after reload; durable history remains available to orchestration resume by run ID.
+Live focus adds native model, thinking, cwd and context usage plus capability-gated controls. Sequenced snapshots and partial-item upserts avoid duplicate streaming text on reconnect. Closed runs expose history and cold continuation, not live controls. The Hub lists one row per named teammate (its latest assignment) and one row per anonymous run from the current manager, not every archived run after reload. Mailbox messages create assignments, not extra teammate rows; durable run history remains available to orchestration by run ID.
 
-## Panel and Agents Hub
+## Panel and Team Hub
 
-The inline panel shows queued/starting/running agents and unconfirmed cleanup receipts. Settled runs with confirmed resources disappear automatically, including named teammates whose processes remain idle. When no active assignments or uncertain resources remain, the whole inline widget is removed. The Hub retains the current manager's history rows, including idle named teammates and closed runs; hiding an idle row does not release its process or context.
+The inline panel shows queued/starting/running agents and unconfirmed cleanup receipts. Settled runs with confirmed resources disappear automatically, including named teammates whose processes remain idle. When no active assignments or uncertain resources remain, the whole inline widget is removed. The Hub retains the latest row for each named teammate and the current manager's anonymous run history; hiding an idle row does not release its process or context.
 
-Hub and inline rows share a compact layout: one selection/status-colored circle, teammate name (specialist type for anonymous runs), description, then right-aligned elapsed time and total per-run tokens (`25m 7s · ↓ 146.5k tokens`, excluding cache reads). Rows omit process labels, result/activity previews, tool/turn counts, owner references and worktree branches; detailed transcript views retain diagnostic information. Settled elapsed time freezes at completion. Active Hub rows precede settled history. Abort confirmation and unconfirmed cleanup replace the right-hand stats so warnings remain visible on narrow rows.
+Hub and inline rows share a compact layout: one selection/status-colored circle, teammate name (specialist type for anonymous runs), description, then right-aligned elapsed time and total per-run tokens (`25m 7s · ↓ 146.5k tokens`, excluding cache reads). Rows omit process labels, result/activity previews, tool/turn counts, owner references and worktree branches; detailed transcript views retain diagnostic information. Settled elapsed time freezes at completion. Active Hub rows precede settled teammates and anonymous run history. Abort confirmation and unconfirmed cleanup replace the right-hand stats so warnings remain visible on narrow rows.
 
 | Input | Action |
 |---|---|
-| `/agents`, Alt+G | open Agents Hub |
-| Left twice within 500 ms at Main document start (including inline navigation) | open Agents Hub; first Left stays native |
+| `/agents`, Alt+G | open Team Hub |
+| Left twice within 500 ms at Main document start (including inline navigation) | open Team Hub; first Left stays native |
 | Down with empty Main prompt and visible inline rows | select Main in bottom navigation, not Hub |
 | Up / Down | select main/run |
 | PgUp / PgDn | page selection (six rows) |
@@ -89,7 +89,7 @@ Model/auth admission happens before a run or panel row exists. An unavailable pr
 
 An authenticated PID mismatch is a fatal control-identity failure, not a transient disconnect: unsubscribe/disconnect, stop reconnect attempts and reject steer/abort/resume/attachment. Retain the uncertain launcher receipt for recovery rather than trusting another process.
 
-Esc and panel dismissal do not kill active execution; closing a native viewer disconnects presentation only. Anonymous completion/failure/stop preserves outcome/session/worktree artifacts before closing execution and its viewer; named teammates remain alive while idle. Parent session shutdown tears down both execution and presentation. History rows remain. Cleanup errors retain authenticated recovery receipts; explicit release can retry cleanup:
+Esc and panel dismissal do not kill active execution; closing a native viewer disconnects presentation only. Anonymous completion/failure/stop preserves outcome/session/worktree artifacts before closing execution and its viewer; named teammates remain alive while idle. Parent session shutdown tears down both execution and presentation. The Hub keeps the latest teammate row and anonymous history rows. Cleanup errors retain authenticated recovery receipts; explicit release can retry cleanup:
 
 ```text
 /agents release <id>

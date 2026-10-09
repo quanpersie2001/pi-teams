@@ -25,6 +25,7 @@ import type { AgentOwner } from "../domain/delivery.js";
 import type { AgentLifecycleEvent, AgentLifecycleEventName } from "../domain/integration-protocol.js";
 import { isStaleExtensionCtxError } from "../shared/stale-context.js";
 import { type AgentManager, budgetStopNote } from "./agent-manager.js";
+import { CompletionQueue, type CompletionQueueOptions } from "./completion-queue.js";
 
 // -- session snapshot ----------------------------------------------------------
 
@@ -63,13 +64,14 @@ export interface CompletionNotification {
 	durationMs?: number;
 	/** totalTokens at settlement (cacheRead excluded), when usage was observed. */
 	totalTokens?: number;
+	/** Additional completions from the same Agent launch batch. */
+	others?: CompletionNotification[];
 }
 
 /**
  * Host port implemented by pi/delivery-host.ts. `sendNotification` injects a
- * custom message into the current conversation; implementations must tolerate
- * being called after a session replacement (stale-ctx swallow happens there,
- * with a defensive second pass here).
+ * custom message into the current conversation; stale-context failures must
+ * propagate so the service can record suppression without breaking settlement.
  */
 export interface DeliveryHost {
 	sendNotification(notification: CompletionNotification): void;
@@ -210,7 +212,7 @@ export interface DeliveryDecisionRecord {
 	at: number;
 }
 
-export interface DeliveryServiceOptions {
+export interface DeliveryServiceOptions extends CompletionQueueOptions {
 	now?: () => number;
 }
 
@@ -224,6 +226,7 @@ export class DeliveryService {
 	private readonly decisions: DeliveryDecisionRecord[] = [];
 	private readonly unsubscribe: () => void;
 	private readonly now: () => number;
+	private readonly queue: CompletionQueue;
 	private switchCount = 0;
 
 	constructor(
@@ -232,6 +235,7 @@ export class DeliveryService {
 		options: DeliveryServiceOptions = {},
 	) {
 		this.now = options.now ?? (() => Date.now());
+		this.queue = new CompletionQueue((events) => this.deliver(events), options);
 		this.unsubscribe = manager.subscribe((event) => this.handle(event));
 	}
 
@@ -254,17 +258,76 @@ export class DeliveryService {
 	 */
 	handleSessionSwitch(): void {
 		this.switchCount += 1;
+		this.queue.clear();
+	}
+
+	/** Drop queued conversation notifications at the end of an owning session. */
+	clearPending(): void {
+		this.queue.clear();
+	}
+
+	/** Successful background Agent tool launches in the current model turn. */
+	trackSpawn(id: string): void {
+		this.queue.trackSpawn(id);
+	}
+
+	/** Finish grouping after Pi has executed the turn's parallel tool calls. */
+	finishSpawnBatch(): void {
+		this.queue.finishBatch();
 	}
 
 	dispose(): void {
 		this.unsubscribe();
+		this.queue.clear();
 	}
 
 	// -- internals -----------------------------------------------------------------
 
 	private handle(event: AgentLifecycleEvent): void {
 		if (!NOTIFIABLE_EVENTS.includes(event.event)) return;
+		// Non-conversation events and inline calls do not participate in a join.
+		if (
+			event.owner.kind === "extension" ||
+			event.delivery === "event" ||
+			event.delivery === "none" ||
+			this.manager.get(event.agentId)?.isBackground === false
+		) {
+			this.deliver([event]);
+			return;
+		}
+		this.queue.add(event);
+	}
 
+	private deliver(events: AgentLifecycleEvent[]): void {
+		const notifications: CompletionNotification[] = [];
+		const accepted: Array<(reason: string) => void> = [];
+		for (const event of events) {
+			const notification = this.prepare(event);
+			if (notification) {
+				notifications.push(notification.notification);
+				accepted.push(notification.markDelivered);
+			}
+		}
+		if (notifications.length === 0) return;
+		try {
+			const [first, ...others] = notifications;
+			if (!first) return;
+			this.host.sendNotification(others.length > 0 ? { ...first, others } : first);
+		} catch (error) {
+			for (const mark of accepted) mark(isStaleExtensionCtxError(error) ? "stale-ctx-swallowed" : "send-failed");
+			if (!isStaleExtensionCtxError(error)) {
+				console.warn(
+					`[pi-teams] delivery of agents ${notifications.map((item) => item.agentId).join(", ")} failed: ${String(error)}`,
+				);
+			}
+			return;
+		}
+		for (const mark of accepted) mark("delivered");
+	}
+
+	private prepare(
+		event: AgentLifecycleEvent,
+	): { notification: CompletionNotification; markDelivered: (reason: string) => void } | undefined {
 		const record = (reason: string): void => {
 			this.decisions.push({
 				agentId: event.agentId,
@@ -281,7 +344,7 @@ export class DeliveryService {
 		const run = this.manager.get(event.agentId);
 		if (run?.isBackground === false || run?.resultConsumed === true) {
 			record("result-consumed-inline");
-			return;
+			return undefined;
 		}
 
 		const parentSessionId =
@@ -300,7 +363,7 @@ export class DeliveryService {
 		const guard = evaluateDeliveryGuard(guardInput);
 		if (!shouldDeliverToConversation(event.owner, event.delivery, guard)) {
 			record(guard.allowed ? `policy-blocked:${event.delivery}` : `guard-refused:${guard.reason}`);
-			return;
+			return undefined;
 		}
 
 		const previewSource = event.event === "completed" ? event.result : (event.error ?? event.result);
@@ -325,19 +388,6 @@ export class DeliveryService {
 			...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
 			...(event.usage !== undefined ? { totalTokens: event.usage.totalTokens } : {}),
 		};
-		try {
-			this.host.sendNotification(notification);
-		} catch (error) {
-			// Stale ctx (session replaced under us): expected refusal — swallow
-			// gracefully and record honestly; nothing was delivered. Any other
-			// transport error is logged-and-ignored so run settlement never breaks;
-			// in both cases the result stays recoverable (never deleted).
-			record(isStaleExtensionCtxError(error) ? "stale-ctx-swallowed" : "send-failed");
-			if (!isStaleExtensionCtxError(error)) {
-				console.warn(`[pi-teams] delivery of agent ${event.agentId} failed: ${String(error)}`);
-			}
-			return;
-		}
-		record("delivered");
+		return { notification, markDelivered: record };
 	}
 }

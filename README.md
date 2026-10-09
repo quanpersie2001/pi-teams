@@ -5,7 +5,7 @@
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.19-339933)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
-> Specialist agents in independent Pi processes — with live steering, native session history, and a shared Agents Hub.
+> Specialist agents in independent Pi processes — with live steering, native session history, and a shared Team Hub.
 
 Delegate implementation, local exploration, external research, and code review without hosting child `AgentSession`s in the parent. Each agent executes in an independent native Pi SDK process. HerdR/tmux panes attach to Pi's real `InteractiveMode` in that same process through a detachable terminal transport.
 
@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/2f715c97-838d-461c-a6a2-7122ae26facf
 - **Independent execution and native UI** — SDK workers host Pi's own transcript, editor, footer and menus in HerdR/tmux; presentation changes never restart execution. Explicit headless workers do not initialize the TUI.
 - **Live control** — launch, inspect, steer, and stop runs over an authenticated, owner-only Unix socket. Live state never depends on terminal input or JSONL polling.
 - **Opt-in time budgets** — optional `timeout`/`idle_timeout` limits in seconds hard-stop runaway children; the idle clock refreshes on child output only, and enforcement stops when the parent session shuts down.
-- **One Agents Hub** — Main and child conversations share navigation, while keeping drafts, scroll positions, and tool expansion independent.
+- **One Team Hub** — Main and child conversations share navigation, while keeping drafts, scroll positions, and tool expansion independent.
 - **Focused specialists** — four bundled roles, layered Markdown definitions, native `@agent` autocomplete, and a packaged `create-agent` skill.
 - **Recoverable sessions** — durable native JSONL history supports explicit cold continuation in a new child process. Anonymous children close after durable finalization; named teammates retain their native child while idle.
 - **Session-owned runs** — other sessions never adopt or control a conversation's live runs. Session end/switch/shutdown tears children down (abort → bounded grace → verified force-kill); control-socket loss stops an orphan with an annotated partial result. Startup archives stale owned rows instead of re-adopting them; foreign-owner rows remain untouched.
@@ -32,7 +32,7 @@ https://github.com/user-attachments/assets/2f715c97-838d-461c-a6a2-7122ae26facf
 
 ## Install
 
-**Requires:** Node.js ≥22.19, Pi peers ≥1.0.4 and <1.1.0, and Unix sockets. HerdR/tmux are optional; headless children still support the parent Hub and child view.
+**Requires:** Node.js ≥22.19, Pi ≥1.0.4 and <1.1.0, and Unix sockets. Pi supplies SDK, TUI and TypeBox to the parent extension. Standalone children resolve the same host packages from the running Pi installation through a Node module hook, without installing duplicate copies in the package. HerdR/tmux are optional; headless children still support the parent Hub and child view.
 
 Install the package with Pi:
 
@@ -61,11 +61,15 @@ The model launches agents through `Agent`. Example of a self-contained assignmen
 ```json
 {
   "subagent_type": "explore",
+  "name": "pi-compat",
+  "color": "#47a3e8",
   "description": "Check Pi compatibility",
   "prompt": "Read package.json. Report the supported Pi version range. Do not edit files.",
   "run_in_background": true
 }
 ```
+
+Every new model-facing `Agent` spawn requires `subagent_type`, `description`, `name` and `color`; `Agent(resume: ..., prompt: ...)` needs none of those new-spawn fields and inherits the original identity. The `name` is the visible `@name` and mailbox address, while the run ID remains available for result/steer/resume operations. External RPC consumers can still launch anonymous runs. In the interactive TUI, a tool batch containing only background Agent launches ends the coordinator turn; completed results arrive later in a new turn. A mixed batch continues normally. In print/JSON/RPC modes, Agent calls block and return their result inline, even when background was requested, because those modes cannot rely on a later interactive turn.
 
 Children do not inherit the parent's conversation automatically. For change reviews, include the actual diff/base context and verification evidence in the assignment prompt.
 
@@ -92,7 +96,7 @@ Children do not inherit the parent's conversation automatically. For change revi
 
 | Input | Action |
 |---|---|
-| `/agents` or **Alt+G** | Open the Main/children Agents Hub |
+| `/agents` or **Alt+G** | Open the Main/children Team Hub |
 | `/teams-backend [auto\|headless]` | Show or switch the launcher mode for this session (session-start value comes from settings/env) |
 | **Left twice within 500 ms** at Main's document start or from bottom navigation | Open Hub without losing the draft |
 | **Down** from empty Main | Enter the visible inline bottom navigation |
@@ -111,7 +115,7 @@ HerdR/tmux's six-child threshold counts every live runtime-owned child, includin
 | Tool | Purpose |
 |---|---|
 | `Agent` | Launch a specialist with an explicit assignment — optionally `name:` it a teammate of this session's team (`@name` becomes its messaging/board address; a name is refused while that teammate is still working, and a settled name means a new assignment for the same teammate) — or resume a settled run by `resume` run ID |
-| `get_subagent_result` | Inspect a run's status and read its full result — durable, re-readable from the run's `result.md` artifact on every call; `wait: true` blocks until the run settles |
+| `get_subagent_result` | Read a run's durable full result from `result.md`; use `wait: true` only when the current turn explicitly needs the answer immediately, not for passive background completions |
 | `steer_subagent` | Send guidance to an active run |
 | `send_message` | Send `{ target: "teammate-name" \| "lead", message: "..." }` through a signed peer mailbox |
 | `team_task_create` | Create `{ title, description?, dependencies? }` in the current team's board |
@@ -120,8 +124,8 @@ HerdR/tmux's six-child threshold counts every live runtime-owned child, includin
 | `team_task_get` | Read one current-team task by ID |
 
 Named teammates stay alive while idle, but their multiplexer panes close. A new assignment under the same name reuses its native child and specialist role and reopens its pane when presentation is eligible; mailbox messages start an assignment when idle or steer the active turn. The bridge watches its inbox automatically—models never poll. In the main composer, `@name message` routes directly to a live teammate; unresolved mentions retain normal inline behavior.
-`Agent(name: "review-api", color: "#e879f9")` sets an optional creation-time color (`#RGB` or `#RRGGBB`). Identity is stored in the team roster, not agent frontmatter. Later assignments inherit the existing color; attempts to change it fail before model admission. Native viewers and companion renderers receive the effective name/color; cold continuation never automatically restores another team's identity.
-Cold continuation from an older run is refused while another assignment retains that teammate's native child; assign the retained child or explicitly release it first.
+`Agent(name: "review-api", color: "#e879f9")` sets a required creation-time color for model-facing spawns (`#RGB` or `#RRGGBB`). Identity is stored in the team roster, not agent frontmatter. Later `Agent` assignments must pass the same color (the roster preserves it); attempts to change it fail before model admission. Native viewers and companion renderers receive the effective name/color; cold continuation never automatically restores another team's identity.
+A named teammate's settled child is normally retained while idle. To continue its live conversation, `send_message` to the teammate or give it a new `Agent` assignment under the same name/color. Cold `Agent(resume: ...)` requires explicit release of the retained child first; do not release merely to deliver a peer reply.
 
 Mailboxes use one owner-only, HMAC-signed file per message under `.pi/teams/t/<team-id>/inboxes/<name>/`. Invalid entries are quarantined with a warning. Messages are untrusted content and cannot approve permissions. Files are consumed only after native injection; they survive runtime reload as artifacts, but never revive a stopped session's children.
 
@@ -173,6 +177,8 @@ Precedence is the reverse of model/turn pinning: invocation > definition > setti
 ```json
 {
   "subagent_type": "explore",
+  "name": "config-audit",
+  "color": "#e879f9",
   "description": "Audit config loading with a budget",
   "prompt": "Trace how .pi/teams.json merges over the built-in defaults. Report every key and where it is read. Do not edit files.",
   "run_in_background": true,

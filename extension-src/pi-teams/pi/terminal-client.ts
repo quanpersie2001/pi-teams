@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import { connect } from "node:net";
 import { resolve } from "node:path";
@@ -225,7 +226,7 @@ export async function runTerminalClient(): Promise<void> {
 }
 
 const entryPath = process.argv[1];
-if (entryPath && import.meta.url === pathToFileURL(resolve(entryPath)).href) {
+if (entryPath && import.meta.url === pathToFileURL(realpathSync(resolve(entryPath))).href) {
 	runTerminalClient().catch((error: unknown) => {
 		process.stderr.write(`pi-teams terminal client: ${error instanceof Error ? error.message : String(error)}\n`);
 		process.exitCode = 1;

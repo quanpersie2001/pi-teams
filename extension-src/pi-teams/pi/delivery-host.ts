@@ -11,9 +11,9 @@
 //
 // The context is captured per session_start; after /new or /resume the
 // runtime may hand out a fresh context, so a previously captured one can go
-// stale — sendNotification therefore swallows stale-context rejections (see
-// shared/stale-context.ts) and the delivery guard refuses stale contexts on
-// positive evidence anyway (refuse-over-deliver).
+// stale — sendNotification lets stale-context rejections reach DeliveryService,
+// which records suppression. The delivery guard refuses on positive evidence
+// of a switch before attempting the send (refuse-over-deliver).
 
 import { chmodSync, type FSWatcher, mkdirSync, watch } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -21,7 +21,6 @@ import type { CompletionNotification, DeliveryHost, SessionSnapshot } from "../a
 import type { MailboxService } from "../app/mailbox-service.js";
 import { TEAMMATE_NOTIFICATION_TYPE } from "../domain/delivery.js";
 import { formatMailboxMessageForInjection, type MailboxMessage } from "../domain/mailbox.js";
-import { ignoreStaleExtensionCtx } from "../shared/stale-context.js";
 
 interface SessionManagerView {
 	getSessionId?: () => string;
@@ -94,27 +93,51 @@ export function createPiDeliveryHost(pi: ExtensionAPI, getContext: () => Extensi
 		const preview = notification.preview.trim();
 		const lines = [header, "", preview.length > 0 ? preview : "(no output)"];
 		if (notification.resultFile !== undefined) lines.push("", `full result: ${notification.resultFile}`);
-		ignoreStaleExtensionCtx(() => {
-			pi.sendMessage(
-				{
-					customType: TEAMMATE_NOTIFICATION_TYPE,
-					content: lines.join("\n"),
-					display: true,
-					details: {
-						agentId: notification.agentId,
-						...(notification.teammateName !== undefined ? { teammateName: notification.teammateName } : {}),
-						...(notification.teammateColor !== undefined ? { color: notification.teammateColor } : {}),
-						description: notification.description,
-						status: notification.status,
-						outcome: notification.outcome,
-						...(notification.resultFile !== undefined ? { resultFile: notification.resultFile } : {}),
-						...(notification.durationMs !== undefined ? { durationMs: notification.durationMs } : {}),
-						...(notification.totalTokens !== undefined ? { totalTokens: notification.totalTokens } : {}),
-					},
+		const others = notification.others ?? [];
+		const content =
+			others.length === 0
+				? lines.join("\n")
+				: [
+						`${others.length + 1} teammates reported from the same launch batch:`,
+						...[notification, ...others].map((item) => {
+							const name = item.teammateName ? `@${item.teammateName}` : item.agentId;
+							return (
+								`\n${name} (${item.outcome}):\n${item.preview.trim() || "(no output)"}` +
+								(item.resultFile ? `\nfull result: ${item.resultFile}` : "")
+							);
+						}),
+					].join("\n");
+		pi.sendMessage(
+			{
+				customType: TEAMMATE_NOTIFICATION_TYPE,
+				content,
+				display: true,
+				details: {
+					agentId: notification.agentId,
+					...(notification.teammateName !== undefined ? { teammateName: notification.teammateName } : {}),
+					...(notification.teammateColor !== undefined ? { color: notification.teammateColor } : {}),
+					description: notification.description,
+					status: notification.status,
+					outcome: notification.outcome,
+					...(notification.resultFile !== undefined ? { resultFile: notification.resultFile } : {}),
+					...(notification.durationMs !== undefined ? { durationMs: notification.durationMs } : {}),
+					...(notification.totalTokens !== undefined ? { totalTokens: notification.totalTokens } : {}),
+					...(others.length > 0
+						? {
+								others: others.map((item) => ({
+									agentId: item.agentId,
+									...(item.teammateName ? { teammateName: item.teammateName } : {}),
+									...(item.teammateColor ? { color: item.teammateColor } : {}),
+									status: item.status,
+									outcome: item.outcome,
+									...(item.resultFile ? { resultFile: item.resultFile } : {}),
+								})),
+							}
+						: {}),
 				},
-				{ deliverAs: "followUp", triggerTurn: true },
-			);
-		});
+			},
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
 	}
 
 	return { sendNotification, currentSession };

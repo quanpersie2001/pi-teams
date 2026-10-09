@@ -1,4 +1,4 @@
-// /agents command — alternative access path to the native Agents Hub.
+// /agents command — alternative access path to the native Team Hub.
 // /teams-backend — show or switch the multiplexer mode (auto | headless).
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../app/agent-manager.js";
@@ -13,7 +13,7 @@ export function registerAgentsCommand(
 	},
 ): void {
 	pi.registerCommand("agents", {
-		description: "Open the Agents Hub; release <id> [--worktree] cleans settled resources",
+		description: "Open the Team Hub; release <id> [--worktree] cleans settled resources",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const words = args.trim().split(/\s+/);
 			if (words[0] === "release") {

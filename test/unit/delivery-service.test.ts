@@ -30,6 +30,9 @@ async function makeFixture(
 		initialSession?: SessionSnapshot;
 		/** Throw from sendNotification (e.g. stale ctx). */
 		sendError?: Error;
+		holdMs?: number;
+		groupTimeoutMs?: number;
+		stragglerTimeoutMs?: number;
 	} = {},
 ): Fixture {
 	const backend = new FakeBackend();
@@ -62,7 +65,11 @@ async function makeFixture(
 			return sessionState;
 		},
 	};
-	const service = new DeliveryService(manager, host);
+	const service = new DeliveryService(manager, host, {
+		holdMs: options.holdMs ?? 0,
+		...(options.groupTimeoutMs !== undefined ? { groupTimeoutMs: options.groupTimeoutMs } : {}),
+		...(options.stragglerTimeoutMs !== undefined ? { stragglerTimeoutMs: options.stragglerTimeoutMs } : {}),
+	});
 	await registry.load();
 	return {
 		manager,
@@ -77,6 +84,8 @@ async function settle(flushTurns = 32): Promise<void> {
 	for (let turn = 0; turn < flushTurns; turn += 1) await Promise.resolve();
 }
 
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function spawnBackground(manager: AgentManager, request: Record<string, unknown> = {}): Promise<string> {
 	const record = await manager.spawn({
 		type: "general-purpose",
@@ -88,6 +97,117 @@ async function spawnBackground(manager: AgentManager, request: Record<string, un
 }
 
 describe("DeliveryService", () => {
+	it("joins a launch batch into one message and filters results fetched before dispatch", async () => {
+		const fixture = await makeFixture({ holdMs: 30 });
+		const ids = await Promise.all([
+			spawnBackground(fixture.manager),
+			spawnBackground(fixture.manager),
+			spawnBackground(fixture.manager),
+		]);
+		for (const id of ids) fixture.service.trackSpawn(id);
+		fixture.service.finishSpawnBatch();
+		await settle(20);
+		for (const [index, id] of ids.entries()) fixture.backend.complete(id, `report ${index}`);
+		await settle();
+		await fixture.manager.getResult(ids[1] ?? "missing", { wait: true });
+		await delay(60);
+		expect(fixture.notifications).toHaveLength(1);
+		expect([
+			fixture.notifications[0]?.agentId,
+			...(fixture.notifications[0]?.others ?? []).map((item) => item.agentId),
+		]).toEqual([ids[0], ids[2]]);
+		expect(fixture.service.getDecisionLog().filter((item) => item.reason === "delivered")).toHaveLength(2);
+		expect(fixture.service.getDecisionLog().filter((item) => item.reason === "result-consumed-inline")).toHaveLength(1);
+		fixture.service.dispose();
+	});
+
+	it("joins a child that settles before its Agent tool returns", async () => {
+		const fixture = await makeFixture({ holdMs: 30 });
+		const ids = await Promise.all([spawnBackground(fixture.manager), spawnBackground(fixture.manager)]);
+		await settle(20);
+		fixture.backend.complete(ids[0] ?? "missing", "fast result");
+		await settle();
+		for (const id of ids) fixture.service.trackSpawn(id);
+		fixture.service.finishSpawnBatch();
+		fixture.backend.complete(ids[1] ?? "missing", "slow result");
+		await delay(60);
+		expect(fixture.notifications).toHaveLength(1);
+		expect(fixture.notifications[0]?.others).toHaveLength(1);
+		fixture.service.dispose();
+	});
+
+	it("does not notify when every result in the batch was fetched", async () => {
+		const fixture = await makeFixture({ holdMs: 25 });
+		const ids = await Promise.all([spawnBackground(fixture.manager), spawnBackground(fixture.manager)]);
+		for (const id of ids) fixture.service.trackSpawn(id);
+		fixture.service.finishSpawnBatch();
+		await settle(20);
+		for (const id of ids) fixture.backend.complete(id, `report ${id}`);
+		await Promise.all(ids.map((id) => fixture.manager.getResult(id, { wait: true })));
+		await delay(50);
+		expect(fixture.notifications).toHaveLength(0);
+		fixture.service.dispose();
+	});
+
+	it("suppresses a single queued completion after get_subagent_result", async () => {
+		const fixture = await makeFixture({ holdMs: 25 });
+		const id = await spawnBackground(fixture.manager);
+		await settle(20);
+		fixture.backend.complete(id, "already read");
+		await fixture.manager.getResult(id, { wait: true });
+		await delay(50);
+		expect(fixture.notifications).toHaveLength(0);
+		expect(fixture.service.getDecisionLog()[0]?.reason).toBe("result-consumed-inline");
+		fixture.service.dispose();
+	});
+
+	it("rechecks the active branch during the notification hold", async () => {
+		const fixture = await makeFixture({ holdMs: 25, initialSession: { sessionId: "session-a", leafId: "leaf-1" } });
+		const id = await spawnBackground(fixture.manager, { parentSession: { sessionId: "session-a", leafId: "leaf-1" } });
+		await settle(20);
+		fixture.backend.complete(id, "result");
+		await settle();
+		fixture.session.leafId = "leaf-2";
+		fixture.session.branchIds = ["root", "leaf-2"];
+		await delay(50);
+		expect(fixture.notifications).toHaveLength(0);
+		expect(fixture.service.getDecisionLog()[0]?.reason).toBe("guard-refused:branch-moved");
+		fixture.service.dispose();
+	});
+
+	it("sends partial groups after timeout, then a later straggler", async () => {
+		const fixture = await makeFixture({ holdMs: 5, groupTimeoutMs: 25, stragglerTimeoutMs: 20 });
+		const ids = await Promise.all([
+			spawnBackground(fixture.manager),
+			spawnBackground(fixture.manager),
+			spawnBackground(fixture.manager),
+		]);
+		for (const id of ids) fixture.service.trackSpawn(id);
+		fixture.service.finishSpawnBatch();
+		await settle(20);
+		fixture.backend.complete(ids[0] ?? "missing", "first");
+		fixture.backend.complete(ids[1] ?? "missing", "second");
+		await delay(50);
+		expect(fixture.notifications).toHaveLength(1);
+		expect(fixture.notifications[0]?.others).toHaveLength(1);
+		fixture.backend.complete(ids[2] ?? "missing", "late");
+		await delay(40);
+		expect(fixture.notifications).toHaveLength(2);
+		expect(fixture.notifications[1]?.agentId).toBe(ids[2]);
+		fixture.service.dispose();
+	});
+
+	it("clears a queued notification when the parent session switches", async () => {
+		const fixture = await makeFixture({ holdMs: 30 });
+		const id = await spawnBackground(fixture.manager);
+		await settle(20);
+		fixture.backend.complete(id, "old session");
+		await settle();
+		fixture.service.handleSessionSwitch();
+		await delay(60);
+		expect(fixture.notifications).toHaveLength(0);
+		fixture.service.dispose();
+	});
 	it("delivers a completion notification for conversation-owned background runs", async () => {
 		const fixture = await makeFixture();
 		const id = await spawnBackground(fixture.manager);
@@ -212,10 +332,14 @@ describe("DeliveryService", () => {
 			},
 		});
 		const notifications: CompletionNotification[] = [];
-		const service = new DeliveryService(manager, {
-			sendNotification: (notification) => notifications.push(notification),
-			currentSession: () => ({ sessionId: "session-a" }),
-		});
+		const service = new DeliveryService(
+			manager,
+			{
+				sendNotification: (notification) => notifications.push(notification),
+				currentSession: () => ({ sessionId: "session-a" }),
+			},
+			{ holdMs: 0 },
+		);
 		await registry.load();
 
 		const pending = manager.spawnAndWait({ type: "general-purpose", prompt: "inline please" });
@@ -262,10 +386,14 @@ describe("DeliveryService", () => {
 			},
 		});
 		const notifications: CompletionNotification[] = [];
-		const service = new DeliveryService(manager, {
-			sendNotification: (notification) => notifications.push(notification),
-			currentSession: () => undefined,
-		});
+		const service = new DeliveryService(
+			manager,
+			{
+				sendNotification: (notification) => notifications.push(notification),
+				currentSession: () => undefined,
+			},
+			{ holdMs: 0 },
+		);
 		await registry.load();
 
 		const id = await spawnBackground(manager, { parentSession: { sessionId: "unknown-session" } });

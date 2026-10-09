@@ -17,6 +17,26 @@ const AUTH_TIMEOUT_MS = 5_000;
 type NativeTerminalOptions = { socketPath: string; childId: string; token: string };
 type Frame = Record<string, unknown>;
 
+// Pi >=1.1.0 extended the TUI `Terminal` contract with OSC 7501 program status.
+// Encoded locally so this extension keeps working against host Pi 1.0.x, where the type and method do not exist.
+type NativeProgramStatus = {
+	state: "idle" | "working" | "blocked" | "done" | "error" | "clear";
+	app?: string;
+	kind?: "permission" | "question" | "auth";
+	message?: string;
+};
+
+const PROGRAM_STATUS_APP_PATTERN = /^[A-Za-z0-9_.+-]{1,32}$/;
+
+function encodeProgramStatus(status: NativeProgramStatus): string {
+	const pairs = [`state=${status.state}`];
+	if (status.app !== undefined && PROGRAM_STATUS_APP_PATTERN.test(status.app)) pairs.push(`app=${status.app}`);
+	if (status.state === "blocked" && status.kind) pairs.push(`kind=${status.kind}`);
+	const message = (status.message ?? "").replace(/\p{Cc}/gu, " ").trim();
+	if (message) pairs.push(`msg=${Buffer.from(message, "utf8").toString("base64")}`);
+	return `\x1b]7501;${pairs.join(":")}\x1b\\`;
+}
+
 function validDimension(value: unknown, max: number): value is number {
 	return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= max;
 }
@@ -208,6 +228,11 @@ export class NativeTerminal implements Terminal {
 	}
 	setProgress(active: boolean): void {
 		this.write(`\x1b]9;4;${active ? "1;1" : "0"}\x07`);
+	}
+
+	// Required by Pi >=1.1.0's ProgramStatusReporter; ignored by earlier Pi versions.
+	setProgramStatus(status: NativeProgramStatus): void {
+		this.write(encodeProgramStatus(status));
 	}
 
 	async close(): Promise<void> {

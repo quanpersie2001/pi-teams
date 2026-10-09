@@ -6,7 +6,8 @@
 // pi/, and their render paths perform no I/O.
 //
 // The shapes intentionally mirror docs/ui/AGENT-PANEL-AND-VIEW.md §2: one row
-// per AgentRun with status, backend indicator, elapsed, tool uses/turns,
+// per named teammate (latest run), or per anonymous AgentRun, with status,
+// backend indicator, elapsed, tool uses/turns,
 // latest activity, worktree branch and an optional owner reference
 // (e.g. "task:auth-fix"). Task-domain semantics never appear here.
 
@@ -46,6 +47,8 @@ export interface AgentListRow {
 	type: string;
 	/** Current-team identity, preferred over the specialist type in compact rows. */
 	teammateName?: string;
+	/** Normalized #RRGGBB identity color, when supplied at creation. */
+	teammateColor?: string;
 	description: string;
 	status: AgentRunStatus;
 	backend: "process";

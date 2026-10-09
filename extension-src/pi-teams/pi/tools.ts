@@ -9,9 +9,10 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentManager, budgetStopNote, type GetResultOptions, type SpawnRequest } from "../app/agent-manager.js";
 import type { AgentRegistry } from "../app/agent-registry.js";
+import type { DeliveryService } from "../app/delivery-service.js";
 import type { MailboxService } from "../app/mailbox-service.js";
 import { isMailboxAddress } from "../domain/mailbox.js";
-import { LEAD_ADDRESS } from "../domain/team.js";
+import { LEAD_ADDRESS, normalizeTeammateColor, teammateNameProblem } from "../domain/team.js";
 
 /** Register the lead's sole peer-messaging tool; targets are validated against the live roster. */
 export function registerLeadSendMessageTool(
@@ -65,8 +66,23 @@ export interface ToolRegistration {
 	skipped?: boolean;
 }
 
-function textResult(text: string, details: Record<string, unknown> = {}) {
-	return { content: [{ type: "text" as const, text }], details };
+function textResult(text: string, details: Record<string, unknown> = {}, terminate = false) {
+	return { content: [{ type: "text" as const, text }], details, ...(terminate ? { terminate: true } : {}) };
+}
+
+/** Only a durable interactive conversation can receive a later completion turn. */
+function canDeliverLater(
+	ctx: { mode: string; sessionManager: { getSessionId?: () => string } },
+	run: { owner: { kind: string; sessionId?: string }; delivery: string },
+	delivery: DeliveryService | undefined,
+): boolean {
+	return (
+		ctx.mode === "tui" &&
+		delivery !== undefined &&
+		run.owner.kind === "conversation" &&
+		run.owner.sessionId === sessionIdOf(ctx) &&
+		(run.delivery === "conversation" || run.delivery === "both")
+	);
 }
 
 /** Session id for default conversation ownership; degrade when unavailable. */
@@ -83,21 +99,25 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "ma
 
 const agentParameters = Type.Object({
 	prompt: Type.String({ description: "The task for the agent to perform." }),
-	description: Type.String({ description: "A short (3-5 word) description of the task (shown in UI)." }),
-	subagent_type: Type.String({
-		description:
-			"Use the exact canonical spelling from the Available agent types listed in this tool's description. Do not invent aliases.",
-	}),
+	description: Type.Optional(
+		Type.String({ description: "Required for a new spawn: a short (3-5 word) task description. Omit when resuming." }),
+	),
+	subagent_type: Type.Optional(
+		Type.String({
+			description:
+				"Required for a new spawn: use the exact canonical name from the Available agent types. Omit when resuming.",
+		}),
+	),
 	name: Type.Optional(
 		Type.String({
 			description:
-				'Optional teammate name (letters, digits, ".", "_", "-", 1-64 chars). Names the run as a teammate of this session\'s team: it becomes the address for messaging, the task board and @mentions. A name is refused while that teammate is still working; reusing a settled name gives that teammate a new assignment.',
+				'REQUIRED for a new spawn (omit only when resuming): a unique teammate name (letters, digits, ".", "_", "-", 1-64 chars). This is its visible @name and address for messaging and tasks. Reuse a settled name only for another assignment to the same teammate.',
 		}),
 	),
 	color: Type.Optional(
 		Type.String({
 			description:
-				"Optional teammate identity color (only with name), as #RGB or #RRGGBB. Fixed when that teammate is first created.",
+				"REQUIRED for a new spawn (omit only when resuming): a distinct, readable teammate color as #RGB or #RRGGBB. Fixed at creation; reuse the same color for later assignments to that teammate.",
 		}),
 	),
 	model: Type.Optional(
@@ -140,7 +160,7 @@ const agentParameters = Type.Object({
 	resume: Type.Optional(
 		Type.String({
 			description:
-				"Optional agent ID to resume from. Continues from previous context. An agent can only be resumed once its current run has finished — use steer_subagent mid-run.",
+				"Cold-resume a finished run after its child has been released. A named teammate with a retained idle child should instead receive send_message or a new Agent assignment under the same name/color; use steer_subagent while it is running.",
 		}),
 	),
 });
@@ -149,13 +169,13 @@ const agentParameters = Type.Object({
  * Build and return the three orchestration tools bound to a manager and the
  * live registry. Exported pure so tests can exercise execute() without a live Pi host.
  */
-export function createSubagentTools(manager: AgentManager, registry: AgentRegistry) {
+export function createSubagentTools(manager: AgentManager, registry: AgentRegistry, delivery?: DeliveryService) {
 	const agentTool = defineTool({
 		name: "Agent",
 		label: "Agent",
 		description:
-			"Launch a specialist sub-agent for a task matching its description. A pinned agent model remains primary; model availability and authentication are checked before spawning, with automatic fallback to an available authenticated model. Subagents are valuable for parallelizing independent queries or protecting this conversation from excessive results. When the agent runs detached you will be notified on completion — do not poll or sleep waiting for it.",
-		promptSnippet: "Launch autonomous teams for complex multi-step tasks",
+			"Spawn/delegate a named, colored specialist teammate. Use Agent whenever the user explicitly asks for subagents, teammates, delegation or parallel work, even for short tasks; also use it proactively for independent investigations, implementation and review that can run in parallel. Give each new teammate a distinct name and color. Do not delegate trivial work better done directly or spawn overlapping tasks. A pinned model remains primary; authentication and fallback are checked before launch. In interactive sessions, a batch containing only detached launches ends the coordinator turn; their completion notifications start the next turn. Do not wait or poll for them.",
+		promptSnippet: "Spawn named, colored subagents when asked; delegate independent work in parallel",
 		parameters: agentParameters,
 		prepareLoadout() {
 			const agents = registry.availableTypes.map((type) => {
@@ -165,7 +185,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 			return {
 				descriptions: {
 					Agent:
-						"Launch a specialist sub-agent for a task matching its description. A pinned agent model remains primary; model availability and authentication are checked before spawning, with automatic fallback to an available authenticated model. Subagents are valuable for parallelizing independent queries or protecting this conversation from excessive results. When the agent runs detached you will be notified on completion — do not poll or sleep waiting for it.\n\n" +
+						"Spawn/delegate a named, colored specialist teammate. When the user asks to spawn subagents/teammates, delegate, or work in parallel, use Agent rather than doing all independent parts yourself, even if each part is short. Also consider parallel agents for independent research, implementation and review; avoid overlapping or trivial tasks. Every NEW spawn MUST include a unique name and a distinct #RGB or #RRGGBB color. Resume inherits the original name/color. Give each agent a bounded, self-contained prompt. In interactive sessions, a batch of detached launches ends this turn; the completion notification starts a new turn. Do not poll or call get_subagent_result(wait: true) for a passive background report; reserve it for explicit immediate dependencies. A teammate's progress message is not a completion signal: let the pending report arrive rather than waiting on it. Retained idle teammates accept send_message or a new assignment under the same name/color, not cold resume. A pinned model remains primary; authentication and fallback are checked before launch.\n\n" +
 						`Use an exact canonical name from the live enabled catalog below. ` +
 						`Available agent types:\n${agents.length > 0 ? agents.join("\n") : "- (none)"}`,
 				},
@@ -175,7 +195,15 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 		renderCall(args, _theme) {
 			const type = typeof args.subagent_type === "string" ? args.subagent_type : "?";
 			const desc = typeof args.description === "string" ? args.description : "";
-			return new Text(`▸ Agent(${type})${desc ? `  ${desc}` : ""}`, 0, 0);
+			const name =
+				typeof args.name === "string" && teammateNameProblem(args.name) === undefined ? args.name : undefined;
+			const color = typeof args.color === "string" ? normalizeTeammateColor(args.color) : undefined;
+			const identity = name
+				? color
+					? `\u001b[38;2;${Number.parseInt(color.slice(1, 3), 16)};${Number.parseInt(color.slice(3, 5), 16)};${Number.parseInt(color.slice(5, 7), 16)}m@${name}\u001b[39m`
+					: `@${name}`
+				: type;
+			return new Text(`▸ Agent(${identity})${desc ? `  ${desc}` : ""}`, 0, 0);
 		},
 
 		renderResult(result, options) {
@@ -187,6 +215,26 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 		},
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (typeof params.resume !== "string" || params.resume.length === 0) {
+				if (
+					typeof params.subagent_type !== "string" ||
+					params.subagent_type.length === 0 ||
+					typeof params.description !== "string" ||
+					params.description.length === 0
+				)
+					return textResult(
+						"A new Agent spawn requires subagent_type and description. Resume needs only resume and prompt.",
+					);
+				if (
+					typeof params.name !== "string" ||
+					params.name.length === 0 ||
+					typeof params.color !== "string" ||
+					params.color.length === 0
+				)
+					return textResult(
+						"A new Agent spawn requires both name and color (#RGB or #RRGGBB). Resume inherits its existing identity.",
+					);
+			}
 			const base = {
 				type: params.subagent_type as string,
 				...(typeof params.name === "string" && params.name.length > 0 ? { name: params.name } : {}),
@@ -206,24 +254,40 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 				// run; subagent_type is ignored there on purpose.
 				if (typeof params.resume === "string" && params.resume.length > 0) {
 					const resumed = await manager.resume(params.resume, base.prompt, {
-						run_in_background: base.run_in_background,
+						// Non-interactive parents may exit before any later notification is read.
+						run_in_background: ctx.mode === "tui" ? base.run_in_background : false,
 						...(base.color !== undefined ? { color: base.color } : {}),
 						...(base.timeout !== undefined ? { timeout: base.timeout } : {}),
 						...(base.idle_timeout !== undefined ? { idle_timeout: base.idle_timeout } : {}),
 					});
-					if (resumed.isBackground === true) {
-						return textResult(`{agent:${resumed.id} started (resumed from ${params.resume})}`, {
-							agentId: resumed.id,
-							resumedFrom: params.resume,
-							...(resumed.teammateName !== undefined ? { teammateName: resumed.teammateName } : {}),
-							...(resumed.teammateColor !== undefined ? { color: resumed.teammateColor } : {}),
-							background: true,
-							model: resumed.model,
-							modelFallback: resumed.modelFallback,
-						});
+					if (
+						resumed.isBackground === true &&
+						ctx.mode === "tui" &&
+						(!delivery || canDeliverLater(ctx, resumed, delivery))
+					) {
+						const stopAfterLaunch = canDeliverLater(ctx, resumed, delivery);
+						if (stopAfterLaunch) delivery?.trackSpawn(resumed.id);
+						return textResult(
+							`{agent:${resumed.id} started (resumed from ${params.resume})}`,
+							{
+								agentId: resumed.id,
+								resumedFrom: params.resume,
+								...(resumed.teammateName !== undefined ? { teammateName: resumed.teammateName } : {}),
+								...(resumed.teammateColor !== undefined ? { color: resumed.teammateColor } : {}),
+								background: true,
+								model: resumed.model,
+								modelFallback: resumed.modelFallback,
+							},
+							stopAfterLaunch,
+						);
 					}
 					const settledResume = (await manager.whenSettled(resumed.id)) ?? resumed;
 					manager.markResultConsumed(resumed.id);
+					if (settledResume.status === "error")
+						return textResult(`Agent failed: ${settledResume.error ?? "unknown error"}`, {
+							agentId: resumed.id,
+							status: settledResume.status,
+						});
 					const resumeNote = budgetStopNote(settledResume);
 					return textResult(
 						resumeNote !== undefined ? `${settledResume.result ?? ""}\n\n${resumeNote}` : (settledResume.result ?? ""),
@@ -246,12 +310,16 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 				// the invocation does not explicitly select a mode.
 				const request: SpawnRequest = {
 					...base,
+					// A print/JSON/RPC parent has no durable interactive turn to notify.
+					run_in_background: ctx.mode === "tui" ? base.run_in_background : false,
 					owner: { kind: "conversation", sessionId: sessionIdOf(ctx) },
 					delivery: "conversation",
 				};
 				const record = await manager.spawn(request);
 
-				if (record.isBackground === true) {
+				if (record.isBackground === true && ctx.mode === "tui") {
+					const stopAfterLaunch = canDeliverLater(ctx, record, delivery);
+					if (stopAfterLaunch) delivery?.trackSpawn(record.id);
 					return textResult(
 						record.teammateName !== undefined
 							? `{agent:${record.id} started as @${record.teammateName}}`
@@ -265,6 +333,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 							model: record.model,
 							modelFallback: record.modelFallback,
 						},
+						stopAfterLaunch,
 					);
 				}
 
@@ -307,11 +376,14 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 		name: "get_subagent_result",
 		label: "Get Agent Result",
 		description:
-			"Check status and retrieve a background agent's result. The full result is durable: it is re-read from the agent's result file on every call and can be read any number of times; the output includes the file path so you can page through very long results with the read tool. The completion notification carries only a preview. Use the agent ID returned by Agent.",
+			"Check status and retrieve a background agent's full result after it finishes. Use wait: true only if the current turn explicitly depends on the answer immediately; otherwise let the completion notification start a new turn, without polling. Results are durable and repeatable from result.md; use the ID returned by Agent.",
 		parameters: Type.Object({
 			agent_id: Type.String({ description: "The agent ID returned by Agent." }),
 			wait: Type.Optional(
-				Type.Boolean({ description: "If true, wait for the agent to complete before returning. Default: false." }),
+				Type.Boolean({
+					description:
+						"Block this tool call until completion only for an immediate dependency. Default: false; background runs notify automatically.",
+				}),
 			),
 		}),
 
@@ -381,10 +453,11 @@ export function registerSubagentTools(
 	pi: ExtensionAPI,
 	manager: AgentManager,
 	registry: AgentRegistry,
+	delivery?: DeliveryService,
 ): ToolRegistration[] {
 	const taken = existingToolNames(pi);
 	const registrations: ToolRegistration[] = [];
-	for (const tool of createSubagentTools(manager, registry)) {
+	for (const tool of createSubagentTools(manager, registry, delivery)) {
 		if (taken.has(tool.name)) {
 			registrations.push({ name: tool.name, skipped: true });
 			continue;

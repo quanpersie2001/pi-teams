@@ -719,8 +719,11 @@ describe("teammate names (ADR 0007 §2)", () => {
 			teammateName: "scout",
 			teammateColor: "#aabbcc",
 		});
-		fixture.backend.complete(first.id, "done");
+		fixture.backend.complete(first.id, "done", "/tmp/sessions/scout.jsonl");
 		await fixture.manager.whenSettled(first.id);
+		await expect(fixture.manager.resume(first.id, "cold")).rejects.toThrow(
+			/retained child.*send_message.*scout.*Agent assignment/,
+		);
 
 		const next = await fixture.manager.spawn({
 			type: "general-purpose",

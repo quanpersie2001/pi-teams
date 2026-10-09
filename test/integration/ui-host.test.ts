@@ -92,7 +92,7 @@ async function makeFixture(
 			await vi.waitFor(() => {
 				const factory = host.componentFactories.get("teams-agents");
 				const lines = factory?.({ requestRender() {} }, host.theme).render(100);
-				expect(lines?.[0]).toContain(`agents (${app.manager.list().length})`);
+				expect(lines?.[0]).toContain(`team (${app.manager.list().length})`);
 				if (description) expect(lines?.join("\n")).toContain(description);
 			});
 		}
@@ -138,6 +138,18 @@ function mountMainEditor(
 }
 
 describe("inline UI installation", () => {
+	it("names the empty overlay Team Hub", async () => {
+		const fx = await makeFixture();
+		try {
+			fx.ui.openHub();
+			const hub = await fx.host.waitForOverlayOpen();
+			expect(hub.component?.render(100)[0]).toContain("team (0) — Team Hub");
+		} finally {
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
 	it("keeps restored settled history in the Hub without an inline panel", async () => {
 		const fx = await makeFixture();
 		const launched = Promise.withResolvers<void>();
@@ -169,6 +181,7 @@ describe("inline UI installation", () => {
 			ui.openHub();
 			const hub = await fx.host.waitForOverlayOpen();
 			await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).toContain("RESTORED_IDLE"));
+			expect(hub.component?.render(100)[0]).toContain("Team Hub");
 			expect(fx.host.widgets.has("teams-agents")).toBe(false);
 			expect(fx.app.manager.get(record.id)?.status).toBe("completed");
 		} finally {

@@ -68,6 +68,54 @@ describe("buildAgentListView", () => {
 		expect(view.rows.find((row) => row.id === continuation.id)?.activity).toBe("Continuation activity");
 	});
 
+	it("shows one row per teammate after mailbox messages while retaining anonymous runs", () => {
+		const old = makeRun({
+			id: "explore-original",
+			teammateName: "structure-explorer",
+			startedAt: 100,
+			status: "completed",
+			completedAt: 200,
+		});
+		const ping = makeRun({
+			id: "explore-ping",
+			teammateName: "structure-explorer",
+			startedAt: 300,
+			status: "completed",
+			completedAt: 400,
+		});
+		const other = makeRun({
+			id: "behavior",
+			teammateName: "behavior-explorer",
+			startedAt: 150,
+			status: "completed",
+			completedAt: 250,
+		});
+		const anonymous = makeRun({ id: "anonymous", startedAt: 50, status: "completed", completedAt: 100 });
+		const view = buildAgentListView(managerOf([old, ping, other, anonymous]));
+		expect(view.rows.map((row) => row.id)).toEqual(["explore-ping", "behavior", "anonymous"]);
+	});
+
+	it("does not reveal an old assignment when the latest teammate row is dismissed", () => {
+		const old = makeRun({ id: "old", teammateName: "scout", startedAt: 100, status: "completed", completedAt: 200 });
+		const latest = makeRun({
+			id: "latest",
+			teammateName: "scout",
+			startedAt: 300,
+			status: "completed",
+			completedAt: 400,
+		});
+		const view = buildAgentListView(managerOf([old, latest]), { dismissedIds: new Set(["latest"]) });
+		expect(view.rows).toEqual([]);
+	});
+
+	it("shows the latest active assignment instead of a settled teammate history row", () => {
+		const old = makeRun({ id: "old", teammateName: "scout", startedAt: 100, status: "completed", completedAt: 200 });
+		const latest = makeRun({ id: "latest", teammateName: "scout", startedAt: 300, status: "running" });
+		const view = buildAgentListView(managerOf([old, latest]));
+		expect(view.rows.map((row) => row.id)).toEqual(["latest"]);
+		expect(view.runningCount).toBe(1);
+	});
+
 	it("projects owner reference, worktree branch and backend onto the row", () => {
 		const run = makeRun({
 			backend: "process",

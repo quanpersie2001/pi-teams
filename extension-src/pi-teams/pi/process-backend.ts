@@ -1,5 +1,14 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { SerializableBackendHandle } from "../app/run-registry.js";
@@ -69,7 +78,7 @@ export interface ProcessBackendOptions {
 	launchers?: readonly ProcessLauncher[];
 	connectTimeoutMs?: number;
 	/** Built runtime entrypoints; overridable for independently launched integration fixtures. */
-	entryPaths?: { headless: string; terminalClient: string };
+	entryPaths?: { headless: string; terminalClient: string; moduleLoader?: string };
 	agentDir?: string;
 	getParentModel?: () => string | undefined;
 	/** Public loaded Main resource paths, including temporary CLI extensions. */
@@ -95,19 +104,46 @@ export function resolveSessionLauncherHint(env: NodeJS.ProcessEnv, settingsBacke
 	return settingsBackend;
 }
 
-function entryPaths(): { headless: string; terminalClient: string } {
+function entryPaths(): { headless: string; terminalClient: string; moduleLoader: string } {
 	const adjacent = {
 		headless: fileURLToPath(new URL("./headless-child.js", import.meta.url)),
 		terminalClient: fileURLToPath(new URL("./terminal-client.js", import.meta.url)),
+		moduleLoader: fileURLToPath(new URL("./child-module-loader.js", import.meta.url)),
 	};
-	if (existsSync(adjacent.headless) && existsSync(adjacent.terminalClient)) return adjacent;
+	if (Object.values(adjacent).every((path) => existsSync(path))) return adjacent;
 	const built = {
 		headless: fileURLToPath(new URL("../../../dist/extensions/headless-child.js", import.meta.url)),
 		terminalClient: fileURLToPath(new URL("../../../dist/extensions/terminal-client.js", import.meta.url)),
+		moduleLoader: fileURLToPath(new URL("../../../dist/extensions/child-module-loader.js", import.meta.url)),
 	};
-	if (!existsSync(built.headless) || !existsSync(built.terminalClient))
+	if (!Object.values(built).every((path) => existsSync(path)))
 		throw new Error("Child runtime is not built. Run npm run build before launching subagents.");
 	return built;
+}
+
+/** Use the actual CLI installation, not the extension's npm tree (which has no host peers). */
+function hostModuleEntry(): string {
+	let directory = dirname(realpathSync(process.argv[1] ?? process.execPath));
+	while (true) {
+		const manifest = join(directory, "package.json");
+		if (existsSync(manifest)) {
+			try {
+				if (JSON.parse(readFileSync(manifest, "utf8")).name === "@earendil-works/pi-coding-agent") {
+					const entry = join(directory, "dist/index.js");
+					if (existsSync(entry)) return entry;
+				}
+			} catch {
+				// Keep looking for the package that owns the CLI.
+			}
+		}
+		const parent = dirname(directory);
+		if (parent === directory) break;
+		directory = parent;
+	}
+	// Vitest and local SDK consumers aren't started through the Pi CLI.
+	const entry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+	if (!existsSync(entry)) throw new Error("Cannot locate the Pi SDK used by the parent process");
+	return entry;
 }
 export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	readonly kind = "process" as const;
@@ -186,7 +222,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 
 	private async openViewer(child: ChildConnection): Promise<void> {
 		if (child.closed || child.viewerHandle || !child.presentationLauncher) return;
-		const paths = this.options.entryPaths ?? entryPaths();
+		const paths = { ...entryPaths(), ...this.options.entryPaths };
 		if (!child.bootstrap.terminalSocketPath) throw new Error("Native child terminal transport is unavailable.");
 		const viewerBootstrapFile = join(child.runDir, "terminal-bootstrap.json");
 		writeFileSync(
@@ -272,7 +308,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		const configuredLauncher = await this.chooseLauncher();
 		const launcher = this.launchers.find((candidate) => candidate.kind === "headless");
 		if (!launcher) throw new Error("Native headless execution launcher is unavailable.");
-		const paths = this.options.entryPaths ?? entryPaths();
+		const paths = { ...entryPaths(), ...this.options.entryPaths };
 		const childId = randomUUID();
 		const presentationLauncher = configuredLauncher.kind !== "headless" ? configuredLauncher : undefined;
 		const runDir = join(teamsArtifactDir(input.configCwd), "sessions", childId);
@@ -332,11 +368,12 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				env: {
 					PI_TEAMS_BOOTSTRAP: configFile,
 					PI_TEAMS_CHILD: "1",
+					PI_TEAMS_HOST_MODULE: hostModuleEntry(),
 					...(this.options.agentDir !== undefined ? { PI_CODING_AGENT_DIR: this.options.agentDir } : {}),
 				},
 				interactiveArgv: [],
 				headlessCommand: process.execPath,
-				headlessArgv: [paths.headless],
+				headlessArgv: ["--import", paths.moduleLoader, paths.headless],
 			});
 			const client = new ChildRpcClient({
 				socketPath: bootstrap.socketPath,

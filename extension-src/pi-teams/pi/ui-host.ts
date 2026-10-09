@@ -458,7 +458,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	function openHub(): void {
 		leftArmed = undefined;
 		if (ctx.mode !== "tui") {
-			notify("The Agents Hub is available in Pi's interactive TUI.", "warning");
+			notify("The Team Hub is available in Pi's interactive TUI.", "warning");
 			return;
 		}
 		if (hubOpen) {

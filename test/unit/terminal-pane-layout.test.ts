@@ -17,6 +17,8 @@ function fixture() {
 	const focusedPaneId = "main";
 	let rejectMove = false;
 	let rejectResize = false;
+	let inspections = 0;
+	let ownershipChecks = 0;
 	function paint(node = tree, area: PaneGeometry = { paneId: "main", x: 0, y: 0, width: 120, height: 36 }): void {
 		if (node === tree) {
 			for (const id of painted) panes.delete(id);
@@ -62,6 +64,7 @@ function fixture() {
 			return true;
 		},
 		async alive(handle) {
+			ownershipChecks++;
 			return owners.get(handle.childId) ?? false;
 		},
 		async terminate(handle) {
@@ -84,6 +87,7 @@ function fixture() {
 					return { paneId: "main", identity: "parent-birth", socketPath: "/tmp/owned-layout.sock" };
 				},
 				async inspect() {
+					inspections++;
 					return [...panes.values()].map((pane) => ({ ...pane }));
 				},
 				async moveBelow(_parent, paneId, targetPaneId) {
@@ -157,6 +161,9 @@ function fixture() {
 		focusedPaneId() {
 			return focusedPaneId;
 		},
+		counts() {
+			return { inspections, ownershipChecks };
+		},
 		rejectNextResize() {
 			rejectResize = true;
 		},
@@ -181,6 +188,16 @@ function geometry(panes: Map<string, PaneGeometry>) {
 }
 
 describe("managed terminal pane column", () => {
+	it("reuses verified geometry until a split or resize changes the layout", async () => {
+		const state = fixture();
+		const launcher = state.launcher();
+		await launcher.launch(spec("a"));
+		// One inspection before split, one after it; width and height already fit.
+		expect(state.counts()).toEqual({ inspections: 2, ownershipChecks: 1 });
+		await launcher.launch(spec("b"));
+		// A vertical split changes geometry; the following resize must be re-inspected.
+		expect(state.counts().inspections).toBeGreaterThan(2);
+	});
 	it("serializes concurrent children, balances removal, and restores Main after the last child", async () => {
 		const state = fixture();
 		const launcher = state.launcher();

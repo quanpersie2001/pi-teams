@@ -7,6 +7,8 @@ export interface NativeRuntimeExtensionOptions {
 	name?: string;
 	color?: string;
 	terminal: NativeTerminal;
+	/** Styled editors render the teammate session name in their frame instead. */
+	showIdentityWidget?: () => boolean;
 	routeNativeInput?: (text: string, idle: boolean) => boolean;
 }
 
@@ -23,7 +25,9 @@ export function createNativeRuntimeExtension(options: NativeRuntimeExtensionOpti
 				"pi-teams-native-identity",
 				(tui) => {
 					options.terminal.setRepaint(() => tui.requestRender(true));
-					return new Text(label, 0, 0);
+					return options.showIdentityWidget?.() === false
+						? { render: () => [], invalidate() {} }
+						: new Text(label, 0, 0);
 				},
 				{ placement: "aboveEditor" },
 			);

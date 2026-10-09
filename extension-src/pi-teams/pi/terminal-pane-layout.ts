@@ -29,6 +29,7 @@ interface PaneGroup {
 	parent: PaneLayoutParent;
 	children: Map<string, LauncherHandle>;
 }
+type ManagedLayout = { main: PaneGeometry; columns: PaneGeometry[][] };
 type PaneLifecycle = Omit<ProcessLauncher, "launch">;
 type GroupAttachment = (
 	handle: LauncherHandle,
@@ -76,7 +77,7 @@ export function withTerminalPaneLayout(
 		group.children.set(handle.childId, handle);
 		return group;
 	}
-	async function layout(group: PaneGroup): Promise<{ main: PaneGeometry; columns: PaneGeometry[][] }> {
+	async function layout(group: PaneGroup): Promise<ManagedLayout> {
 		const panes = await adapter.inspect(group.parent);
 		const main = panes.find((pane) => pane.paneId === group.parent.paneId);
 		if (!main) throw new Error("Managed layout parent is missing");
@@ -130,8 +131,9 @@ export function withTerminalPaneLayout(
 			throw new Error("Foreign pane entered the managed layout; refusing to resize it");
 		return { main, columns };
 	}
-	async function rebalanceColumns(group: PaneGroup): Promise<void> {
-		let { columns } = await layout(group);
+	async function rebalanceColumns(group: PaneGroup): Promise<ManagedLayout> {
+		let current = await layout(group);
+		let { columns } = current;
 		const count = columns.reduce((sum, rows) => sum + rows.length, 0);
 		if (count > MAX_VISIBLE_CHILDREN) throw new Error("Managed pane layout supports at most six visible children");
 		const desiredColumnCount = count > 3 ? 2 : count > 0 ? 1 : 0;
@@ -145,14 +147,15 @@ export function withTerminalPaneLayout(
 			const handle = [...group.children.values()].find((member) => member.paneId === source.paneId);
 			if (!handle || (await ownsPane(handle)) !== true) throw new Error("Cannot move an unverified child pane");
 			await adapter.moveBelow(group.parent, source.paneId, target.paneId);
-			({ columns } = await layout(group));
+			current = await layout(group);
+			columns = current.columns;
 		}
-		if (desiredColumnCount < 2) return;
+		if (desiredColumnCount < 2) return current;
 		for (;;) {
 			const first = columns[0];
 			const second = columns[1];
 			if (!first || !second) throw new Error("Managed pane columns changed during reflow");
-			if (first.length <= second.length + 1 && second.length <= first.length + 1) return;
+			if (first.length <= second.length + 1 && second.length <= first.length + 1) return current;
 			const sourceColumn = first.length > second.length ? first : second;
 			const targetColumn = sourceColumn === first ? second : first;
 			const source = sourceColumn.at(-1);
@@ -161,12 +164,14 @@ export function withTerminalPaneLayout(
 			const handle = [...group.children.values()].find((member) => member.paneId === source.paneId);
 			if (!handle || (await ownsPane(handle)) !== true) throw new Error("Cannot move an unverified child pane");
 			await adapter.moveBelow(group.parent, source.paneId, target.paneId);
-			({ columns } = await layout(group));
+			current = await layout(group);
+			columns = current.columns;
 		}
 	}
-	async function balanceWidths(group: PaneGroup): Promise<void> {
-		const { main, columns } = await layout(group);
-		if (columns.length === 0) return;
+	async function balanceWidths(group: PaneGroup, initial: ManagedLayout): Promise<ManagedLayout> {
+		let current = initial;
+		const { main, columns } = current;
+		if (columns.length === 0) return current;
 		const totalWidth = main.width + columns.reduce((sum, rows) => sum + (rows[0]?.width ?? 0), 0);
 		const columnCount = columns.length + 1;
 		const baseWidth = Math.floor(totalWidth / columnCount);
@@ -175,7 +180,7 @@ export function withTerminalPaneLayout(
 			main.width === baseWidth + (remainder > 0 ? 1 : 0) &&
 			columns.every((rows, index) => rows[0]?.width === baseWidth + (index + 1 < remainder ? 1 : 0))
 		)
-			return;
+			return current;
 		const targets = [
 			{ paneId: main.paneId, width: baseWidth + (remainder > 0 ? 1 : 0) },
 			...columns.map((rows, index) => {
@@ -185,24 +190,27 @@ export function withTerminalPaneLayout(
 			}),
 		];
 		for (const target of targets) {
-			const current = await layout(group);
 			const pane = [current.main, ...current.columns.flat()].find((candidate) => candidate.paneId === target.paneId);
 			if (!pane) throw new Error("Managed pane lost its horizontal resize target");
 			if (pane.paneId !== current.main.paneId) {
 				const handle = [...group.children.values()].find((member) => member.paneId === pane.paneId);
 				if (!handle || (await ownsPane(handle)) !== true) throw new Error("Cannot resize an unverified child pane");
 			}
-			if (pane.width !== target.width) await adapter.resizeWidth(group.parent, target.paneId, target.width);
+			if (pane.width !== target.width) {
+				await adapter.resizeWidth(group.parent, target.paneId, target.width);
+				current = await layout(group);
+			}
 		}
-		const after = await layout(group);
 		if (
-			after.main.width !== targets[0]?.width ||
-			after.columns.some((rows, index) => rows.some((pane) => pane.width !== targets[index + 1]?.width))
+			current.main.width !== targets[0]?.width ||
+			current.columns.some((rows, index) => rows.some((pane) => pane.width !== targets[index + 1]?.width))
 		)
 			throw new Error("Terminal could not balance the managed pane columns");
+		return current;
 	}
-	async function balance(group: PaneGroup): Promise<void> {
-		const { main, columns } = await layout(group);
+	async function balance(group: PaneGroup, initial: ManagedLayout): Promise<void> {
+		let current = initial;
+		const { main, columns } = current;
 		for (const rows of columns) {
 			if (rows.length < 2) continue;
 			const used = rows.reduce((sum, row) => sum + row.height, 0);
@@ -214,7 +222,6 @@ export function withTerminalPaneLayout(
 				const row = rows[index];
 				if (!row) continue;
 				const desired = height + (index >= rows.length - remainder ? 1 : 0);
-				const current = await layout(group);
 				if (
 					current.main.x !== main.x ||
 					current.main.y !== main.y ||
@@ -222,17 +229,18 @@ export function withTerminalPaneLayout(
 					current.main.height !== main.height
 				)
 					throw new Error("Parent geometry changed during child resize");
-				if (current.columns.flat().find((pane) => pane.paneId === row.paneId)?.height !== desired)
+				if (current.columns.flat().find((pane) => pane.paneId === row.paneId)?.height !== desired) {
 					await adapter.resize(group.parent, row.paneId, desired);
+					current = await layout(group);
+				}
 			}
-			const after = await layout(group);
 			if (
-				after.main.x !== main.x ||
-				after.main.y !== main.y ||
-				after.main.width !== main.width ||
-				after.main.height !== main.height ||
+				current.main.x !== main.x ||
+				current.main.y !== main.y ||
+				current.main.width !== main.width ||
+				current.main.height !== main.height ||
 				rows.some((row) => {
-					const actual = after.columns.flat().find((pane) => pane.paneId === row.paneId);
+					const actual = current.columns.flat().find((pane) => pane.paneId === row.paneId);
 					return !actual || actual.height < height || actual.height > height + 1;
 				})
 			)
@@ -249,9 +257,9 @@ export function withTerminalPaneLayout(
 		const childCount = group.children.size;
 		if (childCount === 0) groups.delete(key);
 		else {
-			await rebalanceColumns(group);
-			await balanceWidths(group);
-			await balance(group);
+			const columns = await rebalanceColumns(group);
+			const widths = await balanceWidths(group, columns);
+			await balance(group, widths);
 		}
 	}
 	return {
@@ -303,9 +311,9 @@ export function withTerminalPaneLayout(
 							await adapter.moveBelow(group.parent, source.paneId, target.paneId);
 						}
 					}
-					await rebalanceColumns(group);
-					await balanceWidths(group);
-					await balance(group);
+					const columns = await rebalanceColumns(group);
+					const widths = await balanceWidths(group, columns);
+					await balance(group, widths);
 					return handle;
 				} catch (error) {
 					try {

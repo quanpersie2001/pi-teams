@@ -277,8 +277,7 @@ function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string
 		async available() {
 			if (env[HERDR_ENV_VAR] !== "1" || !env[HERDR_PANE_ID_VAR] || !socketPath || !isAbsolute(socketPath)) return false;
 			try {
-				await run(["--version"]);
-				await run(["status", "server"]);
+				// The pane query checks the CLI, active server and current client in one round trip.
 				await run(["pane", "current", "--current"]);
 				return true;
 			} catch {
@@ -530,9 +529,9 @@ function tmuxLauncher(runner: LauncherCommandRunner, env: Record<string, string 
 	const lifecycle: TerminalLauncher = {
 		kind: "tmux",
 		async available() {
+			if (!defaultSocketPath || !isAbsolute(defaultSocketPath)) return false;
 			try {
-				await run(["-V"]);
-				if (!defaultSocketPath || !isAbsolute(defaultSocketPath)) return false;
+				// A server-backed pane query also proves the tmux CLI is executable.
 				await run(["display-message", "-p", "#{pane_id}"]);
 				return true;
 			} catch {

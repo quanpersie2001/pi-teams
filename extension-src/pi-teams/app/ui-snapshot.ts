@@ -4,9 +4,9 @@
 // onto the domain/ui-view.ts contracts. No I/O here: transcript reads happen
 // in the pi/ transcript adapter and arrive as plain TranscriptItem arrays.
 //
-// Ordering mirrors the reference panel model: active runs first in spawn
-// order, then finished runs newest-first — so the cursor follows a run when
-// the list reorders and completions surface at the top of the settled block.
+// Named teammates occupy one row each (their latest assignment); anonymous
+// runs remain separate. Active rows come first in spawn order, then finished
+// rows newest-first.
 
 import type { AgentRun } from "../domain/agent-run.js";
 import { isTerminalStatus } from "../domain/agent-run.js";
@@ -40,6 +40,7 @@ export function agentRowFromRecord(
 		id: record.id,
 		type: record.type,
 		...(record.teammateName !== undefined ? { teammateName: record.teammateName } : {}),
+		...(record.teammateColor !== undefined ? { teammateColor: record.teammateColor } : {}),
 		description: record.description,
 		status: record.status,
 		backend: record.backend,
@@ -65,9 +66,9 @@ export function agentRowFromRecord(
 }
 
 /**
- * Build the immutable panel snapshot: active runs first (spawn order), then
- * terminal runs newest-first. Dismissed finished rows are hidden; dismissing
- * never touches manager state.
+ * Build the immutable panel snapshot: one row per named teammate (latest run),
+ * plus one row per anonymous run. Active rows come first (spawn order), then
+ * terminal rows newest-first. Dismissal never touches manager state.
  */
 export function buildAgentListView(
 	manager: {
@@ -82,7 +83,22 @@ export function buildAgentListView(
 
 	const active: AgentListRow[] = [];
 	const finished: AgentListRow[] = [];
-	for (const record of manager.list()) {
+	// Pick the newest assignment BEFORE applying dismissal: dismissing a
+	// teammate must not reveal an older, already-closed assignment instead.
+	const runs = manager.list();
+	const latestByName = new Map<string, AgentRun>();
+	for (const record of runs) {
+		if (!record.teammateName) continue;
+		const previous = latestByName.get(record.teammateName);
+		if (
+			!previous ||
+			record.startedAt > previous.startedAt ||
+			(record.startedAt === previous.startedAt && record.id > previous.id)
+		)
+			latestByName.set(record.teammateName, record);
+	}
+	for (const record of runs) {
+		if (record.teammateName && latestByName.get(record.teammateName) !== record) continue;
 		if (isTerminalStatus(record.status) && dismissed?.has(record.id)) continue;
 		const activity = activityByRunId?.get(record.id);
 		const attachable = manager.canAttachPane?.(record.id) ?? false;

@@ -58,6 +58,9 @@ export default function (pi: ExtensionAPI): void {
 		}),
 		runStore: createSubagentRunStore(configCwd),
 		deliveryHost: createPiDeliveryHost(pi, () => latestCtx),
+		// turn_end joins slow parallel Agent calls; a long safety fallback avoids
+		// trapping completions if a turn is aborted before its boundary fires.
+		deliveryOptions: { batchWindowMs: 60_000 },
 		createTeamStore: (sessionId) => createPiTeamStore(configCwd, sessionId),
 	});
 	const transcripts = createPiTranscriptSource({ backends: [backend] });
@@ -72,7 +75,8 @@ export default function (pi: ExtensionAPI): void {
 	// display the content verbatim.
 	registerAgentsCommand(pi, { manager: app.manager, openHub: () => uiHandle?.openHub() });
 	registerBackendCommand(pi, { backend });
-	registerSubagentTools(pi, app.manager, app.registry);
+	registerSubagentTools(pi, app.manager, app.registry, app.delivery);
+	pi.on("turn_end", () => app.delivery?.finishSpawnBatch());
 	registerLeadSendMessageTool(
 		pi,
 		() => app.mailbox,

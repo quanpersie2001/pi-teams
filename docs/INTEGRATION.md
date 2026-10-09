@@ -86,11 +86,11 @@ RPC spawn defaults to `{ kind: "extension", id: "pi-tasks" }` with `delivery: "e
 | `both` | lifecycle and guarded conversation completion |
 | `none` | caller obtains result/status explicitly |
 
-Conversation delivery checks the spawning session/branch context. Delivery subscriptions survive session transitions, but children do not: `/new`, resume and shutdown await teardown before a new team starts. Old control connections are not reattached.
+Conversation delivery checks the spawning session/branch context. In the interactive TUI, a model-facing batch consisting only of successfully admitted background `Agent` launches ends the coordinator's turn (`terminate: true` on each result); completion then triggers a new turn. Mixed tool batches do not force termination. Print/JSON/RPC model-facing Agent calls wait inline instead of relying on a later notification, even if background was requested; public extension RPC spawn policy is unchanged. Delivery subscriptions survive session transitions, but children do not: `/new`, resume and shutdown await teardown before a new team starts. Old control connections are not reattached.
 
 ## Completion notification contract (renderer)
 
-Conversation delivery injects a `pi.sendMessage` custom message when a run settles. The runtime ships **no message renderer** — this payload is the stable contract a pi-style companion visual extension may target by registering a renderer for the customType; without one the plain-text `content` displays verbatim.
+Conversation delivery injects a `pi.sendMessage` custom message after a short hold (200 ms by default). If `get_subagent_result` consumed the result before dispatch, the notification is skipped. Background `Agent` calls issued within one Pi turn are joined into one message (the Pi turn boundary finalizes the group; non-Pi hosts may use a 100 ms fallback). Once the first result arrives, the group waits up to 30 seconds for peers, then sends available results; stragglers join for up to 15 seconds. Each member is checked against the live session/branch guard at dispatch, and session switches cancel pending messages. Lifecycle events are still immediate. The runtime ships **no message renderer** — this payload is the stable contract a pi-style companion visual extension may target by registering a renderer for the customType; without one the plain-text `content` displays verbatim.
 
 - **customType:** `teammate-notification` (constant exported as `TEAMMATE_NOTIFICATION_TYPE` from `domain/delivery.ts`)
 - **delivery:** `followUp` with `triggerTurn: true` — runtime-authored, lead-only, never sent to teammates
@@ -102,6 +102,8 @@ Teammate <id> finished|failed|stopped (<type>, <duration>)
 <preview — result or error text, bounded to 400 chars>
 full result: <absolute resultFile path>   ← last line, only when resultFile exists
 ```
+
+A batch notification contains one section per unconsumed run (`@name (completed|failed|stopped)`, preview, and optional `full result:` path); it remains **one** custom message / follow-up turn. Existing top-level `details` identify the first run; grouped messages add `details.others` with each remaining run's `agentId`, optional `teammateName`/`color`, `status`, `outcome` and optional `resultFile`.
 
 - **details** (machine-readable schema): `agentId`, `type`, `description`, `status`, `outcome` (`completed | failed | stopped`), optional `resultFile`, `durationMs`, `totalTokens`.
 

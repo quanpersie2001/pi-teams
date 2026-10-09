@@ -11,7 +11,7 @@ import type { AgentLifecycleEvent } from "../domain/integration-protocol.js";
 import type { AgentManagerOptions } from "./agent-manager.js";
 import { AgentManager } from "./agent-manager.js";
 import { AgentRegistry, type RawAgentLoader } from "./agent-registry.js";
-import { type DeliveryHost, DeliveryService } from "./delivery-service.js";
+import { type DeliveryHost, DeliveryService, type DeliveryServiceOptions } from "./delivery-service.js";
 import { MailboxService } from "./mailbox-service.js";
 import { archiveRegistryRuns, partitionOwnedEntries } from "./registry-archive.js";
 import type { SubagentRunStore } from "./run-registry.js";
@@ -41,6 +41,8 @@ export interface PiSubagentsAppOptions {
 	 * subscribers (pi.events) so extension consumers keep working.
 	 */
 	deliveryHost?: DeliveryHost;
+	/** Conversation completion hold/join timing; useful for deterministic host tests. */
+	deliveryOptions?: DeliveryServiceOptions;
 	/** Managed worktree service. Checkouts remain until explicit release. */
 	worktreeService?: WorktreeService;
 	/**
@@ -114,7 +116,9 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 
 	// Owner-aware completion delivery. Subscribes to the same
 	// lifecycle event stream the pi host forwards onto pi.events.
-	const delivery = options.deliveryHost ? new DeliveryService(manager, options.deliveryHost) : undefined;
+	const delivery = options.deliveryHost
+		? new DeliveryService(manager, options.deliveryHost, options.deliveryOptions)
+		: undefined;
 
 	return {
 		registry,
@@ -182,7 +186,13 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 			// Session-bound lifetime (ADR 0007): teardown every child. Delivery
 			// stays subscribed for the app lifetime — /new, /resume and /fork
 			// reuse this app and its host reads the latest context dynamically.
-			await manager.shutdownSession();
+			try {
+				await manager.shutdownSession();
+			} finally {
+				// Shutdown itself can settle children; never carry those queued
+				// conversation messages into a replacement session.
+				delivery?.clearPending();
+			}
 		},
 
 		subscribe(listener) {
