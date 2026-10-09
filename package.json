@@ -1,6 +1,6 @@
 {
 	"name": "@quandev104/pi-teams",
-	"version": "0.1.3",
+	"version": "0.1.4",
 	"description": "Specialist team runtime extension for Pi: independent-process teammates, agent definitions, run lifecycle, backends, steer/stop/resume and inline UI.",
 	"license": "MIT",
 	"type": "module",

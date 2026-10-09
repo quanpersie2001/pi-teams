@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.4] - 2026-10-09
+
+### Bug Fixes
+
+- Gate unsupported Windows headless runtime and test package URLs
+- Load isolated child hook via file URL on Windows
+
+### Features
+
+- Match teammate identity and style in child view
+
 ## [0.1.3] - 2026-10-09
 
 ### Bug Fixes
