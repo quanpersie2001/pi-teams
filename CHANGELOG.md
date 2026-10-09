@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.3] - 2026-10-09
+
+### Bug Fixes
+
+- Resolve host Pi modules in terminal viewer
+
 ## [0.1.2] - 2026-10-09
 
 ### Documentation
