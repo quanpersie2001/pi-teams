@@ -9,6 +9,8 @@
 
 Delegate implementation, local exploration, external research, and code review without hosting child `AgentSession`s in the parent. Each agent executes in an independent native Pi SDK process. HerdR/tmux panes attach to Pi's real `InteractiveMode` in that same process through a detachable terminal transport.
 
+https://github.com/user-attachments/assets/2f715c97-838d-461c-a6a2-7122ae26facf
+
 [Install](#install) · [Quick start](#quick-start) · [Bundled agents](#bundled-agents) · [Configuration](#configuration) · [Documentation](#documentation) · [Related extensions](#related-extensions)
 
 ---
@@ -32,22 +34,11 @@ Delegate implementation, local exploration, external research, and code review w
 
 **Requires:** Node.js ≥22.19, Pi peers ≥1.0.4 and <1.1.0, and Unix sockets. HerdR/tmux are optional; headless children still support the parent Hub and child view.
 
-From this checkout:
+Install the package with Pi:
 
 ```bash
-npm ci
-pi install .
+pi install npm:@quandev104/pi-teams
 ```
-
-Use `pi install --local .` for a project-scoped installation; Pi loads project packages after project trust is granted. Start a new Pi session after installation.
-
-To try the complete package without persisting an installation:
-
-```bash
-npm run dev:pi
-```
-
-Load the **package**, not only its extension file, to discover the included skill. The local installation is the currently verified distribution path; the npm package is not yet published.
 
 ---
 
