@@ -32,7 +32,7 @@ https://github.com/user-attachments/assets/2f715c97-838d-461c-a6a2-7122ae26facf
 
 ## Install
 
-**Requires:** Node.js ≥22.19, Pi ≥1.0.4 and <1.1.0, and Unix sockets. Pi supplies SDK, TUI and TypeBox to the parent extension. Standalone children resolve the same host packages from the running Pi installation through a Node module hook, without installing duplicate copies in the package. HerdR/tmux are optional; headless children still support the parent Hub and child view.
+**Requires:** Node.js ≥22.19, Pi ≥1.0.4 and <1.1.0, and Unix sockets. Windows execution is not supported: the headless launcher also requires Unix process-group signaling and `ps`-based identity verification. Pi supplies SDK, TUI and TypeBox to the parent extension. Standalone children resolve the same host packages from the running Pi installation through a Node module hook, without installing duplicate copies in the package. HerdR/tmux are optional; headless children still support the parent Hub and child view.
 
 Install the package with Pi:
 

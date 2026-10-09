@@ -37,3 +37,22 @@ jobs:
 
       - name: Package smoke
         run: npm run package:smoke
+
+  windows-compatibility:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Check Windows package resolution and headless availability
+        run: npx vitest run test/integration/packaged-child-resolution.test.ts test/unit/process-launchers.test.ts -t "loads child and native UI|reports headless availability"

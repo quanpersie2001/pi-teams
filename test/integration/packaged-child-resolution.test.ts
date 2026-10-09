@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { expect, it } from "vitest";
 
 it("loads child and native UI from an isolated Pi package without installing host peers", () => {
@@ -13,7 +13,7 @@ it("loads child and native UI from an isolated Pi package without installing hos
 		const native = readdirSync(dist).find((file) => /^native-runtime-extension-.*\.js$/.test(file));
 		if (!native) throw new Error("Native runtime chunk was not built");
 		const hostEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
-		const script = `await import(${JSON.stringify(join(dist, native))}); await import(${JSON.stringify(join(dist, "headless-child.js"))});`;
+		const script = `await import(${JSON.stringify(pathToFileURL(join(dist, native)).href)}); await import(${JSON.stringify(pathToFileURL(join(dist, "headless-child.js")).href)});`;
 		const args = ["--import", join(dist, "child-module-loader.js"), "--input-type=module", "-e", script];
 		const result = spawnSync(process.execPath, args, {
 			env: { ...process.env, PI_TEAMS_HOST_MODULE: hostEntry },

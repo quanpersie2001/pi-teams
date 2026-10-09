@@ -212,6 +212,24 @@ describe("process launcher lifecycle safety", () => {
 		expect(harness.killed).toEqual(["%7"]);
 	});
 
+	it("reports headless availability accurately and rejects unsupported Windows launches before spawning", async () => {
+		let spawned = false;
+		const headless = createProcessLaunchers({
+			spawnProcess: ((...args: Parameters<typeof spawn>) => {
+				spawned = true;
+				return spawn(...args);
+			}) as typeof spawn,
+		}).find((candidate) => candidate.kind === "headless");
+		if (!headless) throw new Error("headless launcher is missing");
+		expect(await headless.available()).toBe(process.platform !== "win32");
+		if (process.platform === "win32") {
+			await expect(
+				headless.launch({ ...spec, runDir: join(tmpdir(), "pi-teams-unsupported-windows") }),
+			).rejects.toThrow("unsupported on Windows");
+			expect(spawned).toBe(false);
+		}
+	});
+
 	it("treats a headless child already gone after shutdown as successfully terminated", async () => {
 		const runDir = mkdtempSync(join(tmpdir(), "pi-process-launcher-"));
 		tempDirs.push(runDir);

@@ -701,9 +701,10 @@ function processLauncher(runner: LauncherCommandRunner, spawnProcess: typeof spa
 	return {
 		kind: "headless",
 		async available() {
-			return true;
+			return process.platform !== "win32";
 		},
 		async launch(spec) {
+			if (process.platform === "win32") throw new Error("Headless process launcher is unsupported on Windows");
 			mkdirSync(spec.runDir, { recursive: true });
 			const ownerToken = randomUUID();
 			const env = { ...process.env, ...spec.env, PI_TEAMS_LAUNCH_OWNER: ownerToken };
