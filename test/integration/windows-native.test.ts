@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentBackendHandle } from "../../extension-src/pi-teams/domain/backend.js";
 import type { LauncherHandle } from "../../extension-src/pi-teams/domain/process-launcher.js";
@@ -161,7 +161,11 @@ describe.skipIf(process.platform !== "win32")("native windows headless runtime",
 				},
 				interactiveArgv: [],
 				headlessCommand: process.execPath,
-				headlessArgv: ["--import", join(dist, "child-module-loader.js"), join(dist, "headless-child.js")],
+				headlessArgv: [
+					"--import",
+					pathToFileURL(join(dist, "child-module-loader.js")).href,
+					join(dist, "headless-child.js"),
+				],
 			});
 			expect(handle.pid).toBeTruthy();
 			expect(handle.pid).not.toBe(process.pid);

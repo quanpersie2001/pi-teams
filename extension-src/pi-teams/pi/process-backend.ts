@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { SerializableBackendHandle } from "../app/run-registry.js";
 import type {
 	AgentBackendHandle,
@@ -251,7 +251,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				runDir: child.runDir,
 				cwd: child.bootstrap.cwd,
 				env: { PI_TEAMS_TERMINAL_BOOTSTRAP: viewerBootstrapFile, PI_TEAMS_HOST_MODULE: hostModuleEntry() },
-				interactiveArgv: [process.execPath, "--import", paths.moduleLoader, paths.terminalClient],
+				interactiveArgv: [process.execPath, "--import", pathToFileURL(paths.moduleLoader).href, paths.terminalClient],
 				headlessCommand: process.execPath,
 				headlessArgv: [],
 			});
@@ -383,7 +383,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				},
 				interactiveArgv: [],
 				headlessCommand: process.execPath,
-				headlessArgv: ["--import", paths.moduleLoader, paths.headless],
+				headlessArgv: ["--import", pathToFileURL(paths.moduleLoader).href, paths.headless],
 			});
 			const client = new ChildRpcClient({
 				socketPath: bootstrap.socketPath,
