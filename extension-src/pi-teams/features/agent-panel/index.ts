@@ -19,6 +19,29 @@ import { PANEL_PAGE_SIZE, type PanelSelection, selectionIndex } from "./panel-ke
 /** Alias kept for readability: the rendered window equals the paged jump. */
 export const MAX_AGENT_ROWS = PANEL_PAGE_SIZE;
 
+/**
+ * Hub layout. The Hub is a fullscreen overlay with a real terminal height, so its
+ * roster window is derived from that height: the inline panel's fixed page size
+ * (PANEL_PAGE_SIZE) must never clamp it.
+ */
+
+/** Inner width from which the Hub splits into a roster column and a details column. */
+export const HUB_SPLIT_MIN_WIDTH = 70;
+/** Roster share of the inner width once the Hub splits. */
+export const HUB_ROSTER_RATIO = 0.6;
+/** Body lines one Hub roster row occupies: the row itself plus its separator blank line. */
+export const HUB_ROW_LINES = 2;
+
+/**
+ * Roster rows the Hub can show at a given terminal height. Mirrors renderAgentHub:
+ * one top border, one header line, one main row, one blank line after main, then
+ * HUB_ROW_LINES per teammate row, keeping one line free for the "↓ N more" hint.
+ */
+export function hubRosterCapacity(height: number): number {
+	const bodyEnd = Math.max(0, Math.floor(height) - 3);
+	return Math.floor(Math.max(0, bodyEnd - 4) / HUB_ROW_LINES);
+}
+
 /** Data the host hands the renderer at paint time (already immutable). */
 export interface AgentPanelData {
 	view: AgentListView;
@@ -88,14 +111,14 @@ function renderRunRow(
  * Render the whole panel. Returns [] when there is nothing to show — the host
  * then removes the widget entirely.
  */
-export function renderAgentPanel(data: AgentPanelData, fg: ThemeFg, width: number, now: number, hub = false): string[] {
+export function renderAgentPanel(data: AgentPanelData, fg: ThemeFg, width: number, now: number): string[] {
 	const agents = data.view.rows;
 	if (agents.length === 0 || width < 8) return [];
 	const index = selectionIndex(data.selection, agents) ?? 0;
 
 	const hint = data.selection !== null ? "↑↓ select · enter view · esc back · ←← hub" : "←← hub · ↓ to manage";
 	const lines: string[] = [];
-	lines.push(truncateToWidth(` team (${agents.length})${hub ? " — Team Hub" : ""} — ${fg("dim", hint)}`, width));
+	lines.push(truncateToWidth(` team (${agents.length}) — ${fg("dim", hint)}`, width));
 	lines.push("");
 
 	const mainSelected = data.selection === null || index === 0;
@@ -185,7 +208,7 @@ function hubStatusColor(row: AgentListRow, fg: ThemeFg): string {
 
 function hubRosterWidth(width: number): number {
 	const inner = Math.max(0, Math.floor(width) - 2);
-	return width >= 70 ? Math.max(22, Math.floor(inner * 0.38)) : inner;
+	return width >= HUB_SPLIT_MIN_WIDTH ? Math.floor(inner * HUB_ROSTER_RATIO) : inner;
 }
 
 /** Pure layout and click targets share the same window, including short terminals. */
@@ -200,7 +223,7 @@ export function renderAgentHub(
 	const h = Math.max(0, Math.floor(height));
 	if (!w || !h) return { lines: [], targets: new Map() };
 	const inner = Math.max(0, w - 2);
-	const split = w >= 70;
+	const split = w >= HUB_SPLIT_MIN_WIDTH;
 	const rosterWidth = hubRosterWidth(w);
 	const detailWidth = split ? Math.max(0, inner - rosterWidth - 1) : inner;
 	const selected = selectionIndex(data.selection, data.view.rows) ?? 0;
@@ -226,8 +249,8 @@ export function renderAgentHub(
 	if (h === 1) return { lines, targets };
 	const footerY = h - 2;
 	const bodyEnd = Math.max(0, h - 3);
-	const rosterSlots = Math.max(0, bodyEnd - 2); // header, main, then windowed runs
-	const visibleCount = Math.min(MAX_AGENT_ROWS, rosterSlots, data.view.rows.length);
+	const capacity = hubRosterCapacity(h);
+	const visibleCount = Math.min(capacity, data.view.rows.length);
 	const selAgent = Math.max(0, selected - 1);
 	const start = selAgent < visibleCount ? 0 : selAgent - visibleCount + 1;
 	const roster = new Map<number, string>();
@@ -242,7 +265,7 @@ export function renderAgentHub(
 	for (let i = start; i < start + visibleCount; i++) {
 		const run = data.view.rows[i];
 		if (!run) continue;
-		const y = i - start + 3;
+		const y = 4 + HUB_ROW_LINES * (i - start);
 		const label = run.teammateName ? `@${run.teammateName}` : run.type;
 		const isSelected = selected === i + 1;
 		roster.set(
@@ -253,7 +276,7 @@ export function renderAgentHub(
 	}
 	const hiddenBelow = data.view.rows.length - start - visibleCount;
 	if (hiddenBelow > 0 && visibleCount > 0) {
-		const hintY = 3 + visibleCount;
+		const hintY = 4 + HUB_ROW_LINES * visibleCount;
 		if (hintY <= bodyEnd) roster.set(hintY, fg("dim", ` ↓ ${hiddenBelow} more`));
 	}
 	const detail: string[] = [];

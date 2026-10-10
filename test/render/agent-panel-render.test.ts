@@ -6,6 +6,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentListRow, AgentListView } from "../../extension-src/pi-teams/domain/ui-view.js";
 import {
 	createAgentHubComponent,
+	HUB_ROSTER_RATIO,
+	HUB_SPLIT_MIN_WIDTH,
+	hubRosterCapacity,
 	renderAgentHub,
 	renderAgentPanel,
 } from "../../extension-src/pi-teams/features/agent-panel/index.js";
@@ -63,7 +66,7 @@ describe("team hub rendering", () => {
 			const { lines, targets } = renderAgentHub(data, fg, width, height, NOW);
 			expect(lines).toHaveLength(height);
 			assertWidthSafe(lines, width);
-			if (width < 70) expect(targets.size).toBe(0);
+			if (width < HUB_SPLIT_MIN_WIDTH) expect(targets.size).toBe(0);
 		}
 		expect(renderAgentHub(data, fg, 100, 24, NOW).lines.join("\n")).toContain("@peer");
 		expect(renderAgentHub(data, fg, 40, 12, NOW).lines.join("\n")).toContain("Context   unknown");
@@ -106,7 +109,7 @@ describe("team hub rendering", () => {
 				expect(text).toContain(fg("success", "━━"));
 				expect(text).toContain(fg("borderMuted", "────────"));
 			}
-			if (width >= 70) {
+			if (width >= HUB_SPLIT_MIN_WIDTH) {
 				expect(lines.join("\n")).toContain(`${rgb}▸\x1b[39m`);
 				expect(lines[1]).toContain(fg("borderMuted", "│"));
 			}
@@ -290,12 +293,93 @@ describe("team hub rendering", () => {
 		component.handleMouse?.(event(y ?? 0));
 		expect(focused).toEqual([id]);
 		component.handleMouse?.(event(10)); // footer
-		component.handleMouse?.(event(y ?? 0, 38)); // divider (roster ends at x=37)
+		component.handleMouse?.(event(y ?? 0, 59)); // divider (roster ends at x=58)
 		component.handleMouse?.(event(y ?? 0, 60)); // detail pane at the same row
 		component.handleMouse?.(event(2, 60)); // detail pane beside main
 		expect(focused).toEqual([id]);
 		component.handleMouse?.(event(2)); // main roster row remains clickable
 		expect(focused).toEqual([id, "main"]);
+	});
+
+	it("renders as many roster rows as the terminal height allows and hints the remainder", () => {
+		const rows = Array.from({ length: 17 }, () => row());
+		const data = { view: view(rows), selection: null, stopArmedFor: null, focus: null };
+		const { lines } = renderAgentHub(data, fg, 100, 30, NOW);
+		expect(hubRosterCapacity(30)).toBe(11);
+		expect(lines).toHaveLength(30);
+		expect(lines.filter((line) => line.includes("explore"))).toHaveLength(11);
+		expect(lines.join("\n")).toContain("↓ 6 more");
+	});
+
+	it("separates every roster row with exactly one blank line, including after main", () => {
+		const rows = [row({ id: "a" }), row({ id: "b" }), row({ id: "c" })];
+		const data = { view: view(rows), selection: null, stopArmedFor: null, focus: null };
+		const { lines } = renderAgentHub(data, fg, 100, 24, NOW);
+		const divider = fg("borderMuted", "│");
+		// The roster cell sits between the outer frame border and the split divider.
+		const cell = (y: number) => (lines[y]?.split(divider)[1] ?? "").trim();
+		expect(cell(2)).toContain("main"); // header y=1, main y=2
+		expect(cell(3)).toBe(""); // blank after main
+		expect(cell(4)).not.toBe(""); // first teammate
+		expect(cell(5)).toBe("");
+		expect(cell(6)).not.toBe("");
+		expect(cell(7)).toBe("");
+		expect(cell(8)).not.toBe(""); // third teammate, one blank above it
+		expect(cell(9)).toBe("");
+	});
+
+	it("starts the roster/details split at HUB_SPLIT_MIN_WIDTH with a 60/40 share", () => {
+		const run = row({ id: "split", teammateName: "peer" });
+		const data = { view: view([run]), selection: run.id, stopArmedFor: null, focus: null };
+		const divider = fg("borderMuted", "│");
+		const pipes = (line: string) => line.split(divider).length - 1;
+		// Narrow: only the outer frame borders (two pipes), no divider.
+		expect(pipes(renderAgentHub(data, fg, HUB_SPLIT_MIN_WIDTH - 1, 24, NOW).lines[2] ?? "")).toBe(2);
+		// From HUB_SPLIT_MIN_WIDTH on: roster │ details (three pipes).
+		expect(pipes(renderAgentHub(data, fg, HUB_SPLIT_MIN_WIDTH, 24, NOW).lines[2] ?? "")).toBe(3);
+		for (const [width, rosterWidth, detailWidth] of [
+			[70, 40, 27],
+			[90, 52, 35],
+			[100, 58, 39],
+		] as const) {
+			const inner = width - 2;
+			const lines = renderAgentHub(data, fg, width, 24, NOW).lines;
+			expect(visibleWidth(lines[2]?.split(divider)[1] ?? "")).toBe(rosterWidth);
+			expect(visibleWidth(lines[2]?.split(divider)[2] ?? "")).toBe(detailWidth);
+			expect(inner).toBe(rosterWidth + 1 + detailWidth);
+			expect(rosterWidth / inner).toBeGreaterThan(0.58);
+			expect(rosterWidth / inner).toBeLessThan(HUB_ROSTER_RATIO);
+		}
+	});
+
+	it("shows only the roster header and the selected details below the split width", () => {
+		const first = row({ id: "first", teammateName: "alpha", description: "ALPHA_ONLY_DESCRIPTION" });
+		const second = row({ id: "second", teammateName: "beta", description: "BETA_ONLY_DESCRIPTION" });
+		const data = { view: view([first, second]), selection: second.id, stopArmedFor: null, focus: null };
+		const width = HUB_SPLIT_MIN_WIDTH - 1;
+		const { lines, targets } = renderAgentHub(data, fg, width, 12, NOW);
+		expect(targets.size).toBe(0); // no roster row is clickable
+		assertWidthSafe(lines, width);
+		const text = lines.join("\n");
+		// The roster header survives at y=1 ...
+		expect(lines[1]).toContain("team (2)");
+		// ... but no roster row is drawn: only the selected teammate's detail block exists.
+		expect(lines.filter((line) => line.includes("@")).length).toBe(1);
+		expect(text).not.toContain("@alpha");
+		expect(text).not.toContain("ALPHA_ONLY_DESCRIPTION");
+		expect(lines[2]).toContain("@beta");
+		expect(text).toContain("BETA_ONLY_DESCRIPTION");
+		expect(text).toContain("Model");
+	});
+
+	it("keeps hubRosterCapacity in sync with the roster rows the Hub actually renders", () => {
+		const rows = Array.from({ length: 40 }, () => row());
+		const data = { view: view(rows), selection: null, stopArmedFor: null, focus: null };
+		for (const height of [12, 24, 30, 40]) {
+			const { lines } = renderAgentHub(data, fg, 100, height, NOW);
+			expect(lines.filter((line) => line.includes("explore"))).toHaveLength(hubRosterCapacity(height));
+			expect(lines.length).toBeLessThanOrEqual(height);
+		}
 	});
 });
 

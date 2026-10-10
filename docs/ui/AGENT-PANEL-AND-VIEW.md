@@ -25,7 +25,7 @@ Live focus adds native model, thinking, cwd and context usage plus capability-ga
 
 The inline panel shows queued/starting/running agents and unconfirmed cleanup receipts. Settled runs with confirmed resources disappear automatically, including named teammates whose processes remain idle. When no active assignments or uncertain resources remain, the whole inline widget is removed. The Hub retains the latest row for each named teammate and the current manager's anonymous run history; hiding an idle row does not release its process or context.
 
-Hub and inline rows share a compact layout: one selection/status-colored circle, teammate name (specialist type for anonymous runs), description, then right-aligned elapsed time and total per-run tokens (`25m 7s · ↓ 146.5k tokens`, excluding cache reads). Rows omit process labels, result/activity previews, tool/turn counts, owner references and worktree branches; detailed transcript views retain diagnostic information. Settled elapsed time freezes at completion. Active Hub rows precede settled teammates and anonymous run history. Abort confirmation and unconfirmed cleanup replace the right-hand stats so warnings remain visible on narrow rows.
+Hub and inline rows share a compact layout: one selection/status-colored circle, teammate name (specialist type for anonymous runs), description, then right-aligned elapsed time and total per-run tokens (`25m 7s · ↓ 146.5k tokens`, excluding cache reads). The Hub renders a blank separator line between rows while the inline panel stays compact, and the Hub roster window is derived from the terminal height rather than a fixed page; from 70 inner columns the Hub splits into roster and details at a 60/40 share, and below that it renders the roster header and the selected teammate's details only — no roster rows. Rows omit process labels, result/activity previews, tool/turn counts, owner references and worktree branches; detailed transcript views retain diagnostic information. Settled elapsed time freezes at completion. Active Hub rows precede settled teammates and anonymous run history. Abort confirmation and unconfirmed cleanup replace the right-hand stats so warnings remain visible on narrow rows.
 
 | Input | Action |
 |---|---|
@@ -33,7 +33,7 @@ Hub and inline rows share a compact layout: one selection/status-colored circle,
 | Left twice within 500 ms at Main document start (including inline navigation) | open Team Hub; first Left stays native |
 | Down with empty Main prompt and visible inline rows | select Main in bottom navigation, not Hub |
 | Up / Down | select main/run |
-| PgUp / PgDn | page selection (six rows) |
+| PgUp / PgDn | page selection (inline: a six-row page; Hub: one terminal-height window) |
 | Home / End | main / last row |
 | Enter | selected transcript |
 | Esc | return editor focus |
