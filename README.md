@@ -18,7 +18,7 @@ https://github.com/user-attachments/assets/2f715c97-838d-461c-a6a2-7122ae26facf
 ## Features
 
 - **Independent execution and native UI** — SDK workers host Pi's own transcript, editor, footer and menus in HerdR/tmux; presentation changes never restart execution. Explicit headless workers do not initialize the TUI.
-- **Live control** — launch, inspect, steer, and stop runs over an authenticated, owner-only Unix socket. Live state never depends on terminal input or JSONL polling.
+- **Live control** — launch, inspect, steer, and stop runs over an authenticated, owner-only control endpoint: a Unix domain socket on Unix, a named pipe on Windows. Live state never depends on terminal input or JSONL polling.
 - **Opt-in time budgets** — optional `timeout`/`idle_timeout` limits in seconds hard-stop runaway children; the idle clock refreshes on child output only, and enforcement stops when the parent session shuts down.
 - **One Team Hub** — Main and child conversations share navigation, while keeping drafts, scroll positions, and tool expansion independent.
 - **Focused specialists** — four bundled roles, layered Markdown definitions, native `@agent` autocomplete, and a packaged `create-agent` skill.
@@ -32,7 +32,7 @@ https://github.com/user-attachments/assets/2f715c97-838d-461c-a6a2-7122ae26facf
 
 ## Install
 
-**Requires:** Node.js ≥22.19, Pi ≥1.0.4 and <1.1.0, and Unix sockets. Windows execution is not supported: the headless launcher also requires Unix process-group signaling and `ps`-based identity verification. Pi supplies SDK, TUI and TypeBox to the parent extension. Standalone children resolve the same host packages from the running Pi installation through a Node module hook, without installing duplicate copies in the package. HerdR/tmux are optional; headless children still support the parent Hub and child view.
+**Requires:** Node.js ≥22.19 and Pi ≥1.0.4 and <1.1.0. Unix keeps owner-only Unix sockets; native Windows is supported through headless OS-children: named-pipe control endpoints (`\\.\pipe\pi-teams-<childId>\control`), `taskkill /T` tree lifecycle and CIM CreationDate + argv-token identity — exercised by the windows-latest CI job (which runs on GitHub runners, not on this machine). HerdR/tmux viewers are not available on Windows in this increment; headless children still support the parent Hub and child view. Pi supplies SDK, TUI and TypeBox to the parent extension. Standalone children resolve the same host packages from the running Pi installation through a Node module hook, without installing duplicate copies in the package.
 
 Install the package with Pi:
 
@@ -272,9 +272,9 @@ npm run dev:pi  # load the extension and skill with the installed peer CLI
 
 Source follows `shared → domain → features → app → pi`, enforced by dependency-cruiser. Parent, bridge, headless-worker and raw-terminal-client entrypoints build into `dist/extensions/`.
 
-Lifecycle/terminal changes also need isolated native-process smokes; UI changes need observation in the actual Pi TUI. Unit tests alone do not establish terminal compatibility. Native terminal/UI verification has used macOS; those smokes do not establish commercial-provider auth/quota or Linux/Windows behavior.
+Lifecycle/terminal changes also need isolated native-process smokes; UI changes need observation in the actual Pi TUI. Unit tests alone do not establish terminal compatibility. Native terminal/UI verification has used macOS; automated Linux and native Windows runtime tests run in hosted CI, but neither establishes commercial-provider auth/quota or hands-on TUI behavior.
 
-GitHub **CI** runs on pushes and pull requests to `main` with Node 22, `npm ci`, typecheck, lint, dependency boundaries, serialized integration tests and package smoke. Hosted CI does not replace the native multiplexer smokes above.
+GitHub **CI** runs on pushes and pull requests to `main` with Node 22, `npm ci`, typecheck, lint, dependency boundaries, serialized integration tests and package smoke, plus windows-latest jobs for package resolution, headless availability and the native Windows runtime integration. Hosted CI does not replace the native multiplexer smokes above.
 
 The manual **Release** workflow mirrors `pi-style`'s patch/minor/major/alpha/beta channels. Configure the repository Actions secret `NPM_TOKEN` with publish access to `@quandev104/pi-teams` (including unattended/2FA authorization). Repository rules must allow the release job's `contents: write` token to push its version commit and annotated tag. Secrets are repository-specific; an existing `pi-style` secret is not automatically inherited.
 

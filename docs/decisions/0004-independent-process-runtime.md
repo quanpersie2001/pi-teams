@@ -35,7 +35,7 @@ Shared workspace is default. Optional isolated worktrees preserve existing agent
 - Foreground/background share one concurrency budget.
 - Public integration uses protocol v3; Task state stays outside the runtime.
 - Worktree isolation is not a security sandbox against tools running as the same OS user.
-- Supported environment requires Unix sockets, Node >=22.19 and Pi peers >=1.0.4 <1.1.0.
+- Supported environment requires an owner-only control transport (Unix sockets; named pipes on native Windows), Node >=22.19 and Pi peers >=1.0.4 <1.1.0.
 
 ## Trade-offs
 
