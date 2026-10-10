@@ -1,7 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, fchmodSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, fchmodSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type {
 	ChildLaunchSpec,
@@ -152,6 +152,17 @@ async function processHasOwner(
 interface WindowsProcessIdentity {
 	creationDate: string;
 	commandLine?: string;
+}
+
+/** Inline tail of the child's log so identity failures reveal the boot reason even where the file is unreachable (CI). */
+function childLogExcerpt(logPath: string): string {
+	try {
+		const content = readFileSync(logPath, "utf8").trim();
+		if (!content) return "child.log is empty: the child exited without output";
+		return `child.log tail: ...${content.slice(-1500)}`;
+	} catch {
+		return "child.log could not be read";
+	}
 }
 
 async function readWindowsProcessIdentity(
@@ -932,7 +943,9 @@ function windowsHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: ty
 			try {
 				const probed = await readWindowsProcessIdentity(runner, pid);
 				if (probed?.commandLine?.includes(ownerToken) !== true) {
-					throw new Error(`Unable to establish headless child identity; inspect ${logPath}`);
+					throw new Error(
+						`Unable to establish headless child identity; inspect ${logPath} (${childLogExcerpt(logPath)})`,
+					);
 				}
 				return {
 					kind: "headless",

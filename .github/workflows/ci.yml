@@ -75,3 +75,14 @@ jobs:
 
       - name: Native Windows runtime integration
         run: npx vitest run test/integration/windows-native.test.ts --no-file-parallelism
+
+      - name: Upload Windows fixture artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-fixtures
+          path: |
+            ${{ runner.temp }}/teams-windows-native-*/**
+            ${{ runner.temp }}/teams-windows-dispose-*/**
+          if-no-files-found: ignore
+          retention-days: 7
