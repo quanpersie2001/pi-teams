@@ -1,3 +1,5 @@
+> **Internal, historical planning document — NOT published.** This file is a frozen Vietnamese handoff/scratch note from an earlier porting effort, superseded by the shipped documentation (`README.md`, `docs/`). It may reference the former package name `@quandev104/pi-subagents` and APIs that no longer exist. It is excluded from the npm package (`package.json` `files` negation) and kept in the repository for historical context only.
+
 # HANDOFF PROMPT — Port tính năng từ `edxeth/pi-subagents` vào dự án này
 
 > Cách dùng ở session mới: paste toàn bộ file này vào tin nhắn đầu tiên, HOẶC chỉ cần nói:
