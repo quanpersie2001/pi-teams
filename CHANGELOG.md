@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.1.6] - 2026-10-10
+
+### Bug Fixes
+
+- *(model)* Apply strict admission to the launch re-check too
+- *(hub)* Size the roster from the terminal, not the inline panel
+- *(hub)* Page by the rendered window, not the panel page size
+
+### Documentation
+
+- Document team_task_edit/cancel and the send_message target rules
+- State the skill attribution scope
+
+### Features
+
+- *(model)* Reject ambiguous or unregistered invoked models
+
+### Miscellaneous Tasks
+
+- *(package)* Stop publishing the internal porting document
+
+### Refactor
+
+- Share the tool-registration guard
+
+### Testing
+
+- Close the audit coverage gaps
+
 ## [0.1.5] - 2026-10-10
 
 ### Bug Fixes
