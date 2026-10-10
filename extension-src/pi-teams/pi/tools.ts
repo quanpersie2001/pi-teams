@@ -13,6 +13,7 @@ import type { DeliveryService } from "../app/delivery-service.js";
 import type { MailboxService } from "../app/mailbox-service.js";
 import { isMailboxAddress } from "../domain/mailbox.js";
 import { LEAD_ADDRESS, normalizeTeammateColor, teammateNameProblem } from "../domain/team.js";
+import { existingToolNames, type ToolRegistration } from "./tool-registration.js";
 
 /** Register the lead's sole peer-messaging tool; targets are validated against the live roster. */
 export function registerLeadSendMessageTool(
@@ -51,19 +52,6 @@ export function registerLeadSendMessageTool(
 	if (existingToolNames(pi).has(tool.name)) return { name: tool.name, skipped: true };
 	pi.registerTool(tool);
 	return { name: tool.name };
-}
-/** Skip names already registered by Pi or another extension instead of double-registering. */
-function existingToolNames(pi: ExtensionAPI): Set<string> {
-	try {
-		return new Set(pi.getAllTools().map((tool) => tool.name));
-	} catch {
-		return new Set();
-	}
-}
-
-export interface ToolRegistration {
-	name: string;
-	skipped?: boolean;
 }
 
 function textResult(text: string, details: Record<string, unknown> = {}, terminate = false) {

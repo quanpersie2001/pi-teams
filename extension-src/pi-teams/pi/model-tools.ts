@@ -10,6 +10,7 @@ import { defineTool, type ExtensionAPI, type ToolDefinition } from "@earendil-wo
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { listNativeModels } from "./model-admission.js";
+import { existingToolNames, type ToolRegistration } from "./tool-registration.js";
 
 export const LIST_MODELS_TOOL_NAME = "list_models";
 
@@ -71,24 +72,10 @@ export function createModelTools(): ToolDefinition[] {
 	];
 }
 
-/** Skip names already claimed by Pi or another extension instead of double-registering. */
-function existingToolNames(pi: ExtensionAPI): Set<string> {
-	try {
-		return new Set(pi.getAllTools().map((tool) => tool.name));
-	} catch {
-		return new Set();
-	}
-}
-
-export interface ModelToolRegistration {
-	name: string;
-	skipped?: boolean;
-}
-
 /** Register the model preflight tool unless its name is already taken. */
-export function registerModelTools(pi: ExtensionAPI): ModelToolRegistration[] {
+export function registerModelTools(pi: ExtensionAPI): ToolRegistration[] {
 	const taken = existingToolNames(pi);
-	const registrations: ModelToolRegistration[] = [];
+	const registrations: ToolRegistration[] = [];
 	for (const tool of createModelTools()) {
 		if (taken.has(tool.name)) {
 			registrations.push({ name: tool.name, skipped: true });
