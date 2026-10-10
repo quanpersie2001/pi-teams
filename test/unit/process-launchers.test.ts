@@ -298,22 +298,12 @@ describe("process launcher lifecycle safety", () => {
 		expect(harness.killed).toEqual(["%7"]);
 	});
 
-	it("reports headless availability accurately and rejects unsupported Windows launches before spawning", async () => {
-		let spawned = false;
-		const headless = createProcessLaunchers({
-			spawnProcess: ((...args: Parameters<typeof spawn>) => {
-				spawned = true;
-				return spawn(...args);
-			}) as typeof spawn,
-		}).find((candidate) => candidate.kind === "headless");
+	it("reports headless availability on every supported platform", async () => {
+		const headless = createProcessLaunchers().find((candidate) => candidate.kind === "headless");
 		if (!headless) throw new Error("headless launcher is missing");
-		expect(await headless.available()).toBe(process.platform !== "win32");
-		if (process.platform === "win32") {
-			await expect(
-				headless.launch({ ...spec, runDir: join(tmpdir(), "pi-teams-unsupported-windows") }),
-			).rejects.toThrow("unsupported on Windows");
-			expect(spawned).toBe(false);
-		}
+		// Native Windows ships its own headless launcher; Unix keeps the signal-based
+		// one. Availability must be true on both.
+		await expect(headless.available()).resolves.toBe(true);
 	});
 
 	it("treats a headless child already gone after shutdown as successfully terminated", async () => {
@@ -397,9 +387,9 @@ describe("process launcher lifecycle safety", () => {
 		}
 	}, 20_000);
 
-	it("stays unavailable until the windows transport lands while proving identity through the CIM command line", async () => {
+	it("reports windows headless availability while proving identity through the CIM command line", async () => {
 		const harness = windowsHeadlessHarness();
-		expect(await harness.launcher.available()).toBe(false);
+		expect(await harness.launcher.available()).toBe(true);
 		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
 		const ownerToken = harness.spawnedArgv().at(-1);
 		expect(handle.kind).toBe("headless");

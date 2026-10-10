@@ -859,15 +859,12 @@ function windowsHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: ty
 	return {
 		kind: "headless",
 		async available() {
-			// Enabled only after the Windows transport (named-pipe control endpoint)
-			// and native Windows CI land (issue #3 step 4); until then selection must
-			// keep refusing native Windows rather than half-working.
-			return false;
+			// Native Windows is supported: named-pipe control endpoints (child-endpoint)
+			// carry the authenticated transport, and the CIM/taskkill lifecycle below
+			// verifies the same OS-child ownership contract as the Unix launcher.
+			return true;
 		},
 		async launch(spec) {
-			// Mirrors available() on real Windows hosts; the test-only platform option
-			// selects this launcher without lifting the production refusal.
-			if (process.platform === "win32") throw new Error("Headless process launcher is unsupported on Windows");
 			mkdirSync(spec.runDir, { recursive: true });
 			const ownerToken = randomUUID();
 			// Windows cannot read another process's environment (no ps eww equivalent),

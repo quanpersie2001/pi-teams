@@ -41,7 +41,14 @@ async function readBootstrap(): Promise<Bootstrap> {
 	const path = process.env[BOOTSTRAP_ENV];
 	if (!path) throw new Error(`${BOOTSTRAP_ENV} is required`);
 	const metadata = await lstat(path);
-	if (!metadata.isFile() || (metadata.mode & 0o077) !== 0 || metadata.uid !== process.getuid?.()) {
+	// Windows permission bits only mirror the read-only attribute (files read
+	// 0o666) and stats carry no owner, so owner-only proof there is the
+	// parent-written bootstrap inheriting the user's NTFS ACLs; the mode and
+	// uid assertions are POSIX-only.
+	if (
+		!metadata.isFile() ||
+		(process.platform !== "win32" && ((metadata.mode & 0o077) !== 0 || metadata.uid !== process.getuid?.()))
+	) {
 		throw new Error("Terminal bootstrap must be a private file owned by this user");
 	}
 	if (metadata.size > 4096) throw new Error("Terminal bootstrap exceeds limit");

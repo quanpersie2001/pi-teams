@@ -248,10 +248,14 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 export async function loadChildBootstrap(path = process.env[BOOTSTRAP_ENV]): Promise<ChildBootstrap> {
 	if (!path) throw new ChildProtocolError("invalid_bootstrap", `${BOOTSTRAP_ENV} is required`);
 	const details = await lstat(path);
+	// Windows permission bits only mirror the read-only attribute (files read
+	// 0o666) and stats carry no owner, so the owner-only proof there is the
+	// parent-written bootstrap inheriting the user's NTFS ACLs; the mode and
+	// uid assertions are POSIX-only.
 	if (
 		!details.isFile() ||
-		(typeof process.getuid === "function" && details.uid !== process.getuid()) ||
-		(details.mode & 0o077) !== 0
+		(process.platform !== "win32" &&
+			((typeof process.getuid === "function" && details.uid !== process.getuid()) || (details.mode & 0o077) !== 0))
 	) {
 		throw new ChildProtocolError("invalid_bootstrap", "Child bootstrap must be an owner-only regular file");
 	}

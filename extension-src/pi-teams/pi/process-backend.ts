@@ -20,7 +20,7 @@ import {
 	type ChildState,
 } from "../domain/child-protocol.js";
 import type { BackendMode, BackendSelector } from "../domain/config.js";
-import type { LauncherHandle, ProcessLauncher } from "../domain/process-launcher.js";
+import type { LauncherHandle, LauncherKind, ProcessLauncher } from "../domain/process-launcher.js";
 import { ProcessLaunchCleanupPendingError } from "../domain/process-launcher.js";
 import type { TranscriptSnapshot } from "../domain/transcript.js";
 import { cleanupControlEndpointPath, createControlEndpoints, currentPlatform } from "./child-endpoint.js";
@@ -32,6 +32,17 @@ import { teamsArtifactDir } from "./registry-host.js";
 import { TEAM_TASK_TOOL_NAMES } from "./team-task-tools.js";
 
 const TEAM_COORDINATION_TOOLS: readonly string[] = ["send_message", ...TEAM_TASK_TOOL_NAMES];
+
+/**
+ * Honest per-kind availability requirements for diagnostics. available() is a
+ * boolean probe by contract, so failed selection reports these static reasons
+ * instead of a bare hint; the headless entry is platform-dependent by design.
+ */
+const LAUNCHER_REQUIREMENTS: Readonly<Record<LauncherKind, string>> = {
+	herdr: "requires the HerdR terminal environment",
+	tmux: "requires a tmux server socket",
+	headless: "requires a platform with a supported headless process launcher",
+};
 
 interface ChildConnection {
 	bootstrap: ChildBootstrap;
@@ -186,11 +197,18 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	}
 	private async chooseLauncher(): Promise<ProcessLauncher> {
 		const hint = this.launcherHint;
+		const unavailable: LauncherKind[] = [];
 		for (const launcher of this.launchers) {
 			if (hint !== "auto" && launcher.kind !== hint) continue;
 			if (await launcher.available()) return launcher;
+			unavailable.push(launcher.kind);
 		}
-		throw new Error(`No available process launcher for "${hint}".`);
+		if (unavailable.length === 0) throw new Error(`No process launcher for "${hint}" is registered.`);
+		throw new Error(
+			`No available process launcher for "${hint}": ${unavailable
+				.map((kind) => `${kind} ${LAUNCHER_REQUIREMENTS[kind]}`)
+				.join("; ")}.`,
+		);
 	}
 	private async withPresentationLock<T>(operation: () => Promise<T>): Promise<T> {
 		const previous = this.presentationQueue;
