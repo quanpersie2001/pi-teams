@@ -310,4 +310,4 @@ pi install npm:@quandev104/pi-style
 
 ## License
 
-[MIT](LICENSE). The adapted `create-agent` workflow includes its [upstream MIT attribution](skills/create-agent/LICENSE).
+[MIT](LICENSE) covers the package. One bundled skill carries separate attribution: `create-agent` ships its own [LICENSE](skills/create-agent/LICENSE) covering the upstream material it adapts, as described in its [Provenance section](skills/create-agent/SKILL.md). The `team-lead` skill ships no separate license file and its [SKILL.md](skills/team-lead/SKILL.md) documents no provenance.
