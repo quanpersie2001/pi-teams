@@ -18,11 +18,13 @@ import {
 	type AgentPanelData,
 	createAgentHubComponent,
 	createAgentListComponent,
+	hubRosterCapacity,
 } from "../features/agent-panel/index.js";
 import {
 	activatePanel,
 	applyStopConfirm,
 	dispatchPanelKey,
+	PANEL_PAGE_SIZE,
 	type PanelSelection,
 	selectAtIndex,
 	selectionIndex,
@@ -291,6 +293,25 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		}
 		const rows = listView?.rows ?? [];
 		if (selection === null) selection = activatePanel();
+		// The Hub's roster window is derived from the terminal height, so a paged
+		// jump must move one *rendered Hub window* — not the inline panel's fixed
+		// page size. Intercept here so dispatchPanelKey keeps its six-row paging
+		// contract for the inline panel (features/agent-panel/panel-keys.ts).
+		const pageDown = matchesKey(data, "pageDown");
+		if (pageDown || matchesKey(data, "pageUp")) {
+			const terminalRows = tui?.terminal?.rows;
+			// Degenerate fallback only: a host that never reports a usable height
+			// still pages, by the inline size, instead of refusing to move.
+			const page =
+				typeof terminalRows === "number" && terminalRows > 0
+					? Math.max(1, hubRosterCapacity(terminalRows))
+					: PANEL_PAGE_SIZE;
+			const current = selectionIndex(selection, rows) ?? 0;
+			selection = selectAtIndex(rows, current + (pageDown ? page : -page));
+			syncHubFocus();
+			requestRender();
+			return;
+		}
 		const action = dispatchPanelKey(data, selection, rows, "panel");
 		switch (action.kind) {
 			case "select":

@@ -13,6 +13,8 @@ import { createAgentFocusPort } from "../../extension-src/pi-teams/app/focus-ser
 import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
 import type { AgentFocusPort } from "../../extension-src/pi-teams/domain/ui-view.js";
+import { hubRosterCapacity } from "../../extension-src/pi-teams/features/agent-panel/index.js";
+import { PANEL_PAGE_SIZE } from "../../extension-src/pi-teams/features/agent-panel/panel-keys.js";
 import type { AgentViewOverlay } from "../../extension-src/pi-teams/features/agent-view/index.js";
 import { registerAgentsCommand } from "../../extension-src/pi-teams/pi/commands.js";
 import { createPiTeamStore } from "../../extension-src/pi-teams/pi/teams-host.js";
@@ -26,6 +28,14 @@ const UP = "\x1b[A";
 const LEFT = "\x1b[D";
 const ENTER = "\r";
 const ESC = "\x1b";
+const PAGE_UP = "\x1b[5~";
+const PAGE_DOWN = "\x1b[6~";
+/**
+ * Overlay terminal height for the Hub paging test. At 12 rows
+ * hubRosterCapacity(12) is 2, deliberately different from the inline
+ * panel's PANEL_PAGE_SIZE (6).
+ */
+const HUB_PAGING_ROWS = 12;
 
 interface Fixture {
 	host: FakePiHost;
@@ -42,12 +52,14 @@ async function makeFixture(
 		now?: () => number;
 		teamCwd?: string;
 		focus?: (base: AgentFocusPort) => AgentFocusPort;
+		overlayTerminal?: { rows: number; columns: number };
 	} = {},
 ): Promise<Fixture> {
 	const host = new FakePiHost({
 		mode: "tui",
 		sessionView: { sessionId: "session-a" },
 		...(options.initialEditor !== undefined ? { initialEditor: options.initialEditor } : {}),
+		...(options.overlayTerminal !== undefined ? { overlayTerminal: options.overlayTerminal } : {}),
 	});
 	const backend = new FakeBackend();
 	let nextId = 0;
@@ -516,6 +528,75 @@ describe("keyboard table via onTerminalInput", () => {
 		await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).not.toContain("DISMISS_SETTLED"));
 		expect(fx.backend.stops).toHaveLength(0);
 		expect(fx.app.manager.get(runId)?.status).toBe("completed");
+	});
+
+	it("pages the Hub by its rendered window, not the inline panel page size", async () => {
+		const capacity = hubRosterCapacity(HUB_PAGING_ROWS);
+		// Guard: the chosen height must give the Hub a page distinct from the
+		// inline panel's fixed one, otherwise the assertions cannot tell them apart.
+		expect(capacity).not.toBe(PANEL_PAGE_SIZE);
+
+		// The Hub focus handoff names the selected run, so it observes the real jump.
+		const focused: string[] = [];
+		const ids: string[] = [];
+		const fx = await makeFixture({
+			overlayTerminal: { rows: HUB_PAGING_ROWS, columns: 80 },
+			focus: (base) => ({
+				...base,
+				subscribe: () => () => {},
+				read: async (id) => {
+					focused.push(id);
+					return {
+						runId: id,
+						currentRunId: id,
+						items: [],
+						truncatedHead: false,
+						closed: false,
+						cwd: null,
+						capabilities: [],
+						model: "provider/model",
+						thinking: "high",
+						context: { usedTokens: 0, windowTokens: 1 },
+					};
+				},
+			}),
+		});
+		try {
+			// capacity + 1 rows so the last one sits beyond the first Hub window.
+			// Spawned directly: the shared fx.spawn helper asserts the six-row inline
+			// panel, which cannot show rows past the first window.
+			for (let index = 1; index <= capacity + 1; index++) {
+				const record = await fx.app.manager.spawn({
+					type: "explore",
+					prompt: "find auth files",
+					run_in_background: true,
+					description: `PAGE_${index}`,
+				});
+				ids.push(record.id);
+				await vi.waitFor(() => expect(fx.app.manager.get(record.id)?.status).toBe("running"));
+			}
+			fx.ui.refresh();
+
+			fx.ui.openHub();
+			await fx.host.waitForOverlayOpen();
+
+			// One window down from main lands on rows[1], not the six-row clamp.
+			expect(fx.host.emitTerminalInput(PAGE_DOWN)).toBe(true);
+			expect(focused).toEqual([ids[1]]);
+			expect(focused).not.toContain(ids[2]);
+
+			// A second window clamps to the last row; one window back up returns to rows[0].
+			expect(fx.host.emitTerminalInput(PAGE_DOWN)).toBe(true);
+			expect(focused).toEqual([ids[1], ids[2]]);
+			expect(fx.host.emitTerminalInput(PAGE_UP)).toBe(true);
+			expect(focused).toEqual([ids[1], ids[2], ids[0]]);
+		} finally {
+			// Settle the runs first: session teardown otherwise waits its full grace.
+			for (const id of ids) fx.backend.complete(id, "done");
+			await fx.app.manager.waitForAll();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
 	});
 });
 

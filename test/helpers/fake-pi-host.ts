@@ -46,6 +46,11 @@ export interface FakePiHostOptions {
 		leafId?: string | null;
 		branch?: Array<{ id: string }>;
 	};
+	/**
+	 * Terminal size handed to ctx.ui.custom overlay factories (default 24x80).
+	 * Inline widgets receive their own TUI and are unaffected.
+	 */
+	overlayTerminal?: { rows: number; columns: number };
 }
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
@@ -246,6 +251,7 @@ export class FakePiHost {
 	readonly sessionEntries: readonly unknown[];
 	/** Mutable session view; tests can move the leaf/branch to simulate switches. */
 	sessionView: NonNullable<FakePiHostOptions["sessionView"]>;
+	private readonly overlayTerminal: { rows: number; columns: number };
 
 	constructor(options: FakePiHostOptions = {}) {
 		this.mode = options.mode ?? "tui";
@@ -256,6 +262,7 @@ export class FakePiHost {
 		this.cwd = options.cwd ?? "/fake";
 		this.sessionEntries = options.sessionEntries ?? [];
 		this.sessionView = { ...(options.sessionView ?? {}) };
+		this.overlayTerminal = options.overlayTerminal ?? { rows: 24, columns: 80 };
 		this.capabilities = { ...defaultCapabilities, ...options.capabilities };
 		this.theme = createFakeTheme({ name: options.themeName ?? "fake" });
 		this.themeRegistry = new Map(Object.entries(options.themes ?? {}));
@@ -467,7 +474,7 @@ export class FakePiHost {
 				const component = await factory(
 					{
 						requestRender: () => this.requestRender(),
-						terminal: { rows: 24, columns: 80 },
+						terminal: { ...this.overlayTerminal },
 						getShowHardwareCursor: () => true,
 					} as never,
 					this.theme,
