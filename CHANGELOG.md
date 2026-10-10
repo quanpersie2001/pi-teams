@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.5] - 2026-10-10
+
+### Bug Fixes
+
+- Harden headless teardown and fail-closed force-kill per review
+- *(windows)* Pass the module loader to --import as a file URL
+
+### Features
+
+- Add Team Hub details and restore child terminal modes
+- Add verified Windows headless launcher behind platform selection
+- Port child control transport to Windows named pipes
+- Enable native Windows headless execution with actionable backend errors
+- *(task-board)* Short task codes, edit/cancel ops and readable tool rendering
+- *(guidance)* Model-facing tool contracts, recovery errors, team-lead skill
+
+### Miscellaneous Tasks
+
+- Add native windows-latest integration job and document windows support
+- *(windows)* Surface child boot logs in identity failures
+
+### Testing
+
+- Prove verified teardown of a live windows child in native integration
+
 ## [0.1.4] - 2026-10-09
 
 ### Bug Fixes
