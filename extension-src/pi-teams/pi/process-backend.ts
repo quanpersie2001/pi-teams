@@ -308,6 +308,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		// Recheck after queueing and before creating any filesystem/process/pane resource.
 		const admission = await this.prepareModel({
 			...(input.model !== undefined ? { model: input.model } : {}),
+			...(input.strict === true ? { strict: true } : {}),
 			...(sessionFile !== undefined ? { sessionFile } : {}),
 		});
 		input = {

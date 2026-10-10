@@ -776,6 +776,71 @@ describe("AgentManager model admission input", () => {
 
 		expect(fixture.backend.admissions).toHaveLength(1);
 		expect(fixture.backend.admissions[0]).toEqual({ model: "provider/model-a", strict: true });
+		// The launch re-check must repeat the strict gate, or a queued run could be
+		// silently switched after models.json changes.
+		expect(fixture.backend.launches).toHaveLength(1);
+		expect(fixture.backend.launches[0]?.strict).toBe(true);
+		expect(fixture.backend.launches[0]?.model).toBe("provider/model-a");
+	});
+
+	it("omits the launch re-check strict flag when admission fell back", async () => {
+		const fixture = makeManager();
+		fixture.backend.admissionResult = {
+			model: "parent/model-p",
+			fallback: "requested provider/model-a has no usable auth",
+		};
+		await load(fixture);
+
+		await fixture.manager.spawn({
+			type: "general-purpose",
+			prompt: "work",
+			model: "provider/model-a",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+
+		// Admission 1 still requests strict for the caller's model...
+		expect(fixture.backend.admissions[0]).toEqual({ model: "provider/model-a", strict: true });
+		// ...but the system-chosen fallback must not be re-checked strictly.
+		expect(fixture.backend.launches[0]?.strict).toBeUndefined();
+		expect(fixture.backend.launches[0]?.model).toBe("parent/model-p");
+	});
+
+	it("carries the canonical admitted model into the launch input", async () => {
+		const fixture = makeManager();
+		fixture.backend.admissionResult = { model: "provider/canonical-z" };
+		await load(fixture);
+
+		await fixture.manager.spawn({
+			type: "general-purpose",
+			prompt: "work",
+			model: "fuzzy-name",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+
+		expect(fixture.backend.launches[0]?.model).toBe("provider/canonical-z");
+		expect(fixture.backend.launches[0]?.model).not.toBe("fuzzy-name");
+		expect(fixture.backend.launches[0]?.strict).toBe(true);
+	});
+
+	it("treats a blank invocation model as absent", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+
+		await fixture.manager.spawn({
+			type: "general-purpose",
+			prompt: "work",
+			model: "   ",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+
+		expect(fixture.backend.admissions[0]).toEqual({});
+		expect(fixture.backend.admissions[0]).not.toHaveProperty("model");
+		expect(fixture.backend.admissions[0]).not.toHaveProperty("fallbackModel");
+		expect(fixture.backend.admissions[0]).not.toHaveProperty("strict");
+		expect(fixture.backend.launches[0]?.strict).toBeUndefined();
 	});
 
 	it("omits strict for the same launch when strictModelAdmission is off", async () => {

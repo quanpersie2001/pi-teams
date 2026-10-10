@@ -108,7 +108,15 @@ export interface AgentManagerOptions {
 }
 
 type LaunchPlan =
-	| { kind: "launch"; prompt: string }
+	| {
+			kind: "launch";
+			prompt: string;
+			/**
+			 * Strict re-check of the admitted model before child resources are created;
+			 * set only when the invocation model was selected without fallback.
+			 */
+			strict?: boolean;
+	  }
 	| { kind: "mailbox" }
 	| { kind: "assignment"; handle: AgentBackendHandle; prompt: string; sourceAgentId: string }
 	| {
@@ -427,6 +435,11 @@ export class AgentManager {
 		}
 		const epoch = this.admissionEpoch;
 
+		// A blank/whitespace-only invocation model is treated as absent: admission
+		// trims it internally, so a raw-compare strict gate would otherwise let it
+		// silently inherit the parent model. Normalize once and reuse everywhere.
+		const invocationModel = request.model?.trim() || undefined;
+
 		const overrides: {
 			model?: string;
 			thinking?: ThinkingLevel;
@@ -434,7 +447,7 @@ export class AgentManager {
 			timeout?: number;
 			idleTimeout?: number;
 		} = {};
-		if (request.model !== undefined) overrides.model = request.model;
+		if (invocationModel !== undefined) overrides.model = invocationModel;
 		if (request.thinking !== undefined) overrides.thinking = request.thinking;
 		if (request.max_turns !== undefined) overrides.maxTurnLimit = request.max_turns;
 		// Budgets are validated inside resolveInvocation: malformed provided
@@ -464,13 +477,19 @@ export class AgentManager {
 		// Strict admission is for an explicit invocation request only: a definition pin keeps its
 		// documented fallback to the caller/definition/parent model.
 		const strictRequest =
-			requestedModel !== undefined && request.model === requestedModel && this.settings.strictModelAdmission;
+			requestedModel !== undefined && invocationModel === requestedModel && this.settings.strictModelAdmission;
 		const admission = await backend.prepareModel({
 			...(requestedModel !== undefined ? { model: requestedModel } : {}),
-			...(request.model !== undefined && request.model !== requestedModel ? { fallbackModel: request.model } : {}),
+			...(invocationModel !== undefined && invocationModel !== requestedModel
+				? { fallbackModel: invocationModel }
+				: {}),
 			...(strictRequest ? { strict: true } : {}),
 			...(plan.kind === "resume" ? { sessionFile: plan.input.sessionFile } : {}),
 		});
+		// The launch re-check stays strict only when admission 1 selected the requested model
+		// itself; a system-chosen fallback must not produce a "Requested model" failure.
+		const launchStrict = strictRequest && admission.fallback === undefined;
+		if (plan.kind === "launch") plan.strict = launchStrict;
 		if (this.disposed || this.shuttingDown || epoch !== this.admissionEpoch)
 			throw new Error("AgentManager session changed during model admission; no run was allocated.");
 		if (request.name !== undefined) {
@@ -1555,8 +1574,9 @@ export class AgentManager {
 		};
 		if (internal.worktreeInfo !== undefined) input.worktree = { ...internal.worktreeInfo };
 		if (resolved.instructions !== undefined) input.instructions = resolved.instructions;
-		if (resolved.model !== undefined) input.model = resolved.model;
+		if (record.model !== undefined) input.model = record.model;
 		if (record.modelFallback !== undefined) input.modelFallback = record.modelFallback;
+		if (internal.plan.strict === true) input.strict = true;
 		if (resolved.thinking !== undefined) input.thinking = resolved.thinking;
 		if (resolved.tools !== undefined) input.tools = [...resolved.tools];
 		if (resolved.maxTurnLimit !== undefined) input.maxTurns = resolved.maxTurnLimit;

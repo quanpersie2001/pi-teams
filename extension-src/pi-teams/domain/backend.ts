@@ -27,6 +27,11 @@ export interface AgentLaunchInput {
 	instructions?: string;
 	model?: string;
 	modelFallback?: string;
+	/**
+	 * Strict re-check of the admitted model before child resources are created;
+	 * set only when the invocation model was selected without fallback.
+	 */
+	strict?: boolean;
 	thinking?: ThinkingLevel;
 	/** Built-in tool allowlist; undefined = default toolset. */
 	tools?: readonly string[];
