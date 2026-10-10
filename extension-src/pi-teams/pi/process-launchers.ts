@@ -34,10 +34,21 @@ function createDefaultCommandRunner(): LauncherCommandRunner {
 					env: options.env,
 					encoding: "utf8",
 					maxBuffer: 4 * 1024 * 1024,
+					// Bounded probes: a wedged PowerShell/CIM or CLI query must never hang
+					// alive()/terminate() — or budget enforcement — indefinitely.
+					timeout: 15_000,
 				},
 				(error, stdout, stderr) => {
 					if (error) {
-						reject(Object.assign(new Error(`${command} exited unsuccessfully`), { stdout, stderr }));
+						// Propagate the exit code so callers can classify failures by code
+						// (taskkill's 128 "process not found") instead of localized stderr text.
+						reject(
+							Object.assign(new Error(`${command} exited unsuccessfully`), {
+								code: error.code,
+								stdout,
+								stderr,
+							}),
+						);
 						return;
 					}
 					resolve({ stdout, stderr });
@@ -92,6 +103,14 @@ function validateHandle(handle: LauncherHandle, kind: LauncherHandle["kind"]): v
 function errorText(error: unknown): string {
 	if (error instanceof Error && "stderr" in error && typeof error.stderr === "string") return error.stderr;
 	return String(error);
+}
+
+function taskkillMissesPid(error: unknown): boolean {
+	// taskkill reports an already-exited PID with exit code 128 (0x80) — its ESRCH
+	// equivalent. Classify by exit code, never stderr text: Windows localizes
+	// taskkill's messages. Never broaden: any other failure stays visible.
+	const code = (error as { code?: number | string }).code;
+	return code === 128 || code === "128";
 }
 
 interface HerdrForegroundProcess {
@@ -229,6 +248,19 @@ function delay(milliseconds: number): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	setTimeout(resolve, milliseconds);
 	return promise;
+}
+
+/** Poll cleanupExited until the owned child is verifiably gone, or the ≤5s window closes. */
+async function pollVerifiedExit(
+	launcher: Pick<ProcessLauncher, "cleanupExited">,
+	handle: LauncherHandle,
+): Promise<boolean> {
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		if (await launcher.cleanupExited(handle)) return true;
+		await delay(25);
+	}
+	return false;
 }
 
 function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string | undefined>): ProcessLauncher {
@@ -834,12 +866,14 @@ function unixHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: typeo
 			validateHandle(handle, "headless");
 			if (!handle.pid || !handle.identity?.startTime || !handle.identity.ownerToken)
 				throw new Error("Incomplete headless launcher handle");
-			// Ownership re-check before the forced signal: a recycled or foreign
-			// PID must never receive SIGKILL.
+			// Ownership re-check before the forced signal: a recycled or foreign PID
+			// must never receive SIGKILL — and the gate fails CLOSED: a missing probe
+			// (broken ps) is a refusal, not permission, so unverifiable cleanup stays
+			// visible instead of signaling on stale identity.
 			const startTime = await readProcessStart(runner, handle.pid);
-			if (startTime !== undefined && startTime !== handle.identity.startTime) {
+			if (startTime === undefined) throw new Error("Refusing to force-kill: process identity could not be re-verified");
+			if (startTime !== handle.identity.startTime)
 				throw new Error("Refusing to force-kill: process start time no longer matches the owned child");
-			}
 			try {
 				process.kill(-handle.pid, "SIGKILL");
 			} catch (error) {
@@ -912,9 +946,9 @@ function windowsHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: ty
 				try {
 					await runner.run("taskkill", ["/PID", String(pid), "/T"]);
 				} catch (taskkillError) {
-					// taskkill also fails for an already-exited PID (its ESRCH); only other
-					// failures block the verified-exit poll below.
-					if (!/not found/i.test(errorText(taskkillError))) cleanupError = taskkillError;
+					// taskkill exits 128 for an already-gone PID (its ESRCH equivalent); only
+					// other failures block the verified-exit poll below.
+					if (!taskkillMissesPid(taskkillError)) cleanupError = taskkillError;
 				}
 				if (cleanupError === undefined) {
 					const deadline = Date.now() + 5_000;
@@ -956,19 +990,43 @@ function windowsHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: ty
 			// alive() re-verifies CreationDate and the command-line owner token right
 			// before signaling; a recycled or foreign PID is never taskkilled.
 			if ((await this.alive(handle)) === true) {
+				// Windows console children have no graceful signal delivery: taskkill /T
+				// without /F only posts WM_CLOSE, which they ignore — taskkill then exits
+				// non-zero ("can only be terminated forcefully") and backend dispose flows,
+				// which do not escalate on their own, would leak idle children until parent
+				// exit. Their cooperative path is the RPC abort/shutdown the backend invokes
+				// before terminate(); this launcher keeps its own contract — verified exit or
+				// visible failure — by escalating exactly once to /T /F. forceKill remains
+				// the identity-strict budget path with its own fresh ownership probe.
+				let exitConfirmed = false;
 				try {
-					// Graceful first: without /F taskkill only posts close requests, which
-					// console Node children may ignore — the caller escalates to forceKill.
 					await runner.run("taskkill", ["/PID", String(handle.pid), "/T"]);
+					exitConfirmed = await pollVerifiedExit(this, handle);
 				} catch (error) {
-					if (!/not found/i.test(errorText(error))) throw error;
+					// Exit code 128 is taskkill's "process not found" (its ESRCH): the child
+					// may have exited on its own, so only the exit poll decides. Any other
+					// failure means the child was never signaled — escalate immediately
+					// instead of burning the grace window watching it live.
+					if (taskkillMissesPid(error)) exitConfirmed = await pollVerifiedExit(this, handle);
 				}
-				const deadline = Date.now() + 5_000;
-				while (Date.now() < deadline) {
-					if (await this.cleanupExited(handle)) return;
-					await delay(25);
+				if (!exitConfirmed) {
+					let escalationError: unknown;
+					try {
+						await runner.run("taskkill", ["/PID", String(handle.pid), "/T", "/F"]);
+					} catch (error) {
+						// The PID may already be gone (128): the poll below decides success;
+						// other failures stay attached to the final timeout, never swallowed.
+						if (!taskkillMissesPid(error)) escalationError = error;
+					}
+					// Even a refused /F gets the poll's final word: the tree may have died
+					// from the graceful round, and success is claimed only on verified exit.
+					exitConfirmed = await pollVerifiedExit(this, handle);
+					if (!exitConfirmed)
+						throw new Error("Timed out confirming the owned headless process exited", {
+							...(escalationError ? { cause: escalationError } : {}),
+						});
 				}
-				throw new Error("Timed out confirming the owned headless process exited");
+				return;
 			}
 			if (await this.cleanupExited(handle)) return;
 			throw new Error("Refusing to signal an unverified headless process");
@@ -977,16 +1035,18 @@ function windowsHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: ty
 			validateHandle(handle, "headless");
 			if (!handle.pid || !handle.identity?.creationDate || !handle.identity.ownerToken)
 				throw new Error("Incomplete headless launcher handle");
-			// Ownership re-check before the forced kill: a recycled or foreign PID
-			// must never receive taskkill /F.
+			// Ownership re-check before the forced kill: a recycled or foreign PID must
+			// never receive taskkill /F — and the gate fails CLOSED: a missing CIM probe
+			// is a refusal, not permission, so unverifiable cleanup stays visible instead
+			// of signaling on stale identity.
 			const probed = await readWindowsProcessIdentity(runner, handle.pid);
-			if (probed !== undefined && probed.creationDate !== handle.identity.creationDate) {
-				throw new Error("Refusing to force-kill: process start time no longer matches the owned child");
-			}
+			if (probed === undefined) throw new Error("Refusing to force-kill: process identity could not be re-verified");
+			if (probed.creationDate !== handle.identity.creationDate)
+				throw new Error("Refusing to force-kill: process identity (CreationDate) no longer matches the owned child");
 			try {
 				await runner.run("taskkill", ["/PID", String(handle.pid), "/T", "/F"]);
 			} catch (error) {
-				if (!/not found/i.test(errorText(error))) throw error;
+				if (!taskkillMissesPid(error)) throw error;
 			}
 			const deadline = Date.now() + 5_000;
 			while (Date.now() < deadline) {

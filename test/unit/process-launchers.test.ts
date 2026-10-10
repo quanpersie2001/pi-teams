@@ -139,18 +139,23 @@ interface WindowsHeadlessHarness {
 	useLivePid(): ChildProcess;
 	dropOwnerToken(): void;
 	reusePid(): void;
+	failProbe(): void;
+	failNextTaskkill(code: number, stderr: string): void;
 }
 
 function windowsHeadlessHarness(): WindowsHeadlessHarness {
 	let pid = windowsDeadPid;
 	let creationDate = windowsCreationDate;
 	let ownerless = false;
+	let probeFails = false;
 	let spawnedArgv: readonly string[] = [];
 	let spawnedOwnerEnv: string | undefined;
 	const taskkill: string[] = [];
+	const taskkillFailures: Array<{ code: number; stderr: string }> = [];
 	const runner: LauncherCommandRunner = {
 		async run(command, args) {
 			if (command === "powershell.exe") {
+				if (probeFails) throw Object.assign(new Error("powershell.exe exited unsuccessfully"), { code: 1, stderr: "" });
 				const probed = /ProcessId=(\d+)/.exec(args.join(" "))?.[1];
 				if (probed !== String(pid)) return { stdout: "", stderr: "" };
 				const commandLine = ownerless ? "C:\\Windows\\System32\\unrelated.exe --foreign" : spawnedArgv.join(" ");
@@ -161,6 +166,13 @@ function windowsHeadlessHarness(): WindowsHeadlessHarness {
 			}
 			if (command === "taskkill") {
 				taskkill.push(args.join(" "));
+				const failure = taskkillFailures.shift();
+				if (failure)
+					throw Object.assign(new Error("taskkill exited unsuccessfully"), {
+						code: failure.code,
+						stderr: failure.stderr,
+						stdout: "",
+					});
 				return { stdout: "", stderr: "" };
 			}
 			throw new Error(`unexpected command ${command}`);
@@ -192,6 +204,12 @@ function windowsHeadlessHarness(): WindowsHeadlessHarness {
 		},
 		reusePid() {
 			creationDate = reusedWindowsCreationDate;
+		},
+		failProbe() {
+			probeFails = true;
+		},
+		failNextTaskkill(code, stderr) {
+			taskkillFailures.push({ code, stderr });
 		},
 	};
 }
@@ -424,25 +442,95 @@ describe("process launcher lifecycle safety", () => {
 		await expect(harness.launcher.terminate(handle)).resolves.toBeUndefined();
 		expect(harness.taskkill).toEqual([`/PID ${windowsDeadPid} /T`]);
 	});
-	it("reports a windows termination timeout when the owned pid survives taskkill", async () => {
+	it("reports a windows termination timeout when the pid survives graceful and forced taskkill", async () => {
 		const harness = windowsHeadlessHarness();
 		const live = harness.useLivePid();
 		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
 		await expect(harness.launcher.terminate(handle)).rejects.toThrow(
 			"Timed out confirming the owned headless process exited",
 		);
-		expect(harness.taskkill).toEqual([`/PID ${live.pid} /T`]);
+		expect(harness.taskkill).toEqual([`/PID ${live.pid} /T`, `/PID ${live.pid} /T /F`]);
+		await stopLiveChild(live);
+	}, 15_000);
+	it("escalates windows termination to a forced tree kill when the graceful taskkill is refused", async () => {
+		const harness = windowsHeadlessHarness();
+		harness.failNextTaskkill(1, 'ERROR: The process "1900000003" can only be terminated forcefully.');
+		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		await expect(harness.launcher.terminate(handle)).resolves.toBeUndefined();
+		expect(harness.taskkill).toEqual([`/PID ${windowsDeadPid} /T`, `/PID ${windowsDeadPid} /T /F`]);
+	});
+	it("keeps a refused windows forced kill visible with its failure attached", async () => {
+		const harness = windowsHeadlessHarness();
+		const live = harness.useLivePid();
+		harness.failNextTaskkill(1, "ERROR: The process can only be terminated forcefully.");
+		harness.failNextTaskkill(5, "Access is denied.");
+		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		const failure = await harness.launcher.terminate(handle).then(
+			() => undefined,
+			(error: unknown) => error as Error & { cause?: unknown },
+		);
+		expect(failure?.message).toBe("Timed out confirming the owned headless process exited");
+		expect((failure?.cause as { code?: number } | undefined)?.code).toBe(5);
+		expect(harness.taskkill).toEqual([`/PID ${live.pid} /T`, `/PID ${live.pid} /T /F`]);
 		await stopLiveChild(live);
 	}, 10_000);
+	it("treats taskkill exit 128 as an already-gone pid and verifies exit without escalation", async () => {
+		const harness = windowsHeadlessHarness();
+		harness.failNextTaskkill(128, "");
+		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		await expect(harness.launcher.terminate(handle)).resolves.toBeUndefined();
+		expect(harness.taskkill).toEqual([`/PID ${windowsDeadPid} /T`]);
+	});
 	it("refuses to force-kill a reused windows pid before any taskkill", async () => {
 		const harness = windowsHeadlessHarness();
 		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
 		harness.reusePid();
 		expect(await harness.launcher.alive(handle)).toBe(false);
 		await expect(harness.launcher.forceKill(handle)).rejects.toThrow(
-			"Refusing to force-kill: process start time no longer matches the owned child",
+			"Refusing to force-kill: process identity (CreationDate) no longer matches the owned child",
 		);
 		expect(harness.taskkill).toEqual([]);
+	});
+	it("refuses to force-kill a windows pid when the identity probe is unavailable", async () => {
+		const harness = windowsHeadlessHarness();
+		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		harness.failProbe();
+		await expect(harness.launcher.forceKill(handle)).rejects.toThrow(
+			"Refusing to force-kill: process identity could not be re-verified",
+		);
+		expect(harness.taskkill).toEqual([]);
+	});
+	it("refuses unix force-kill when the identity probe fails or no longer matches", async () => {
+		const originalStart = "Mon Oct 13 21:00:00 2025";
+		let startTime: string | undefined = originalStart;
+		const runner: LauncherCommandRunner = {
+			async run(command, args) {
+				if (command !== "ps" || !args.includes("lstart="))
+					throw new Error(`unexpected command ${command} ${args.join(" ")}`);
+				if (startTime === undefined) throw Object.assign(new Error("ps exited unsuccessfully"), { stderr: "" });
+				return { stdout: `${startTime}\n`, stderr: "" };
+			},
+		};
+		const headless = createProcessLaunchers({ runner }).find((candidate) => candidate.kind === "headless");
+		if (!headless) throw new Error("headless launcher is missing");
+		const handle = {
+			kind: "headless" as const,
+			childId: "child-a",
+			pid: 1900000004,
+			identity: { startTime: originalStart, ownerToken: "owned-token" },
+		};
+		startTime = undefined;
+		await expect(headless.forceKill?.(handle)).rejects.toThrow(
+			"Refusing to force-kill: process identity could not be re-verified",
+		);
+		startTime = "Tue Oct 14 09:00:00 2025";
+		await expect(headless.forceKill?.(handle)).rejects.toThrow(
+			"Refusing to force-kill: process start time no longer matches the owned child",
+		);
+		// A matching probe still proceeds: the never-existing PID yields ESRCH, the
+		// tolerated not-found case, and the poll confirms the group is verifiably gone.
+		startTime = originalStart;
+		await expect(headless.forceKill?.(handle)).resolves.toBeUndefined();
 	});
 	it("force-kills the verified windows child tree and confirms exit", async () => {
 		const harness = windowsHeadlessHarness();
