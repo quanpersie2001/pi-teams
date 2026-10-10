@@ -1,5 +1,6 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -123,6 +124,91 @@ const spec = {
 	headlessCommand: "node",
 	headlessArgv: ["/tmp/child.js"],
 };
+
+// A PID beyond the kernel's allocation range never exists, so processExists()
+// stays deterministically false on the CI hosts running this suite.
+const windowsDeadPid = 1900000003;
+const windowsCreationDate = "/Date(1760000000000)/";
+const reusedWindowsCreationDate = "/Date(1760000099999)/";
+
+interface WindowsHeadlessHarness {
+	launcher: ProcessLauncher;
+	taskkill: string[];
+	spawnedArgv(): readonly string[];
+	spawnedOwnerEnv(): string | undefined;
+	useLivePid(): ChildProcess;
+	dropOwnerToken(): void;
+	reusePid(): void;
+}
+
+function windowsHeadlessHarness(): WindowsHeadlessHarness {
+	let pid = windowsDeadPid;
+	let creationDate = windowsCreationDate;
+	let ownerless = false;
+	let spawnedArgv: readonly string[] = [];
+	let spawnedOwnerEnv: string | undefined;
+	const taskkill: string[] = [];
+	const runner: LauncherCommandRunner = {
+		async run(command, args) {
+			if (command === "powershell.exe") {
+				const probed = /ProcessId=(\d+)/.exec(args.join(" "))?.[1];
+				if (probed !== String(pid)) return { stdout: "", stderr: "" };
+				const commandLine = ownerless ? "C:\\Windows\\System32\\unrelated.exe --foreign" : spawnedArgv.join(" ");
+				return {
+					stdout: JSON.stringify({ ProcessId: pid, CreationDate: creationDate, CommandLine: commandLine }),
+					stderr: "",
+				};
+			}
+			if (command === "taskkill") {
+				taskkill.push(args.join(" "));
+				return { stdout: "", stderr: "" };
+			}
+			throw new Error(`unexpected command ${command}`);
+		},
+	};
+	const spawnProcess = ((command: string, args: readonly string[], options: SpawnOptions) => {
+		spawnedArgv = [command, ...args];
+		spawnedOwnerEnv = options.env?.PI_TEAMS_LAUNCH_OWNER;
+		const child = Object.assign(new EventEmitter(), { pid, unref: () => {} }) as unknown as ChildProcess;
+		queueMicrotask(() => child.emit("spawn"));
+		return child;
+	}) as typeof spawn;
+	const launcher = createProcessLaunchers({ platform: "win32", runner, spawnProcess }).find(
+		(candidate) => candidate.kind === "headless",
+	);
+	if (!launcher) throw new Error("windows headless launcher is missing");
+	return {
+		launcher,
+		taskkill,
+		spawnedArgv: () => spawnedArgv,
+		spawnedOwnerEnv: () => spawnedOwnerEnv,
+		useLivePid() {
+			const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+			pid = live.pid ?? pid;
+			return live;
+		},
+		dropOwnerToken() {
+			ownerless = true;
+		},
+		reusePid() {
+			creationDate = reusedWindowsCreationDate;
+		},
+	};
+}
+
+async function stopLiveChild(child: ChildProcess): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	child.once("exit", () => resolve());
+	child.kill("SIGTERM");
+	await promise;
+}
+
+function windowsRunDir(): string {
+	const runDir = mkdtempSync(join(tmpdir(), "pi-windows-launcher-"));
+	tempDirs.push(runDir);
+	return runDir;
+}
 
 describe("process launcher lifecycle safety", () => {
 	it("propagates an interactive launch failure instead of returning a fake handle", async () => {
@@ -310,4 +396,79 @@ describe("process launcher lifecycle safety", () => {
 			}
 		}
 	}, 20_000);
+
+	it("stays unavailable until the windows transport lands while proving identity through the CIM command line", async () => {
+		const harness = windowsHeadlessHarness();
+		expect(await harness.launcher.available()).toBe(false);
+		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		const ownerToken = harness.spawnedArgv().at(-1);
+		expect(handle.kind).toBe("headless");
+		expect(handle.pid).toBe(windowsDeadPid);
+		expect(handle.identity).toEqual({ creationDate: windowsCreationDate, ownerToken });
+		expect(harness.spawnedArgv().slice(-2)).toEqual(["--launch-owner", ownerToken]);
+		expect(harness.spawnedOwnerEnv()).toBe(ownerToken);
+		expect(harness.taskkill).toEqual([]);
+	});
+	it("kills an unowned windows headless spawn instead of returning a fake handle", async () => {
+		const harness = windowsHeadlessHarness();
+		harness.dropOwnerToken();
+		await expect(harness.launcher.launch({ ...spec, runDir: windowsRunDir() })).rejects.toThrow(
+			"Unable to establish headless child identity",
+		);
+		expect(harness.taskkill).toEqual([`/PID ${windowsDeadPid} /T`]);
+	});
+	it("keeps unverifiable windows launch cleanup visible as pending", async () => {
+		const harness = windowsHeadlessHarness();
+		const live = harness.useLivePid();
+		harness.dropOwnerToken();
+		await expect(harness.launcher.launch({ ...spec, runDir: windowsRunDir() })).rejects.toBeInstanceOf(
+			ProcessLaunchCleanupPendingError,
+		);
+		expect(harness.taskkill).toEqual([`/PID ${live.pid} /T`]);
+		await stopLiveChild(live);
+	}, 10_000);
+	it("terminates a verified windows child only after its exit is confirmed", async () => {
+		const harness = windowsHeadlessHarness();
+		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		expect(await harness.launcher.alive(handle)).toBe(true);
+		await expect(harness.launcher.terminate(handle)).resolves.toBeUndefined();
+		expect(harness.taskkill).toEqual([`/PID ${windowsDeadPid} /T`]);
+	});
+	it("reports a windows termination timeout when the owned pid survives taskkill", async () => {
+		const harness = windowsHeadlessHarness();
+		const live = harness.useLivePid();
+		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		await expect(harness.launcher.terminate(handle)).rejects.toThrow(
+			"Timed out confirming the owned headless process exited",
+		);
+		expect(harness.taskkill).toEqual([`/PID ${live.pid} /T`]);
+		await stopLiveChild(live);
+	}, 10_000);
+	it("refuses to force-kill a reused windows pid before any taskkill", async () => {
+		const harness = windowsHeadlessHarness();
+		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		harness.reusePid();
+		expect(await harness.launcher.alive(handle)).toBe(false);
+		await expect(harness.launcher.forceKill(handle)).rejects.toThrow(
+			"Refusing to force-kill: process start time no longer matches the owned child",
+		);
+		expect(harness.taskkill).toEqual([]);
+	});
+	it("force-kills the verified windows child tree and confirms exit", async () => {
+		const harness = windowsHeadlessHarness();
+		const handle = await harness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		await expect(harness.launcher.forceKill(handle)).resolves.toBeUndefined();
+		expect(harness.taskkill).toEqual([`/PID ${windowsDeadPid} /T /F`]);
+	});
+	it("confirms windows cleanup only for a verified dead pid", async () => {
+		const gone = windowsHeadlessHarness();
+		const goneHandle = await gone.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		expect(await gone.launcher.cleanupExited(goneHandle)).toBe(true);
+		const liveHarness = windowsHeadlessHarness();
+		const live = liveHarness.useLivePid();
+		const liveHandle = await liveHarness.launcher.launch({ ...spec, runDir: windowsRunDir() });
+		expect(await liveHarness.launcher.cleanupExited(liveHandle)).toBe(false);
+		await stopLiveChild(live);
+		expect(await liveHarness.launcher.cleanupExited(liveHandle)).toBe(true);
+	});
 });

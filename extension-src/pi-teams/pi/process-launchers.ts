@@ -52,6 +52,8 @@ interface ProcessLauncherOptions {
 	runner?: LauncherCommandRunner;
 	env?: Record<string, string | undefined>;
 	spawnProcess?: typeof spawn;
+	/** Test-only host platform override; production always reads process.platform. */
+	platform?: NodeJS.Platform;
 }
 
 function lastLine(value: string): string | undefined {
@@ -124,6 +126,40 @@ async function processHasOwner(
 	try {
 		return (await runner.run("ps", ["eww", "-p", String(pid), "-o", "command="])).stdout.includes(ownerToken);
 	} catch {
+		return undefined;
+	}
+}
+
+interface WindowsProcessIdentity {
+	creationDate: string;
+	commandLine?: string;
+}
+
+async function readWindowsProcessIdentity(
+	runner: LauncherCommandRunner,
+	pid: number,
+): Promise<WindowsProcessIdentity | undefined> {
+	try {
+		// wmic is removed from recent Windows 11; CIM through PowerShell stays queryable
+		// cross-process and returns CreationDate + CommandLine in a single probe.
+		const result = await runner.run("powershell.exe", [
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			`Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' | ConvertTo-Json -Compress`,
+		]);
+		const decoded = JSON.parse(result.stdout) as unknown;
+		// A unique-key filter yields one record, but piped ConvertTo-Json wraps it in an
+		// array on some hosts; accept both shapes.
+		const record = (Array.isArray(decoded) ? decoded[0] : decoded) as Record<string, unknown> | null | undefined;
+		if (typeof record?.CreationDate !== "string" || !record.CreationDate) return undefined;
+		return {
+			creationDate: record.CreationDate,
+			...(typeof record.CommandLine === "string" ? { commandLine: record.CommandLine } : {}),
+		};
+	} catch {
+		// An empty pipeline (process gone) and a broken probe are both "no identity";
+		// callers fall back to processExists semantics exactly like the ps path.
 		return undefined;
 	}
 }
@@ -697,7 +733,7 @@ function tmuxLauncher(runner: LauncherCommandRunner, env: Record<string, string 
 	return withTerminalPaneLayout(lifecycle, createTmuxPaneLayoutAdapter(runner, env), lifecycle.launch.bind(lifecycle));
 }
 
-function processLauncher(runner: LauncherCommandRunner, spawnProcess: typeof spawn): ProcessLauncher {
+function unixHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: typeof spawn): ProcessLauncher {
 	return {
 		kind: "headless",
 		async available() {
@@ -819,12 +855,160 @@ function processLauncher(runner: LauncherCommandRunner, spawnProcess: typeof spa
 	};
 }
 
+function windowsHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: typeof spawn): ProcessLauncher {
+	return {
+		kind: "headless",
+		async available() {
+			// Enabled only after the Windows transport (named-pipe control endpoint)
+			// and native Windows CI land (issue #3 step 4); until then selection must
+			// keep refusing native Windows rather than half-working.
+			return false;
+		},
+		async launch(spec) {
+			// Mirrors available() on real Windows hosts; the test-only platform option
+			// selects this launcher without lifting the production refusal.
+			if (process.platform === "win32") throw new Error("Headless process launcher is unsupported on Windows");
+			mkdirSync(spec.runDir, { recursive: true });
+			const ownerToken = randomUUID();
+			// Windows cannot read another process's environment (no ps eww equivalent),
+			// but CommandLine is queryable via CIM: ownership rides in argv. The child
+			// ignores trailing argv — bootstrap is PI_TEAMS_BOOTSTRAP/env-driven and its
+			// direct-entry check reads only argv[1] — and the env token stays set for
+			// symmetry with the Unix launcher.
+			const env = { ...process.env, ...spec.env, PI_TEAMS_LAUNCH_OWNER: ownerToken };
+			const logPath = join(spec.runDir, "child.log");
+			const logFd = openSync(logPath, "a", 0o600);
+			let child: ChildProcess;
+			try {
+				fchmodSync(logFd, 0o600);
+				// No detached: Windows has no process groups; taskkill /T owns the tree
+				// at teardown instead of negative-PID signals.
+				child = spawnProcess(spec.headlessCommand, [...spec.headlessArgv, "--launch-owner", ownerToken], {
+					cwd: spec.cwd,
+					env,
+					stdio: ["ignore", logFd, logFd],
+				});
+			} finally {
+				closeSync(logFd);
+			}
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			child.once("spawn", resolve);
+			child.once("error", reject);
+			await promise;
+			const pid = child.pid;
+			if (!pid) throw new Error("Headless child failed to start");
+			child.unref();
+			try {
+				const probed = await readWindowsProcessIdentity(runner, pid);
+				if (probed?.commandLine?.includes(ownerToken) !== true) {
+					throw new Error(`Unable to establish headless child identity; inspect ${logPath}`);
+				}
+				return {
+					kind: "headless",
+					childId: spec.childId,
+					pid,
+					identity: { creationDate: probed.creationDate, ownerToken },
+				};
+			} catch (error) {
+				let cleanupComplete = false;
+				let cleanupError: unknown;
+				try {
+					await runner.run("taskkill", ["/PID", String(pid), "/T"]);
+				} catch (taskkillError) {
+					// taskkill also fails for an already-exited PID (its ESRCH); only other
+					// failures block the verified-exit poll below.
+					if (!/not found/i.test(errorText(taskkillError))) cleanupError = taskkillError;
+				}
+				if (cleanupError === undefined) {
+					const deadline = Date.now() + 5_000;
+					while (Date.now() < deadline) {
+						if (processExists(pid) === false) {
+							cleanupComplete = true;
+							break;
+						}
+						await delay(25);
+					}
+				}
+				if (!cleanupComplete)
+					throw new ProcessLaunchCleanupPendingError("Headless process cleanup remains unverified.", {
+						cause: cleanupError ?? error,
+					});
+				throw error;
+			}
+		},
+		async alive(handle) {
+			validateHandle(handle, "headless");
+			if (!handle.pid || !handle.identity?.creationDate || !handle.identity.ownerToken)
+				throw new Error("Incomplete headless launcher handle");
+			const probed = await readWindowsProcessIdentity(runner, handle.pid);
+			if (probed === undefined) return processExists(handle.pid) === false ? false : undefined;
+			if (probed.creationDate !== handle.identity.creationDate) return false;
+			return probed.commandLine?.includes(handle.identity.ownerToken) === true;
+		},
+		async cleanupExited(handle) {
+			validateHandle(handle, "headless");
+			if (!handle.pid || !handle.identity?.creationDate || !handle.identity.ownerToken)
+				throw new Error("Incomplete headless launcher handle");
+			// No process groups on Windows; the owned tree is torn down via taskkill
+			// /T, so a verified-gone root PID is the full exit proof available here.
+			return processExists(handle.pid) === false;
+		},
+		async terminate(handle) {
+			validateHandle(handle, "headless");
+			if (!handle.pid) throw new Error("Incomplete headless launcher handle");
+			// alive() re-verifies CreationDate and the command-line owner token right
+			// before signaling; a recycled or foreign PID is never taskkilled.
+			if ((await this.alive(handle)) === true) {
+				try {
+					// Graceful first: without /F taskkill only posts close requests, which
+					// console Node children may ignore — the caller escalates to forceKill.
+					await runner.run("taskkill", ["/PID", String(handle.pid), "/T"]);
+				} catch (error) {
+					if (!/not found/i.test(errorText(error))) throw error;
+				}
+				const deadline = Date.now() + 5_000;
+				while (Date.now() < deadline) {
+					if (await this.cleanupExited(handle)) return;
+					await delay(25);
+				}
+				throw new Error("Timed out confirming the owned headless process exited");
+			}
+			if (await this.cleanupExited(handle)) return;
+			throw new Error("Refusing to signal an unverified headless process");
+		},
+		async forceKill(handle) {
+			validateHandle(handle, "headless");
+			if (!handle.pid || !handle.identity?.creationDate || !handle.identity.ownerToken)
+				throw new Error("Incomplete headless launcher handle");
+			// Ownership re-check before the forced kill: a recycled or foreign PID
+			// must never receive taskkill /F.
+			const probed = await readWindowsProcessIdentity(runner, handle.pid);
+			if (probed !== undefined && probed.creationDate !== handle.identity.creationDate) {
+				throw new Error("Refusing to force-kill: process start time no longer matches the owned child");
+			}
+			try {
+				await runner.run("taskkill", ["/PID", String(handle.pid), "/T", "/F"]);
+			} catch (error) {
+				if (!/not found/i.test(errorText(error))) throw error;
+			}
+			const deadline = Date.now() + 5_000;
+			while (Date.now() < deadline) {
+				if (await this.cleanupExited(handle)) return;
+				await delay(25);
+			}
+			throw new Error("Timed out confirming the forced headless process exit");
+		},
+	};
+}
+
 export function createProcessLaunchers(options: ProcessLauncherOptions = {}): readonly ProcessLauncher[] {
 	const runner = options.runner ?? createDefaultCommandRunner();
 	const env = options.env ?? process.env;
-	return [
-		herdrLauncher(runner, env),
-		tmuxLauncher(runner, env),
-		processLauncher(runner, options.spawnProcess ?? spawn),
-	];
+	// The platform option lets tests drive the Windows lifecycle on any host;
+	// production always follows process.platform.
+	const headless =
+		(options.platform ?? process.platform) === "win32"
+			? windowsHeadlessLauncher(runner, options.spawnProcess ?? spawn)
+			: unixHeadlessLauncher(runner, options.spawnProcess ?? spawn);
+	return [herdrLauncher(runner, env), tmuxLauncher(runner, env), headless];
 }
