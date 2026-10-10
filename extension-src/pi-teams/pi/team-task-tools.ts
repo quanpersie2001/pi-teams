@@ -200,7 +200,8 @@ export function createTeamTaskTools(getBoard: () => TaskBoardService | undefined
 		defineTool({
 			name: "team_task_create",
 			label: "Create Team Task",
-			description: "Create a shared team task, optionally blocked on existing tasks.",
+			description:
+				"Create a shared team task, optionally blocked on existing tasks. Create prerequisite tasks first and pass their returned IDs in dependencies; a task with incomplete dependencies stays blocked and cannot be claimed until every prerequisite is completed. To retire a mistaken task, cancel it with team_task_cancel while it is pending (release the claim first if needed).",
 			parameters: Type.Object({
 				title: Type.String({ description: "Task title" }),
 				description: Type.Optional(Type.String({ description: "Task description" })),
@@ -218,10 +219,15 @@ export function createTeamTaskTools(getBoard: () => TaskBoardService | undefined
 		defineTool({
 			name: "team_task_update",
 			label: "Update Team Task",
-			description: "Claim a pending task, release your own task, or complete a task you own.",
+			description:
+				"Update a task's status along the lifecycle pending → in_progress (claim; you become the owner) → completed (terminal; cancelled via team_task_cancel is also terminal). A task must be claimed before it can be completed, and only the current owner can release or complete it. Set in_progress to claim a pending, unblocked task (or keep one you already own), pending to release your own claim, completed to finish a task you own.",
 			parameters: Type.Object({
 				id: Type.String({ description: ID_DESCRIPTION }),
-				status: Type.Union([Type.Literal("pending"), Type.Literal("in_progress"), Type.Literal("completed")]),
+				status: Type.Union([
+					Type.Literal("pending", { description: "Release my own claim; the task returns to pending" }),
+					Type.Literal("in_progress", { description: "Claim a pending, unblocked task; I become the owner" }),
+					Type.Literal("completed", { description: "Finish a task I own; terminal" }),
+				]),
 			}),
 			renderCall: (args) => {
 				const id = typeof args.id === "string" ? args.id : "?";
@@ -250,7 +256,7 @@ export function createTeamTaskTools(getBoard: () => TaskBoardService | undefined
 		defineTool({
 			name: "team_task_cancel",
 			label: "Cancel Team Task",
-			description: "Cancel a pending team task that no other task depends on.",
+			description: "Cancel a pending team task that no other task depends on (release an in_progress claim first).",
 			parameters: Type.Object({ id: Type.String({ description: ID_DESCRIPTION }) }),
 			renderCall: (args) => new Text(`▸ team_task_cancel(${typeof args.id === "string" ? args.id : "?"})`, 0, 0),
 			renderResult: (result) => new Text(renderTaskResult(result, renderTaskLine), 0, 0),
@@ -261,7 +267,8 @@ export function createTeamTaskTools(getBoard: () => TaskBoardService | undefined
 		defineTool({
 			name: "team_task_get",
 			label: "Get Team Task",
-			description: "Get a shared team task and its current dependency blockers.",
+			description:
+				"Get a shared team task and its current state; blockedBy lists prerequisite task IDs that are not yet completed.",
 			parameters: Type.Object({ id: Type.String({ description: ID_DESCRIPTION }) }),
 			renderCall: (args) => new Text(`▸ team_task_get(${typeof args.id === "string" ? args.id : "?"})`, 0, 0),
 			renderResult: (result) => new Text(renderTaskResult(result, renderTaskDetail), 0, 0),
@@ -274,7 +281,8 @@ export function createTeamTaskTools(getBoard: () => TaskBoardService | undefined
 		defineTool({
 			name: "team_task_list",
 			label: "List Team Tasks",
-			description: "List shared team tasks and their current dependency blockers.",
+			description:
+				"List shared team tasks and their current state; each task's blockedBy lists prerequisite task IDs that are not yet completed.",
 			parameters: Type.Object({}),
 			renderCall: () => new Text("▸ team_task_list()", 0, 0),
 			renderResult: (result) => new Text(renderTaskResult(result, renderTaskLine), 0, 0),

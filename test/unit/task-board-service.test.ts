@@ -126,6 +126,25 @@ describe("TaskBoardService", () => {
 		expect(lead.get("T1")).toMatchObject({ status: "pending" });
 	});
 
+	it("teaches recovery for pending complete/release errors and retires via cancel", () => {
+		root = mkdtempSync(join(tmpdir(), "task-board-"));
+		const lead = board("team-a", "lead");
+		const mistaken = lead.create({ title: "Mistaken" });
+		expect(() => lead.update({ id: mistaken.id, status: "completed" })).toThrow(/claim it first/);
+		expect(() => lead.update({ id: mistaken.id, status: "pending" })).toThrow(/nothing to release/);
+		expect(lead.cancel({ id: mistaken.id })).toMatchObject({ status: "cancelled" });
+
+		const claimed = lead.create({ title: "Claimed then retired" });
+		lead.update({ id: claimed.id, status: "in_progress" });
+		expect(() => lead.cancel({ id: claimed.id })).toThrow(/Only pending tasks can be cancelled/);
+		lead.update({ id: claimed.id, status: "pending" });
+		expect(lead.cancel({ id: claimed.id })).toMatchObject({ status: "cancelled" });
+
+		const blocker = lead.create({ title: "Blocker" });
+		lead.create({ title: "Dependent", dependencies: [blocker.id] });
+		expect(() => lead.cancel({ id: blocker.id })).toThrow(/dependency of/);
+	});
+
 	it("keeps legacy codeless task files addressable by UUID", () => {
 		root = mkdtempSync(join(tmpdir(), "task-board-"));
 		const lead = board("legacy-team", "lead");

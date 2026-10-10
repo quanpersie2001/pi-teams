@@ -91,8 +91,8 @@ export class TaskBoardService {
 				if (task.status !== "in_progress" || task.owner !== this.self) {
 					throw new Error(
 						task.status === "in_progress"
-							? `${this.label(task)} is in_progress, owned by @${task.owner} - only the owner can release it`
-							: `${this.label(task)} is ${task.status} and has no owner to release it`,
+							? `${this.label(task)} is in_progress - only the owner can release it; owned by ${task.owner}`
+							: "Task is not claimed; nothing to release",
 					);
 				}
 				task.status = "pending";
@@ -100,8 +100,8 @@ export class TaskBoardService {
 			} else if (task.status !== "in_progress" || task.owner !== this.self) {
 				throw new Error(
 					task.status === "in_progress"
-						? `${this.label(task)} is in_progress, owned by @${task.owner} - only the owner can complete it`
-						: `${this.label(task)} is ${task.status} - claim it with in_progress before completing`,
+						? `${this.label(task)} is in_progress - only the owner can complete it; owned by ${task.owner}`
+						: 'Task is pending: claim it first with status "in_progress", then complete it',
 				);
 			} else {
 				task.status = "completed";

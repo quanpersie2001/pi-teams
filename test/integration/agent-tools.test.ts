@@ -110,7 +110,9 @@ describe("tool registration", () => {
 		expect(catalog).toContain("general-purpose");
 		expect(catalog).toContain("Project-selected specialist");
 		expect(catalog).not.toContain("hidden-specialist");
-		expect(catalog).toContain("Every NEW spawn MUST include a unique name");
+		expect(catalog).toContain(
+			"Every NEW spawn MUST include all four required fields — subagent_type, description, name, and color",
+		);
 		expect(catalog).toContain("When the user asks to spawn subagents/teammates");
 		expect(agent?.promptSnippet).toContain("Spawn named, colored subagents");
 	});
