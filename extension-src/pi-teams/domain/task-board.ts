@@ -1,9 +1,10 @@
 // Task board contracts and validation (ADR 0007 §4).
 
-export type TaskStatus = "pending" | "in_progress" | "completed";
+export type TaskStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
 export interface BoardTask {
 	id: string;
+	code?: string;
 	title: string;
 	description?: string;
 	status: TaskStatus;
@@ -21,15 +22,23 @@ export function isTaskId(value: unknown): value is string {
 	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 }
 
+export function isTaskCode(value: unknown): value is string {
+	return typeof value === "string" && /^T[1-9][0-9]*$/.test(value);
+}
+
 export function parseBoardTask(value: unknown): BoardTask | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	const raw = value as Record<string, unknown>;
 	if (
 		!isTaskId(raw.id) ||
+		(raw.code !== undefined && !isTaskCode(raw.code)) ||
 		typeof raw.title !== "string" ||
 		raw.title.length === 0 ||
 		(raw.description !== undefined && typeof raw.description !== "string") ||
-		(raw.status !== "pending" && raw.status !== "in_progress" && raw.status !== "completed") ||
+		(raw.status !== "pending" &&
+			raw.status !== "in_progress" &&
+			raw.status !== "completed" &&
+			raw.status !== "cancelled") ||
 		!Array.isArray(raw.dependencies) ||
 		!raw.dependencies.every(isTaskId) ||
 		(raw.owner !== undefined &&
@@ -38,9 +47,11 @@ export function parseBoardTask(value: unknown): BoardTask | undefined {
 		!Number.isSafeInteger(raw.updatedAt)
 	)
 		return undefined;
+	// Owner presence is only legal for in_progress tasks; pending/completed/cancelled are unowned.
 	if ((raw.status === "in_progress") !== (raw.owner !== undefined)) return undefined;
 	return {
 		id: raw.id,
+		...(raw.code === undefined ? {} : { code: raw.code as string }),
 		title: raw.title,
 		...(raw.description === undefined ? {} : { description: raw.description }),
 		status: raw.status,
