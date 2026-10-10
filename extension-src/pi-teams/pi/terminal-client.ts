@@ -4,6 +4,7 @@ import { connect } from "node:net";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { ProcessTerminal } from "@earendil-works/pi-tui";
+import { isWindowsPipeEndpoint } from "./child-endpoint.js";
 
 const BOOTSTRAP_ENV = "PI_TEAMS_TERMINAL_BOOTSTRAP";
 const MAX_FRAME_BYTES = 64 * 1024;
@@ -23,7 +24,7 @@ function validateBootstrap(value: unknown): Bootstrap {
 	const input = value as Record<string, unknown>;
 	if (
 		typeof input.socketPath !== "string" ||
-		!input.socketPath.startsWith("/") ||
+		(!input.socketPath.startsWith("/") && !isWindowsPipeEndpoint(input.socketPath)) ||
 		typeof input.childId !== "string" ||
 		input.childId.length < 1 ||
 		input.childId.length > 128 ||

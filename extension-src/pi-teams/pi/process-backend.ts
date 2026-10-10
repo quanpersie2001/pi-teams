@@ -1,14 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import {
-	chmodSync,
-	existsSync,
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	realpathSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { SerializableBackendHandle } from "../app/run-registry.js";
@@ -32,6 +23,7 @@ import type { BackendMode, BackendSelector } from "../domain/config.js";
 import type { LauncherHandle, ProcessLauncher } from "../domain/process-launcher.js";
 import { ProcessLaunchCleanupPendingError } from "../domain/process-launcher.js";
 import type { TranscriptSnapshot } from "../domain/transcript.js";
+import { cleanupControlEndpointPath, createControlEndpoints, currentPlatform } from "./child-endpoint.js";
 import { deriveViewerToken } from "./child-rpc-auth.js";
 import { ChildRpcClient } from "./child-rpc-client.js";
 import { createModelAdmission } from "./model-admission.js";
@@ -314,9 +306,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		const runDir = join(teamsArtifactDir(input.configCwd), "sessions", childId);
 		mkdirSync(runDir, { recursive: true, mode: 0o700 });
 		chmodSync(runDir, 0o700);
-		// Unix socket pathname limits are small; project/session paths may be arbitrarily long.
-		const controlDir = mkdtempSync("/tmp/pi-teams-");
-		chmodSync(controlDir, 0o700);
+		const control = createControlEndpoints(childId, { terminal: presentationLauncher !== undefined });
 		const tools = input.tools === undefined ? undefined : [...input.tools];
 		if (input.team && tools) {
 			for (const tool of TEAM_COORDINATION_TOOLS) {
@@ -326,8 +316,10 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		const bootstrap: ChildBootstrap = {
 			childId,
 			token: randomBytes(32).toString("hex"),
-			socketPath: join(controlDir, "control.sock"),
-			...(presentationLauncher ? { terminalSocketPath: join(controlDir, "terminal.sock") } : {}),
+			socketPath: control.socketPath,
+			...(presentationLauncher && control.terminalSocketPath !== undefined
+				? { terminalSocketPath: control.terminalSocketPath }
+				: {}),
 			...(presentationLauncher && this.options.getParentExtensionPaths
 				? { presentationExtensionPaths: [...this.options.getParentExtensionPaths()] }
 				: {}),
@@ -470,7 +462,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				this.children.delete(childId);
 				this.runs.delete(input.runId);
 			} else {
-				rmSync(controlDir, { recursive: true, force: true });
+				control.cleanup();
 			}
 			await this.withPresentationLock(async () => {
 				this.pendingChildren.delete(childId);
@@ -561,7 +553,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	private releaseChild(child: ChildConnection): void {
 		this.unwatch(child);
 		child.client.disconnect();
-		rmSync(dirname(child.bootstrap.socketPath), { recursive: true, force: true });
+		cleanupControlEndpointPath(child.bootstrap.socketPath, currentPlatform());
 		child.closed = true;
 	}
 
@@ -1055,7 +1047,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				}
 			}
 			await launcher.terminate(serialized.launcher);
-			rmSync(dirname(serialized.socketPath), { recursive: true, force: true });
+			cleanupControlEndpointPath(serialized.socketPath, currentPlatform());
 			return true;
 		} catch (error) {
 			if (error instanceof ChildProtocolError && error.code === "identity_mismatch") throw error;

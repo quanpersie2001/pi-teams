@@ -29,6 +29,7 @@ import {
 	requireString,
 } from "../domain/child-protocol.js";
 import type { TranscriptItem } from "../domain/transcript.js";
+import { currentPlatform, isWindowsPipeEndpoint, validateControlEndpoints } from "./child-endpoint.js";
 import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
 import { createTeamTaskTools } from "./team-task-tools.js";
 
@@ -38,7 +39,6 @@ const MAX_TRANSCRIPT_STATE_BYTES = 768 * 1024;
 const MAX_TEXT_CHARS = 8_192;
 const MAX_REQUESTS = 512;
 const MAX_CONNECTIONS = 16;
-const MAX_SOCKET_PATH_BYTES = process.platform === "darwin" ? 103 : 107;
 const CHILD_ENV = "PI_TEAMS_CHILD";
 const BOOTSTRAP_ENV = "PI_TEAMS_BOOTSTRAP";
 // Session-bound lifetime (ADR 0007 §1): losing the authenticated control
@@ -145,25 +145,11 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 	const token = requireString(value.token, "token", 512);
 	if (token.length < 16) throw new ChildProtocolError("invalid_bootstrap", "Child bootstrap token is too short");
 	const socketPath = requireString(value.socketPath, "socketPath", 4_096);
-	if (!isAbsolute(socketPath) || Buffer.byteLength(socketPath) > MAX_SOCKET_PATH_BYTES) {
-		throw new ChildProtocolError(
-			"invalid_bootstrap",
-			`Child socketPath must be absolute and fit in ${MAX_SOCKET_PATH_BYTES} UTF-8 bytes`,
-		);
-	}
 	const terminalSocketPath = parseOptionalString(value, "terminalSocketPath", 4_096);
-	if (
-		terminalSocketPath !== undefined &&
-		(!isAbsolute(terminalSocketPath) ||
-			Buffer.byteLength(terminalSocketPath) > MAX_SOCKET_PATH_BYTES ||
-			dirname(terminalSocketPath) !== dirname(socketPath) ||
-			terminalSocketPath === socketPath)
-	) {
-		throw new ChildProtocolError(
-			"invalid_bootstrap",
-			"terminalSocketPath must be a distinct short absolute socket path in the child control directory",
-		);
-	}
+	validateControlEndpoints(
+		terminalSocketPath === undefined ? { socketPath } : { socketPath, terminalSocketPath },
+		currentPlatform(),
+	);
 	const sessionDir = requireString(value.sessionDir, "sessionDir", 4_096);
 	const cwd = requireString(value.cwd, "cwd", 4_096);
 	const configCwd = requireString(value.configCwd, "configCwd", 4_096);
@@ -1123,7 +1109,9 @@ class ChildRuntime {
 
 export async function startChildBridge(bootstrap: ChildBootstrap, host: ChildBridgeHost): Promise<ChildBridgeHandle> {
 	const childBootstrap = parseChildBootstrap(bootstrap);
-	await mkdir(dirname(childBootstrap.socketPath), { recursive: true, mode: 0o700 });
+	// Defensive control-directory creation; a named pipe needs no filesystem directory.
+	if (!isWindowsPipeEndpoint(childBootstrap.socketPath))
+		await mkdir(dirname(childBootstrap.socketPath), { recursive: true, mode: 0o700 });
 	const sessionFile = host.getSessionFile();
 	if (typeof sessionFile !== "string" || sessionFile.length === 0)
 		throw new ChildProtocolError(
@@ -1148,14 +1136,20 @@ export async function startChildBridge(bootstrap: ChildBootstrap, host: ChildBri
 }
 
 async function openChildSocket(bootstrap: ChildBootstrap, runtime: ChildRuntime): Promise<ChildSocketHandle> {
-	try {
-		const old = await lstat(bootstrap.socketPath);
-		if (!old.isSocket() || (typeof process.getuid === "function" && old.uid !== process.getuid())) {
-			throw new ChildProtocolError("socket_path_conflict", "Refusing to replace a non-owned child socket path");
+	// Named pipes are kernel objects, not filesystem entries: the pipe name
+	// embeds a fresh childId UUID, so no stale socket file can exist and there
+	// is no mode to restrict after listening.
+	const pipeEndpoint = isWindowsPipeEndpoint(bootstrap.socketPath);
+	if (!pipeEndpoint) {
+		try {
+			const old = await lstat(bootstrap.socketPath);
+			if (!old.isSocket() || (typeof process.getuid === "function" && old.uid !== process.getuid())) {
+				throw new ChildProtocolError("socket_path_conflict", "Refusing to replace a non-owned child socket path");
+			}
+			await unlink(bootstrap.socketPath);
+		} catch (error) {
+			if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
 		}
-		await unlink(bootstrap.socketPath);
-	} catch (error) {
-		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
 	}
 	const clients = new Set<Socket>();
 	const cache = new Map<string, CachedCommand>();
@@ -1217,12 +1211,14 @@ async function openChildSocket(bootstrap: ChildBootstrap, runtime: ChildRuntime)
 		server.once("listening", onListening);
 		server.listen(bootstrap.socketPath);
 	});
-	try {
-		await chmod(bootstrap.socketPath, 0o600);
-	} catch (error) {
-		for (const socket of clients) socket.destroy();
-		await new Promise<void>((resolve) => server.close(() => resolve()));
-		throw error;
+	if (!pipeEndpoint) {
+		try {
+			await chmod(bootstrap.socketPath, 0o600);
+		} catch (error) {
+			for (const socket of clients) socket.destroy();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			throw error;
+		}
 	}
 	return {
 		server,
@@ -1454,6 +1450,8 @@ async function closeChildSocket(handle: ChildSocketHandle): Promise<void> {
 	handle.beginIntentionalClose();
 	for (const socket of handle.clients) socket.destroy();
 	await new Promise<void>((resolve) => handle.server.close(() => resolve()));
+	// A named pipe has no filesystem entry to unlink once its last handle closes.
+	if (isWindowsPipeEndpoint(handle.socketPath)) return;
 	try {
 		const current = await lstat(handle.socketPath);
 		if (current.isSocket() && (typeof process.getuid !== "function" || current.uid === process.getuid()))
