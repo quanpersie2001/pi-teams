@@ -146,7 +146,7 @@ Startup reconciliation is archive-only, before UI initialization. Owned stale ac
 
 Messaging is independent of public integration v3 orchestration and runtime-authored completion notifications.
 
-`send_message` accepts `{ target: "teammate-name" | "lead", message: string }`. The lead and named teammates receive the tool; children do not receive `Agent`, result retrieval or parent orchestration tools. Targets must resolve to the current team's roster. There is no broadcast primitive.
+`send_message` accepts `{ target, message }`. A teammate addresses another teammate or the lead; the lead addresses teammates only and cannot target `"lead"` (`Unknown teammate: lead`). The lead and named teammates receive the tool; children do not receive `Agent`, result retrieval or parent orchestration tools. Targets must resolve to the current team's roster. There is no broadcast primitive.
 
 Each participant has `.pi/teams/t/<team-id>/inboxes/<name>/`. A message is a single JSON file written with an exclusive temporary file and atomic rename (0700 directories, 0600 files). A per-team HMAC key is generated with the roster and distributed through the authenticated, owner-only bootstrap. Verification rejects malformed, tampered or wrong-recipient entries; quarantine preserves invalid entries and logs the reason.
 
@@ -166,6 +166,8 @@ The lead and named teammates receive these tools:
 |---|---|
 | `team_task_create` | `{ title: string, description?: string, dependencies?: string[] }` |
 | `team_task_update` | `{ id: string, status: "pending" \| "in_progress" \| "completed" }` |
+| `team_task_edit` | `{ id: string, description: string }` |
+| `team_task_cancel` | `{ id: string }` |
 | `team_task_get` | `{ id: string }` |
 | `team_task_list` | `{}` |
 

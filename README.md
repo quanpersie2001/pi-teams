@@ -118,9 +118,11 @@ HerdR/tmux's six-child threshold counts every live runtime-owned child, includin
 | `list_models` | Resolve a model reference before spawning: optional `query` (string) and `limit` (number) return up to `limit` (default 50) matching `provider/id — display name` rows sorted canonically, plus the total match count |
 | `get_subagent_result` | Read a run's durable full result from `result.md`; use `wait: true` only when the current turn explicitly needs the answer immediately, not for passive background completions |
 | `steer_subagent` | Send guidance to an active run |
-| `send_message` | Send `{ target: "teammate-name" \| "lead", message: "..." }` through a signed peer mailbox |
+| `send_message` | Send `{ target, message }` through a signed peer mailbox. A teammate addresses another teammate or the lead; the lead addresses teammates only, so `target: "lead"` is refused |
 | `team_task_create` | Create `{ title, description?, dependencies? }` in the current team's board |
 | `team_task_update` | Claim a pending task (`in_progress`), release your own claim (`pending`) or complete it (`completed`) |
+| `team_task_edit` | Replace a task's description with `{ id, description }`; only a pending task can be edited, so release a claim first |
+| `team_task_cancel` | Cancel a task by `{ id }`; only a pending task can be cancelled (release a claim first), and it is refused while another task depends on it |
 | `team_task_list` | List current-team tasks with their current `blockedBy` dependency IDs |
 | `team_task_get` | Read one current-team task by ID |
 

@@ -219,7 +219,7 @@ One team per session, created at `session_start`; the team id derives from the s
 
 Exclusive `<id>.lock` directories serialize claim/update read-modify-write across native processes. Claims set the runtime actor as owner; only that owner can release or complete the task, and completed tasks are terminal. Lock conflicts are explicit errors, not automatic retries.
 
-`pi/team-task-tools.ts` provides `team_task_create/update/list/get` to the lead and named children. Native child tools are registered before session creation; explicit role allowlists still include coordination tools. Lead tools resolve the active board at execution time, so a session switch cannot mutate a previous team's board. Cold named continuation receives only the current team's authenticated context.
+`pi/team-task-tools.ts` provides `team_task_create/update/edit/cancel/get/list` to the lead and named children. Native child tools are registered before session creation; explicit role allowlists still include coordination tools. Lead tools resolve the active board at execution time, so a session switch cannot mutate a previous team's board. Cold named continuation receives only the current team's authenticated context.
 
 The board is coordination only. Retention follows team/history artifacts; consumer retry, acceptance, review, priority and assignment policy remain outside the runtime. A settled board is a read-only artifact for consumers, not shared mutable `pi-tasks` state.
 
