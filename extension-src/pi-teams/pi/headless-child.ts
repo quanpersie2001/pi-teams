@@ -81,10 +81,14 @@ function validateSessionDirectory(path: string): Promise<void> {
 	return (async () => {
 		await mkdir(path, { recursive: true, mode: 0o700 });
 		const details = await lstat(path);
+		// Windows permission bits only mirror the read-only attribute (directories
+		// always read 0o777) and stats carry no owner, so owner-only proof there is
+		// the parent-created directory inheriting the user's NTFS ACLs; the mode
+		// and uid assertions are POSIX-only.
 		if (
 			!details.isDirectory() ||
-			(typeof process.getuid === "function" && details.uid !== process.getuid()) ||
-			(details.mode & 0o077) !== 0
+			(process.platform !== "win32" &&
+				((typeof process.getuid === "function" && details.uid !== process.getuid()) || (details.mode & 0o077) !== 0))
 		) {
 			throw new ChildProtocolError("unsafe_session_dir", "Child session directory must be an owner-only directory");
 		}

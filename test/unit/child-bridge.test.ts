@@ -1,6 +1,6 @@
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TranscriptItem } from "../../extension-src/pi-teams/domain/transcript.js";
 import {
@@ -11,6 +11,13 @@ import {
 	parseChildBootstrap,
 	startChildBridge,
 } from "../../extension-src/pi-teams/pi/child-bridge.js";
+import {
+	cleanupControlEndpointPath,
+	createControlEndpoints,
+	currentPlatform,
+	isWindowsPipeEndpoint,
+	validateControlEndpoints,
+} from "../../extension-src/pi-teams/pi/child-endpoint.js";
 import { deriveViewerToken } from "../../extension-src/pi-teams/pi/child-rpc-auth.js";
 import { ChildRpcClient } from "../../extension-src/pi-teams/pi/child-rpc-client.js";
 
@@ -548,5 +555,98 @@ describe("control-loss self-termination (ADR 0007 §1)", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe("child control endpoints", () => {
+	const childId = "1b0e8a5e-9c3d-4f2a-8d7b-6c1f2e3a4b5c";
+	const controlPipe = `\\\\.\\pipe\\pi-teams-${childId}\\control`;
+	const terminalPipe = `\\\\.\\pipe\\pi-teams-${childId}\\terminal`;
+
+	it("creates owner-only Unix sockets in one temporary control directory and cleans it up", () => {
+		const endpoint = createControlEndpoints("endpoint-unix", { terminal: true });
+		const controlDir = dirname(endpoint.socketPath);
+		tempDir = controlDir;
+		expect(controlDir.startsWith(join(tmpdir(), "pi-teams-"))).toBe(true);
+		expect(endpoint.socketPath).toBe(join(controlDir, "control.sock"));
+		expect(endpoint.terminalSocketPath).toBe(join(controlDir, "terminal.sock"));
+		expect(statSync(controlDir).mode & 0o777).toBe(0o700);
+		endpoint.cleanup();
+		expect(() => statSync(controlDir)).toThrow();
+		// The serialized-path cleanup helper stays idempotent after cleanup.
+		expect(() => cleanupControlEndpointPath(endpoint.socketPath, currentPlatform())).not.toThrow();
+	});
+
+	it("creates named pipes on win32 without touching the filesystem", () => {
+		const endpoint = createControlEndpoints(childId, { terminal: true, platform: "win32" });
+		expect(endpoint.socketPath).toBe(controlPipe);
+		expect(endpoint.terminalSocketPath).toBe(terminalPipe);
+		expect(endpoint.socketPath.length).toBeLessThanOrEqual(256);
+		expect(() => endpoint.cleanup()).not.toThrow();
+		expect(() => cleanupControlEndpointPath(controlPipe, "win32")).not.toThrow();
+		expect(createControlEndpoints(childId, { terminal: false, platform: "win32" }).terminalSocketPath).toBeUndefined();
+	});
+
+	it("keeps the Unix socket pathname rules unchanged per platform", () => {
+		const unixPath = (bytes: number) => `/${"a".repeat(bytes - 1)}`;
+		expect(() => validateControlEndpoints({ socketPath: unixPath(103) }, "darwin")).not.toThrow();
+		expect(() => validateControlEndpoints({ socketPath: unixPath(104) }, "darwin")).toThrow(
+			"Child socketPath must be absolute and fit in 103 UTF-8 bytes",
+		);
+		expect(() => validateControlEndpoints({ socketPath: unixPath(107) }, "linux")).not.toThrow();
+		expect(() => validateControlEndpoints({ socketPath: unixPath(108) }, "linux")).toThrow(
+			"Child socketPath must be absolute and fit in 107 UTF-8 bytes",
+		);
+		expect(() => validateControlEndpoints({ socketPath: "relative.sock" }, "linux")).toThrow();
+		const socketPath = `/${"a".repeat(40)}/control.sock`;
+		const terminalSocketPath = `/${"a".repeat(40)}/terminal.sock`;
+		expect(() => validateControlEndpoints({ socketPath, terminalSocketPath }, "linux")).not.toThrow();
+		for (const invalid of ["/elsewhere/terminal.sock", socketPath, "relative.sock", unixPath(108)]) {
+			expect(() => validateControlEndpoints({ socketPath, terminalSocketPath: invalid }, "linux")).toThrow();
+		}
+	});
+
+	it("accepts only the exact Windows pipe shape with one shared childId", () => {
+		expect(() =>
+			validateControlEndpoints({ socketPath: controlPipe, terminalSocketPath: terminalPipe }, "win32"),
+		).not.toThrow();
+		expect(() => validateControlEndpoints({ socketPath: controlPipe }, "win32")).not.toThrow();
+		for (const invalid of [
+			"/tmp/pi-teams.sock",
+			"\\\\.\\pipe\\other-1b0e8a5e-9c3d-4f2a-8d7b-6c1f2e3a4b5c\\control",
+			"\\\\.\\pipe\\pi-teams-not-a-uuid\\control",
+			`${controlPipe}${"x".repeat(300)}`,
+			terminalPipe,
+		]) {
+			expect(() => validateControlEndpoints({ socketPath: invalid }, "win32")).toThrow();
+		}
+		for (const invalid of [
+			controlPipe,
+			"\\\\.\\pipe\\pi-teams-2c1f9b6f-0d4e-5a3b-9e8c-7d2f3e4b5c6d\\terminal",
+			"/tmp/terminal.sock",
+		]) {
+			expect(() =>
+				validateControlEndpoints({ socketPath: controlPipe, terminalSocketPath: invalid }, "win32"),
+			).toThrow();
+		}
+	});
+
+	it("selects endpoint rules by platform rather than path shape", () => {
+		expect(() => validateControlEndpoints({ socketPath: controlPipe }, "linux")).toThrow();
+		expect(() => validateControlEndpoints({ socketPath: controlPipe }, "darwin")).toThrow();
+		expect(isWindowsPipeEndpoint(controlPipe)).toBe(true);
+		expect(isWindowsPipeEndpoint("/tmp/control.sock")).toBe(false);
+		if (process.platform === "win32") return;
+		const bootstrap = {
+			childId: "endpoint-rules",
+			token: TOKEN,
+			socketPath: controlPipe,
+			sessionDir: "/tmp/pi-teams-endpoint-rules",
+			cwd: "/tmp/pi-teams-endpoint-rules",
+			configCwd: "/tmp/pi-teams-endpoint-rules",
+			systemPrompt: "",
+			promptMode: "append" as const,
+		};
+		expect(() => parseChildBootstrap({ ...bootstrap, terminalSocketPath: terminalPipe })).toThrow();
 	});
 });

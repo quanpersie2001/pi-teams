@@ -1,16 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import {
-	chmodSync,
-	existsSync,
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	realpathSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { SerializableBackendHandle } from "../app/run-registry.js";
 import type {
 	AgentBackendHandle,
@@ -29,9 +20,10 @@ import {
 	type ChildState,
 } from "../domain/child-protocol.js";
 import type { BackendMode, BackendSelector } from "../domain/config.js";
-import type { LauncherHandle, ProcessLauncher } from "../domain/process-launcher.js";
+import type { LauncherHandle, LauncherKind, ProcessLauncher } from "../domain/process-launcher.js";
 import { ProcessLaunchCleanupPendingError } from "../domain/process-launcher.js";
 import type { TranscriptSnapshot } from "../domain/transcript.js";
+import { cleanupControlEndpointPath, createControlEndpoints, currentPlatform } from "./child-endpoint.js";
 import { deriveViewerToken } from "./child-rpc-auth.js";
 import { ChildRpcClient } from "./child-rpc-client.js";
 import { createModelAdmission } from "./model-admission.js";
@@ -40,6 +32,17 @@ import { teamsArtifactDir } from "./registry-host.js";
 import { TEAM_TASK_TOOL_NAMES } from "./team-task-tools.js";
 
 const TEAM_COORDINATION_TOOLS: readonly string[] = ["send_message", ...TEAM_TASK_TOOL_NAMES];
+
+/**
+ * Honest per-kind availability requirements for diagnostics. available() is a
+ * boolean probe by contract, so failed selection reports these static reasons
+ * instead of a bare hint; the headless entry is platform-dependent by design.
+ */
+const LAUNCHER_REQUIREMENTS: Readonly<Record<LauncherKind, string>> = {
+	herdr: "requires the HerdR terminal environment",
+	tmux: "requires a tmux server socket",
+	headless: "requires a platform with a supported headless process launcher",
+};
 
 interface ChildConnection {
 	bootstrap: ChildBootstrap;
@@ -194,11 +197,18 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	}
 	private async chooseLauncher(): Promise<ProcessLauncher> {
 		const hint = this.launcherHint;
+		const unavailable: LauncherKind[] = [];
 		for (const launcher of this.launchers) {
 			if (hint !== "auto" && launcher.kind !== hint) continue;
 			if (await launcher.available()) return launcher;
+			unavailable.push(launcher.kind);
 		}
-		throw new Error(`No available process launcher for "${hint}".`);
+		if (unavailable.length === 0) throw new Error(`No process launcher for "${hint}" is registered.`);
+		throw new Error(
+			`No available process launcher for "${hint}": ${unavailable
+				.map((kind) => `${kind} ${LAUNCHER_REQUIREMENTS[kind]}`)
+				.join("; ")}.`,
+		);
 	}
 	private async withPresentationLock<T>(operation: () => Promise<T>): Promise<T> {
 		const previous = this.presentationQueue;
@@ -241,7 +251,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				runDir: child.runDir,
 				cwd: child.bootstrap.cwd,
 				env: { PI_TEAMS_TERMINAL_BOOTSTRAP: viewerBootstrapFile, PI_TEAMS_HOST_MODULE: hostModuleEntry() },
-				interactiveArgv: [process.execPath, "--import", paths.moduleLoader, paths.terminalClient],
+				interactiveArgv: [process.execPath, "--import", pathToFileURL(paths.moduleLoader).href, paths.terminalClient],
 				headlessCommand: process.execPath,
 				headlessArgv: [],
 			});
@@ -314,9 +324,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		const runDir = join(teamsArtifactDir(input.configCwd), "sessions", childId);
 		mkdirSync(runDir, { recursive: true, mode: 0o700 });
 		chmodSync(runDir, 0o700);
-		// Unix socket pathname limits are small; project/session paths may be arbitrarily long.
-		const controlDir = mkdtempSync("/tmp/pi-teams-");
-		chmodSync(controlDir, 0o700);
+		const control = createControlEndpoints(childId, { terminal: presentationLauncher !== undefined });
 		const tools = input.tools === undefined ? undefined : [...input.tools];
 		if (input.team && tools) {
 			for (const tool of TEAM_COORDINATION_TOOLS) {
@@ -326,8 +334,10 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		const bootstrap: ChildBootstrap = {
 			childId,
 			token: randomBytes(32).toString("hex"),
-			socketPath: join(controlDir, "control.sock"),
-			...(presentationLauncher ? { terminalSocketPath: join(controlDir, "terminal.sock") } : {}),
+			socketPath: control.socketPath,
+			...(presentationLauncher && control.terminalSocketPath !== undefined
+				? { terminalSocketPath: control.terminalSocketPath }
+				: {}),
 			...(presentationLauncher && this.options.getParentExtensionPaths
 				? { presentationExtensionPaths: [...this.options.getParentExtensionPaths()] }
 				: {}),
@@ -373,7 +383,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				},
 				interactiveArgv: [],
 				headlessCommand: process.execPath,
-				headlessArgv: ["--import", paths.moduleLoader, paths.headless],
+				headlessArgv: ["--import", pathToFileURL(paths.moduleLoader).href, paths.headless],
 			});
 			const client = new ChildRpcClient({
 				socketPath: bootstrap.socketPath,
@@ -470,7 +480,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				this.children.delete(childId);
 				this.runs.delete(input.runId);
 			} else {
-				rmSync(controlDir, { recursive: true, force: true });
+				control.cleanup();
 			}
 			await this.withPresentationLock(async () => {
 				this.pendingChildren.delete(childId);
@@ -561,7 +571,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	private releaseChild(child: ChildConnection): void {
 		this.unwatch(child);
 		child.client.disconnect();
-		rmSync(dirname(child.bootstrap.socketPath), { recursive: true, force: true });
+		cleanupControlEndpointPath(child.bootstrap.socketPath, currentPlatform());
 		child.closed = true;
 	}
 
@@ -1055,7 +1065,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				}
 			}
 			await launcher.terminate(serialized.launcher);
-			rmSync(dirname(serialized.socketPath), { recursive: true, force: true });
+			cleanupControlEndpointPath(serialized.socketPath, currentPlatform());
 			return true;
 		} catch (error) {
 			if (error instanceof ChildProtocolError && error.code === "identity_mismatch") throw error;

@@ -36,7 +36,7 @@ import {
 import { normalizeTeammateColor, teammateNameProblem } from "../domain/team.js";
 import type { WorktreeInfo } from "../domain/worktree.js";
 import type { AgentRegistry } from "./agent-registry.js";
-import { resolveBackend } from "./backend-selector.js";
+import { backendUnavailableReason, resolveBackend } from "./backend-selector.js";
 import type {
 	AgentRegistryEntry,
 	CompletedRunHistoryEntry,
@@ -450,7 +450,16 @@ export class AgentManager {
 			sessionId: owner.kind === "conversation" ? owner.sessionId : this.getSessionId(),
 		};
 		const backend = await resolveBackend({ backends: this.backends });
-		if (!backend) throw new Error("No process execution backend is available for model admission.");
+		if (!backend) {
+			// The failure is the execution backend itself, not the model check that
+			// never ran: name the launcher problem and keep admission out of it.
+			const reason = await backendUnavailableReason({ backends: this.backends });
+			throw new Error(
+				reason === undefined
+					? "No usable process launcher is available on this platform; model admission was not attempted."
+					: `No usable process launcher is available on this platform (${reason}); model admission was not attempted.`,
+			);
+		}
 		const admission = await backend.prepareModel({
 			...(plan.kind === "launch" && snapshot.resolved.model !== undefined ? { model: snapshot.resolved.model } : {}),
 			...(request.model !== undefined ? { fallbackModel: request.model } : {}),
