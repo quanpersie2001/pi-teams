@@ -12,6 +12,7 @@ import { shouldSkipExtensionInChildSession } from "./child-guard.js";
 import { registerAgentsCommand, registerBackendCommand } from "./commands.js";
 import { loadSubagentsSettings } from "./config-host.js";
 import { createPiDeliveryHost, installLeadMailbox } from "./delivery-host.js";
+import { registerModelTools } from "./model-tools.js";
 import { ProcessAgentExecutionBackend, resolveLauncherHint, resolveSessionLauncherHint } from "./process-backend.js";
 import { createSubagentRunStore } from "./registry-host.js";
 import { type SubagentsRpcWiring, wireSubagentsRpc } from "./rpc.js";
@@ -76,6 +77,7 @@ export default function (pi: ExtensionAPI): void {
 	registerAgentsCommand(pi, { manager: app.manager, openHub: () => uiHandle?.openHub() });
 	registerBackendCommand(pi, { backend });
 	registerSubagentTools(pi, app.manager, app.registry, app.delivery);
+	registerModelTools(pi);
 	pi.on("turn_end", () => app.delivery?.finishSpawnBatch());
 	registerLeadSendMessageTool(
 		pi,

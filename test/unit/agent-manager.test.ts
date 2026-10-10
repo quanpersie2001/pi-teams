@@ -752,6 +752,131 @@ describe("teammate names (ADR 0007 §2)", () => {
 	});
 });
 
+describe("AgentManager model admission input", () => {
+	function pinnedModelFile(model: string): LoadedAgentFile {
+		return {
+			sourcePath: "/fake/pinned-model-agent.md",
+			frontmatter: { name: "pinned-model-agent", description: "pinned model", model },
+			body: "specialist body",
+			filenameStem: "pinned-model-agent",
+		};
+	}
+
+	it("marks an explicitly requested launch model strict when the setting is on", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+
+		await fixture.manager.spawn({
+			type: "general-purpose",
+			prompt: "work",
+			model: "provider/model-a",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+
+		expect(fixture.backend.admissions).toHaveLength(1);
+		expect(fixture.backend.admissions[0]).toEqual({ model: "provider/model-a", strict: true });
+	});
+
+	it("omits strict for the same launch when strictModelAdmission is off", async () => {
+		const fixture = makeManager({ settingsOverrides: { strictModelAdmission: false } });
+		await load(fixture);
+
+		await fixture.manager.spawn({
+			type: "general-purpose",
+			prompt: "work",
+			model: "provider/model-a",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+
+		expect(fixture.backend.admissions).toHaveLength(1);
+		expect(fixture.backend.admissions[0]).toEqual({ model: "provider/model-a" });
+		expect(fixture.backend.admissions[0]).not.toHaveProperty("strict");
+	});
+
+	it("never sends the same reference as both model and fallbackModel", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+
+		await fixture.manager.spawn({
+			type: "general-purpose",
+			prompt: "work",
+			model: "provider/model-a",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+
+		expect(fixture.backend.admissions[0]).toEqual({ model: "provider/model-a", strict: true });
+		expect(fixture.backend.admissions[0]).not.toHaveProperty("fallbackModel");
+	});
+
+	it("omits strict for a definition pin when the invocation names no model", async () => {
+		const fixture = makeManager({ files: [pinnedModelFile("pinned/model-x")] });
+		await load(fixture);
+
+		await fixture.manager.spawn({ type: "pinned-model-agent", prompt: "work", run_in_background: true });
+		await settle(fixture.manager);
+
+		expect(fixture.backend.admissions[0]).toEqual({ model: "pinned/model-x" });
+		expect(fixture.backend.admissions[0]).not.toHaveProperty("strict");
+	});
+
+	it("keeps a pinned definition model primary and the invocation model only as fallback", async () => {
+		const fixture = makeManager({ files: [pinnedModelFile("pinned/model-x")] });
+		await load(fixture);
+
+		await fixture.manager.spawn({
+			type: "pinned-model-agent",
+			prompt: "work",
+			model: "requested/model-y",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+
+		expect(fixture.backend.admissions[0]).toEqual({
+			model: "pinned/model-x",
+			fallbackModel: "requested/model-y",
+		});
+		expect(fixture.backend.admissions[0]).not.toHaveProperty("strict");
+	});
+
+	it("applies strict when the definition pin and the invocation model are the same", async () => {
+		const fixture = makeManager({ files: [pinnedModelFile("shared/model")] });
+		await load(fixture);
+
+		await fixture.manager.spawn({
+			type: "pinned-model-agent",
+			prompt: "work",
+			model: "shared/model",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+
+		expect(fixture.backend.admissions[0]).toEqual({ model: "shared/model", strict: true });
+		expect(fixture.backend.admissions[0]).not.toHaveProperty("fallbackModel");
+	});
+
+	it("resume admission carries only the sessionFile", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+
+		const original = await spawnBg(fixture.manager);
+		await settle(fixture.manager, 20);
+		fixture.backend.complete(original.id, "done", "/tmp/sessions/resume.jsonl");
+		await fixture.manager.whenSettled(original.id);
+
+		await fixture.manager.resume(original.id, "continue");
+		await settle(fixture.manager);
+
+		const admission = fixture.backend.admissions[fixture.backend.admissions.length - 1];
+		expect(admission).toEqual({ sessionFile: "/tmp/sessions/resume.jsonl" });
+		expect(admission).not.toHaveProperty("model");
+		expect(admission).not.toHaveProperty("strict");
+		expect(admission).not.toHaveProperty("fallbackModel");
+	});
+});
+
 describe("AgentManager dispose", () => {
 	it("stops everything and disposes backend handles", async () => {
 		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 2 } });

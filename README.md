@@ -115,6 +115,7 @@ HerdR/tmux's six-child threshold counts every live runtime-owned child, includin
 | Tool | Purpose |
 |---|---|
 | `Agent` | Launch a specialist with an explicit assignment — optionally `name:` it a teammate of this session's team (`@name` becomes its messaging/board address; a name is refused while that teammate is still working, and a settled name means a new assignment for the same teammate) — or resume a settled run by `resume` run ID |
+| `list_models` | Resolve a model reference before spawning: optional `query` (string) and `limit` (number) return up to `limit` (default 50) matching `provider/id — display name` rows sorted canonically, plus the total match count |
 | `get_subagent_result` | Read a run's durable full result from `result.md`; use `wait: true` only when the current turn explicitly needs the answer immediately, not for passive background completions |
 | `steer_subagent` | Send guidance to an active run |
 | `send_message` | Send `{ target: "teammate-name" \| "lead", message: "..." }` through a signed peer mailbox |
@@ -148,9 +149,12 @@ Override operational settings in `.pi/teams.json` or globally in `~/.pi/agent/te
   "graceTurns": 3,
   "backgroundByDefault": true,
   "worktreeIsolation": false,
+  "strictModelAdmission": true,
   "backend": "auto"
 }
 ```
+
+`strictModelAdmission` (default `true`) requires a model passed explicitly in the spawn invocation (`Agent`'s `model`) to resolve to exactly one registered model. An ambiguous invocation reference fails admission with the candidate models listed, and an unregistered one fails admission with a distinct message naming the reference, instead of falling back to the parent's model; a definition/agent-file model pin is unaffected and still falls back to the caller/definition/parent model with a recorded note, as does a model that resolves but has no usable authentication. Set it to `false` to restore caller/definition/parent fallback for the invocation `model` too, recorded as `Model fallback: ...` in the agent result. Pass models as `provider/modelId` and resolve a reference with `list_models` first: the bare `glm-5.3-flash` is ambiguous across five providers, while `zai/glm-5.3-flash` resolves exactly.
 
 `backend` selects presentation: `auto` (default) detects HerdR → tmux and falls back to no pane; `headless` never attaches a multiplexer. Precedence for new children: `/teams-backend <mode>` (current session) > `PI_TEAMS_BACKEND` > settings `backend` > `auto`. The env variable does not override a session switch, and switching affects only new children. Existing children retain their selected presentation launcher, subject to the all-headless presentation threshold above six. Execution and native UI state remain in the same independent worker when panes close or reopen. A forced unavailable launcher fails explicitly.
 

@@ -81,7 +81,9 @@ pinned specialist definition
 
 Public `Agent`/spawn RPC expose only their documented inputs; internal invocation fields are not automatically public options. Background mode is separate: explicit invocation mode overrides the specialist default. Description can also be supplied per invocation.
 
-Model admission first tries the resolved primary. If it cannot resolve a native model/auth, it tries the caller model ignored by a pin, captured parent model, then authenticated native candidates in stable `provider/id` order. With neither a pin nor invocation model, the parent model is primary. No usable model rejects before run ID, queue slot, worktree or child/pane creation.
+Model admission first tries the resolved primary. If it cannot resolve a native model/auth, it tries the caller model ignored by a pin, captured parent model, then authenticated native candidates in stable `provider/id` order — unless the primary is a model requested explicitly in the invocation (`Agent`'s `model`) and `strictModelAdmission` is on (default), in which case an ambiguous request fails admission listing the candidate models and an unregistered request fails admission naming the reference, instead of falling back. A definition/agent-file pin is not subject to strict admission and keeps this fallback. With neither a pin nor invocation model, the parent model is primary. No usable model rejects before run ID, queue slot, worktree or child/pane creation.
+
+Pass model references canonically as `provider/modelId` — to `Agent`, in a definition `model` pin, or wherever a model is requested. A bare name is accepted only while it resolves to exactly one registered model: `glm-5.3-flash` exists in five providers (`opencode`, `opencode-go`, `radius`, `zai`, `zai-coding-cn`), so requesting it is ambiguous, whereas `zai/glm-5.3-flash` resolves exactly. Resolve a reference with the read-only `list_models` tool before spawning. With `strictModelAdmission` on (default), an ambiguous model passed in the invocation (`Agent`'s `model`) fails admission listing the candidate models, and an unregistered one fails admission with a distinct message naming the reference, instead of falling back; a definition/agent-file pin is unaffected and still falls back with a recorded note, as does a model that resolves but has no usable authentication. See [Operational settings](#5-operational-settings).
 
 Admission uses the native child's `ModelRuntime`, `models.json` and `auth.json` in Pi's agent directory. Catalog refresh is offline; native auth may refresh OAuth. This does **not** check provider availability, remote key acceptance, billing or quota. Launch rechecks after queueing and the child guards dispatch. `model` and optional `modelFallback` in replies/status/lifecycle/history describe the actual selection.
 
@@ -128,6 +130,7 @@ Defaults:
   "worktreeIsolation": false,
   "rememberAgents": true,
   "strictAgentFiles": false,
+  "strictModelAdmission": true,
   "fallbackSubagent": "none",
   "agentPanel": true,
   "backend": "auto"
@@ -145,6 +148,7 @@ Defaults:
 | `worktreeIsolation` | Enables managed-worktree capability; default shared workspace. |
 | `rememberAgents` | Preserves settled run/session history for explicit cold continuation. It never re-adopts live children. Startup archives stale owned active rows as stopped with recovery metadata; foreign-owner rows remain untouched. |
 | `strictAgentFiles` | Strict mode fails loading on malformed files or validated invalid fields, naming the source path. Lenient mode skips unreadable/unparseable files, but corrects invalid fields with warnings while retaining the specialist. |
+| `strictModelAdmission` | Default `true`. A model passed explicitly in the spawn invocation (`Agent`'s `model`) must resolve to exactly one registered native model; an ambiguous invocation reference fails admission with an error listing the sorted candidate models, and an unregistered one fails admission with a distinct message naming the reference and no candidates, instead of falling back to the parent's model. A model pinned in a definition/agent-file is unaffected: it keeps its documented fallback to the caller/definition/parent model with a recorded note. Auth-based fallback is unaffected too: a model that resolves but has no usable authentication still falls back with a recorded note. With `false`, the old behavior is restored for the invocation `model` as well: fall back to the caller/definition/parent model and record `Model fallback: ...` in the agent result. |
 | `fallbackSubagent` | Specialist name to use when requested type is unknown/disabled/ambiguous; `none` rejects. Empty/mistyped values default to `none`. |
 | `agentPanel` | Enables inline panel, Hub and remote child focus; no effect on lifecycle or automatic cleanup. |
 | `backend` | Presentation mode: `auto` (default) detects HerdR → tmux, otherwise no viewer; `headless` never attaches a multiplexer. Execution always uses independent native SDK workers. Explicit `herdr`/`tmux` forcing is env-only. `/teams-backend [auto\|headless]` switches selection for future children in the current session. |

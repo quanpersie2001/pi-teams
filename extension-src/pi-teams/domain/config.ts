@@ -1,6 +1,6 @@
 // Operational settings contract and pure sanitization.
 //
-// Exactly the ten accepted operational keys. Values are read from
+// Exactly the thirteen accepted operational keys. Values are read from
 // ~/.pi/agent/teams.json (global) and <project>/.pi/teams.json
 // (overrides), then passed through sanitizeSettings before use.
 
@@ -18,6 +18,7 @@ export type SubagentsSettings = {
 	worktreeIsolation: boolean;
 	rememberAgents: boolean;
 	strictAgentFiles: boolean;
+	strictModelAdmission: boolean;
 	fallbackSubagent: string;
 	agentPanel: boolean;
 	/** Multiplexer mode: auto-detect (herdr → tmux → headless) or forced headless. */
@@ -37,6 +38,7 @@ export const DEFAULT_SUBAGENTS_SETTINGS: Readonly<SubagentsSettings> = {
 	worktreeIsolation: false,
 	rememberAgents: true,
 	strictAgentFiles: false,
+	strictModelAdmission: true,
 	fallbackSubagent: "none",
 	agentPanel: true,
 	backend: "auto",
@@ -100,7 +102,7 @@ function budgetOrZero(value: unknown): number {
  *   positive fractions fall back to 0; whole seconds cap at MAX_BUDGET_SECONDS;
  * - fallbackSubagent must be a non-empty string, else "none";
  * - backend accepts only "auto" or "headless", else "auto";
- * - unknown keys are dropped (the result contains exactly the twelve keys).
+ * - unknown keys are dropped (the result contains exactly the thirteen keys).
  */
 export function sanitizeSettings(raw: unknown): SubagentsSettings {
 	const source = toRecord(raw);
@@ -119,6 +121,7 @@ export function sanitizeSettings(raw: unknown): SubagentsSettings {
 		worktreeIsolation: boolOr(source.worktreeIsolation, DEFAULT_SUBAGENTS_SETTINGS.worktreeIsolation),
 		rememberAgents: boolOr(source.rememberAgents, DEFAULT_SUBAGENTS_SETTINGS.rememberAgents),
 		strictAgentFiles: boolOr(source.strictAgentFiles, DEFAULT_SUBAGENTS_SETTINGS.strictAgentFiles),
+		strictModelAdmission: boolOr(source.strictModelAdmission, DEFAULT_SUBAGENTS_SETTINGS.strictModelAdmission),
 		fallbackSubagent:
 			typeof source.fallbackSubagent === "string" && source.fallbackSubagent.trim().length > 0
 				? source.fallbackSubagent

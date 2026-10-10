@@ -91,6 +91,13 @@ export interface ModelAdmissionInput {
 	fallbackModel?: string;
 	/** Cold resume prefers its saved bootstrap model when no model is supplied. */
 	sessionFile?: string;
+	/**
+	 * An explicitly requested `model` must resolve unambiguously or admission
+	 * fails instead of degrading to another model. Auth-based fallback is
+	 * unaffected: a resolvable model without usable auth still falls back.
+	 * Default false (fall back, and report the reason).
+	 */
+	strict?: boolean;
 }
 
 export interface ModelAdmission {

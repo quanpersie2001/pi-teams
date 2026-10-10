@@ -19,6 +19,7 @@ describe("sanitizeSettings", () => {
 				worktreeIsolation: false,
 				rememberAgents: false,
 				strictAgentFiles: true,
+				strictModelAdmission: false,
 				fallbackSubagent: "general-purpose",
 				agentPanel: false,
 				backend: "headless",
@@ -33,10 +34,20 @@ describe("sanitizeSettings", () => {
 			worktreeIsolation: false,
 			rememberAgents: false,
 			strictAgentFiles: true,
+			strictModelAdmission: false,
 			fallbackSubagent: "general-purpose",
 			agentPanel: false,
 			backend: "headless",
 		});
+	});
+
+	it("defaults strictModelAdmission to true and coerces non-booleans to the default", () => {
+		expect(sanitizeSettings({}).strictModelAdmission).toBe(true);
+		expect(sanitizeSettings({ strictModelAdmission: false }).strictModelAdmission).toBe(false);
+		expect(sanitizeSettings({ strictModelAdmission: true }).strictModelAdmission).toBe(true);
+		expect(sanitizeSettings({ strictModelAdmission: "false" }).strictModelAdmission).toBe(true);
+		expect(sanitizeSettings({ strictModelAdmission: 0 }).strictModelAdmission).toBe(true);
+		expect(sanitizeSettings({ strictModelAdmission: null }).strictModelAdmission).toBe(true);
 	});
 
 	it("accepts only auto|headless for backend; anything else falls back to auto", () => {

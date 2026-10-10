@@ -78,6 +78,7 @@ Match the exact runtime error, apply the fix, retry. `<task>` stands for the tas
 | `Task cancellation requires team_task_cancel` | Use `team_task_cancel { id }` instead of `team_task_update` with `status: "cancelled"`. |
 | `Only pending tasks can be cancelled: <task> is <status>` | The task is claimed or already terminal. Release the claim back to `pending` with `team_task_update { id, status: "pending" }`, then cancel. |
 | `Cannot cancel <task> - it is a dependency of: <ids>` | Other tasks depend on it. Cancel or complete the dependents first, then retry the cancel. |
+| `Requested model "<ref>" matches multiple native Pi models (ambiguous; specify provider/modelId): <candidates>` | The model passed in the spawn invocation is ambiguous; the error lists the sorted candidates. Re-spawn with the canonical `provider/modelId` chosen from them, or narrow the request. An unregistered invocation reference fails instead of falling back with a distinct message (`Requested model "<ref>" is not registered in the native Pi model runtime.`) that names the reference and lists no candidates. A model pinned in a definition/agent-file is unaffected and still falls back with a recorded note. Run `list_models` before spawning to resolve a reference; set `strictModelAdmission: false` to opt out and fall back to the caller/definition/parent model with a recorded `Model fallback: ...` note. |
 
 ## End-to-end coordination recipe
 

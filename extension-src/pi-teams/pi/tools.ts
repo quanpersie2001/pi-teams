@@ -123,7 +123,7 @@ const agentParameters = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				'Optional model choice. Accepts "provider/modelId" or a fuzzy name. A pinned agent model remains primary; this choice can be an automatic fallback if the primary is unavailable.',
+				'Optional model choice. Prefer the canonical "provider/modelId"; a bare or fuzzy name must resolve to exactly one registered native model. A model pinned by the agent definition remains primary. When strictModelAdmission is enabled (default), an ambiguous or unregistered named model fails admission with the list of candidate models instead of silently running a different model; authentication-based fallback is unaffected.',
 		}),
 	),
 	thinking: Type.Optional(

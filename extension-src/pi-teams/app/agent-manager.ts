@@ -460,9 +460,15 @@ export class AgentManager {
 					: `No usable process launcher is available on this platform (${reason}); model admission was not attempted.`,
 			);
 		}
+		const requestedModel = plan.kind === "launch" ? snapshot.resolved.model : undefined;
+		// Strict admission is for an explicit invocation request only: a definition pin keeps its
+		// documented fallback to the caller/definition/parent model.
+		const strictRequest =
+			requestedModel !== undefined && request.model === requestedModel && this.settings.strictModelAdmission;
 		const admission = await backend.prepareModel({
-			...(plan.kind === "launch" && snapshot.resolved.model !== undefined ? { model: snapshot.resolved.model } : {}),
-			...(request.model !== undefined ? { fallbackModel: request.model } : {}),
+			...(requestedModel !== undefined ? { model: requestedModel } : {}),
+			...(request.model !== undefined && request.model !== requestedModel ? { fallbackModel: request.model } : {}),
+			...(strictRequest ? { strict: true } : {}),
 			...(plan.kind === "resume" ? { sessionFile: plan.input.sessionFile } : {}),
 		});
 		if (this.disposed || this.shuttingDown || epoch !== this.admissionEpoch)

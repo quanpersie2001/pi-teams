@@ -34,9 +34,54 @@ function resolveModel(reference: string, models: readonly NativeModel[]): ModelR
 			(model) => model.id.toLowerCase().includes(pattern) || model.name.toLowerCase().includes(pattern),
 		);
 	}
-	if (matches.length > 1) return { reason: "matches multiple native Pi models (ambiguous; specify provider/modelId)" };
+	if (matches.length > 1) {
+		const candidates = matches.map(canonicalModel).sort();
+		return {
+			reason: `matches multiple native Pi models (ambiguous; specify provider/modelId): ${candidates.join(", ")}`,
+		};
+	}
 	const model = matches[0];
 	return model ? { model } : { reason: "is not registered in the native Pi model runtime" };
+}
+
+/** Native models visible to isolated children: same dedupe by canonical reference form as the resolver. */
+function nativeModels(runtime: ModelRuntime): NativeModel[] {
+	return [...new Map(runtime.getModels().map((model) => [canonicalModel(model), model])).values()];
+}
+
+/** Create the isolated native runtime the admission resolver reads configuration from. */
+function createIsolatedRuntime(agentDir: string): Promise<ModelRuntime> {
+	return ModelRuntime.create({
+		authPath: join(agentDir, "auth.json"),
+		modelsPath: join(agentDir, "models.json"),
+		allowModelNetwork: false,
+		refreshOnCreate: false,
+	});
+}
+
+/** Re-read on-disk model/auth configuration without allowing network access. */
+async function refreshOffline(runtime: ModelRuntime): Promise<ModelRuntime> {
+	await runtime.refresh({ allowNetwork: false });
+	return runtime;
+}
+
+/**
+ * List the native Pi models isolated children can see, so callers can disambiguate an ambiguous
+ * `provider/modelId` request. Performs no auth checks.
+ */
+export async function listNativeModels(
+	options: { agentDir?: string; query?: string; limit?: number } = {},
+): Promise<{ total: number; rows: Array<{ ref: string; name: string }> }> {
+	const runtime = await refreshOffline(await createIsolatedRuntime(options.agentDir ?? getAgentDir()));
+	const query = options.query?.trim().toLowerCase();
+	const rows = nativeModels(runtime)
+		.filter(
+			(model) =>
+				!query || canonicalModel(model).toLowerCase().includes(query) || model.name.toLowerCase().includes(query),
+		)
+		.map((model) => ({ ref: canonicalModel(model), name: model.name }))
+		.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0));
+	return { total: rows.length, rows: rows.slice(0, Math.max(0, options.limit ?? 50)) };
 }
 
 /** Resolve the same global models/auth configuration that isolated native children load. */
@@ -49,19 +94,9 @@ export function createModelAdmission(
 
 	function refreshedRuntime(): Promise<ModelRuntime> {
 		if (refresh) return refresh;
-		const initializing =
-			setup ??
-			ModelRuntime.create({
-				authPath: join(agentDir, "auth.json"),
-				modelsPath: join(agentDir, "models.json"),
-				allowModelNetwork: false,
-				refreshOnCreate: false,
-			});
+		const initializing = setup ?? createIsolatedRuntime(agentDir);
 		setup = initializing;
-		const refreshing = initializing.then(async (runtime) => {
-			await runtime.refresh({ allowNetwork: false });
-			return runtime;
-		});
+		const refreshing = initializing.then(refreshOffline);
 		refresh = refreshing;
 		void refreshing.then(
 			() => {
@@ -92,7 +127,7 @@ export function createModelAdmission(
 			throw new Error("No authenticated model is available: native Pi model/auth setup failed.");
 		}
 
-		const models = [...new Map(runtime.getModels().map((model) => [canonicalModel(model), model])).values()];
+		const models = nativeModels(runtime);
 		const triedModels = new Set<string>();
 		const triedReferences = new Set<string>();
 		const providerAuth = new Map<string, Promise<boolean>>();
@@ -137,6 +172,10 @@ export function createModelAdmission(
 			triedReferences.add(reference.toLowerCase());
 			const resolution = resolveModel(reference, models);
 			if ("reason" in resolution) {
+				// A strict explicit request must fail loudly instead of degrading to another model.
+				if (input.strict === true && reference === requested) {
+					throw new Error(`Requested model ${JSON.stringify(reference)} ${resolution.reason}.`);
+				}
 				if (reference === primary) primaryReason = resolution.reason;
 				continue;
 			}

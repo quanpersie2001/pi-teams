@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createModelAdmission } from "../../extension-src/pi-teams/pi/model-admission.js";
+import { createModelAdmission, listNativeModels } from "../../extension-src/pi-teams/pi/model-admission.js";
 
 interface FixtureModel {
 	id: string;
@@ -223,12 +223,127 @@ describe("native child model admission", () => {
 				"admission-parent": provider([{ id: "parent" }], "fixture-parent-key"),
 			});
 			const prepare = createModelAdmission({ agentDir, getParentModel: () => "admission-parent/parent" });
-			expect(await prepare({ model })).toEqual({
+			const admission = await prepare({ model });
+			expect(admission).toEqual({
 				model: "admission-parent/parent",
 				fallback: expect.stringMatching(/ambiguous.*admission-parent\/parent/),
 			});
+			expect(admission.fallback).toContain("admission-ambiguous/shared-exact-id");
 		},
 	);
+
+	it.each(["shared fuzzy", "admission-ambiguous/shared"])(
+		"fails fast instead of falling back when a strict request %s is ambiguous",
+		async (model) => {
+			await fixture({
+				"admission-ambiguous": provider(
+					[
+						{ id: "shared-exact-id", name: "Shared fuzzy alpha" },
+						{ id: "shared-beta", name: "Shared fuzzy beta" },
+					],
+					"fixture-ambiguous-key",
+				),
+				"admission-parent": provider([{ id: "parent" }], "fixture-parent-key"),
+			});
+			const prepare = createModelAdmission({ agentDir, getParentModel: () => "admission-parent/parent" });
+			const failure = await prepare({ model, strict: true }).catch((error: Error) => error);
+			expect(failure).toBeInstanceOf(Error);
+			if (!(failure instanceof Error)) throw new Error("Expected strict admission failure");
+			expect(failure.message).toContain(JSON.stringify(model));
+			expect(failure.message).toContain("admission-ambiguous/shared-beta");
+			expect(failure.message).toContain("admission-ambiguous/shared-exact-id");
+		},
+	);
+
+	it("fails fast instead of falling back when a strict request is not registered", async () => {
+		await fixture({
+			"admission-caller": provider([{ id: "caller" }], "fixture-caller-key"),
+			"admission-parent": provider([{ id: "parent" }], "fixture-parent-key"),
+		});
+		const prepare = createModelAdmission({ agentDir, getParentModel: () => "admission-parent/parent" });
+		const failure = await prepare({
+			model: "missing-provider/missing",
+			fallbackModel: "admission-caller/caller",
+			strict: true,
+		}).catch((error: Error) => error);
+		expect(failure).toBeInstanceOf(Error);
+		if (!(failure instanceof Error)) throw new Error("Expected strict admission failure");
+		expect(failure.message).toBe(
+			'Requested model "missing-provider/missing" is not registered in the native Pi model runtime.',
+		);
+	});
+
+	it("still falls back for a strict request that resolves without usable native authentication", async () => {
+		await fixture({
+			"admission-no-auth": provider([{ id: "pinned" }]),
+			"admission-parent": provider([{ id: "parent" }], "fixture-parent-key"),
+		});
+		const prepare = createModelAdmission({ agentDir, getParentModel: () => "admission-parent/parent" });
+		expect(await prepare({ model: "admission-no-auth/pinned", strict: true })).toEqual({
+			model: "admission-parent/parent",
+			fallback: expect.stringMatching(
+				/admission-no-auth\/pinned.*no usable native authentication.*admission-parent\/parent/,
+			),
+		});
+	});
+
+	it("keeps cold-resume fallback behavior under strict admission", async () => {
+		await fixture({
+			"admission-saved": provider([{ id: "saved" }]),
+			"admission-parent": provider([{ id: "parent" }], "fixture-parent-key"),
+		});
+		const sessionFile = await savedSession("admission-saved/saved");
+		const prepare = createModelAdmission({ agentDir, getParentModel: () => "admission-parent/parent" });
+		expect(await prepare({ sessionFile, strict: true })).toEqual({
+			model: "admission-parent/parent",
+			fallback: expect.stringMatching(
+				/admission-saved\/saved.*no usable native authentication.*admission-parent\/parent/,
+			),
+		});
+	});
+
+	it("lists native models with sorted refs, display names, query filtering, and a pre-cap total", async () => {
+		await fixture({
+			"admission-a": provider([{ id: "alpha", name: "Alpha display name" }]),
+			"admission-b": provider([
+				{ id: "second", name: "Second display name" },
+				{ id: "first", name: "First display name" },
+			]),
+		});
+		// The runtime also ships its built-in catalog, so scope exact expectations to the fixture query.
+		expect(await listNativeModels({ agentDir, query: "admission-" })).toEqual({
+			total: 3,
+			rows: [
+				{ ref: "admission-a/alpha", name: "Alpha display name" },
+				{ ref: "admission-b/first", name: "First display name" },
+				{ ref: "admission-b/second", name: "Second display name" },
+			],
+		});
+		expect(await listNativeModels({ agentDir, query: "ADMISSION-B" })).toEqual({
+			total: 2,
+			rows: [
+				{ ref: "admission-b/first", name: "First display name" },
+				{ ref: "admission-b/second", name: "Second display name" },
+			],
+		});
+		expect(await listNativeModels({ agentDir, query: "second" })).toEqual({
+			total: 1,
+			rows: [{ ref: "admission-b/second", name: "Second display name" }],
+		});
+		expect(await listNativeModels({ agentDir, query: "admission-", limit: 2 })).toEqual({
+			total: 3,
+			rows: [
+				{ ref: "admission-a/alpha", name: "Alpha display name" },
+				{ ref: "admission-b/first", name: "First display name" },
+			],
+		});
+		expect(await listNativeModels({ agentDir, query: "no-such-model" })).toEqual({ total: 0, rows: [] });
+		// Without a query every native model is eligible, capped at the default limit of 50.
+		const all = await listNativeModels({ agentDir });
+		expect(all.total).toBeGreaterThanOrEqual(3);
+		expect(all.rows).toHaveLength(Math.min(50, all.total));
+		expect(all.rows[0]).toEqual({ ref: "admission-a/alpha", name: "Alpha display name" });
+	});
 
 	it.each([
 		"UNIQUE-EXACT",
