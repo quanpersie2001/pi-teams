@@ -1369,6 +1369,115 @@ describe("real process runtime", () => {
 			await manager.dispose();
 		}
 	}, 60_000);
+
+	it("fails a queued run loudly when its admitted model disappears instead of completing on the parent model", async () => {
+		const provider = await localProvider({ holdFirst: true });
+		const agentDir = process.env.PI_CODING_AGENT_DIR ?? "";
+		const modelsPath = join(agentDir, "models.json");
+		// Register a usable "parent" model so a non-strict launch re-check would
+		// silently complete this run on the parent instead of reporting the loss.
+		const configured = JSON.parse(await readFile(modelsPath, "utf8")) as {
+			providers: Record<string, Record<string, unknown>>;
+		};
+		const localBaseUrl = configured.providers["local-test"]?.baseUrl;
+		if (typeof localBaseUrl !== "string") throw new Error("Local fixture provider was not configured");
+		configured.providers["local-parent"] = {
+			baseUrl: localBaseUrl,
+			apiKey: "local-parent-key",
+			api: "openai-completions",
+			models: [
+				{
+					id: "parent-model",
+					name: "Local parent model",
+					reasoning: false,
+					input: ["text"],
+					contextWindow: 4096,
+					maxTokens: 128,
+				},
+			],
+		};
+		await writeFile(modelsPath, JSON.stringify(configured));
+
+		const { launcher } = observedHeadlessLauncher();
+		const backend = new ProcessAgentExecutionBackend({
+			launchers: [launcher],
+			agentDir,
+			getParentModel: () => "local-parent/parent-model",
+			connectTimeoutMs: 15_000,
+		});
+		const settings = sanitizeSettings({ maxConcurrent: 1, backgroundByDefault: true, worktreeIsolation: false });
+		const registry = new AgentRegistry({
+			sources: [],
+			loader: async () => [
+				{
+					sourcePath: join(provider.cwd, "worker.md"),
+					filenameStem: "worker",
+					frontmatter: {
+						name: "worker",
+						description: "queued model re-admission regression",
+						model: "local-test/local-model",
+						tools: "none",
+						max_turns: 1,
+					},
+					body: "Use the local deterministic provider.",
+				},
+			],
+			settings,
+		});
+		await registry.load();
+		const store = createSubagentRunStore(provider.cwd);
+		let allocated = 0;
+		const manager = new AgentManager({
+			registry,
+			settings,
+			backends: [backend],
+			cwd: provider.cwd,
+			configCwd: provider.cwd,
+			registryStore: store,
+			idFactory: () => `queued-admission-${++allocated}`,
+		});
+		try {
+			// The holder run keeps the only concurrency slot on an open model request.
+			const holder = await manager.spawn({ type: "worker", prompt: "Hold the only execution slot." });
+			await provider.firstRequest;
+			await waitUntilRunning(manager, holder.id);
+
+			// An explicit invocation model is admitted now (strict re-check pending) but
+			// queued because the single execution slot is occupied.
+			const queued = await manager.spawn({
+				type: "worker",
+				model: "local-test/local-model",
+				prompt: "This run must not inherit the parent model.",
+			});
+			expect(manager.get(queued.id)?.status).toBe("queued");
+			expect(queued.model).toBe("local-test/local-model");
+
+			// The admitted model vanishes from the on-disk configuration while the run
+			// waits in the queue; the authoritative launch re-check must re-read it.
+			delete configured.providers["local-test"];
+			await writeFile(modelsPath, JSON.stringify(configured));
+
+			provider.releaseFirst();
+			expect((await manager.whenSettled(holder.id))?.status).toBe("completed");
+
+			// 1. The queued run must not complete on the parent model.
+			const settled = await manager.whenSettled(queued.id);
+			expect(settled?.status).toBe("error");
+			expect(settled?.result).toBeUndefined();
+			// 2. It fails loudly with the exact not-registered message.
+			expect(settled?.error).toContain(
+				'Requested model "local-test/local-model" is not registered in the native Pi model runtime',
+			);
+			// 3. It is not recorded as a completed run.
+			const history = store.readHistory();
+			expect(history.find((entry) => entry.id === holder.id)?.status).toBe("completed");
+			expect(history.find((entry) => entry.id === queued.id)?.status).not.toBe("completed");
+			// No second native child ever launched: the holder's request is the only one.
+			expect(provider.requests).toHaveLength(1);
+		} finally {
+			await manager.dispose();
+		}
+	}, 60_000);
 });
 
 /**
