@@ -4,7 +4,7 @@ import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
-import { Editor, TuiMainScreen } from "@earendil-works/pi-tui";
+import { Editor, Text, TuiAltScreen, TuiMainScreen } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createNativeTerminal, type NativeTerminal } from "../../extension-src/pi-teams/pi/native-terminal.js";
 
@@ -65,6 +65,44 @@ afterEach(async () => {
 });
 
 describe("native terminal Unix transport", () => {
+	it("restores fullscreen terminal modes before repaint on initial attach and reconnect", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "pi-teams-terminal-"));
+		terminal = await createNativeTerminal({
+			socketPath: join(tempDir, "terminal.sock"),
+			childId: "child-native-1",
+			token: TOKEN,
+		});
+		const tui = new TuiAltScreen(terminal);
+		tui.addChild(new Text("native fullscreen content", 0, 0));
+		tui.start();
+		terminal.setRepaint(() => tui.requestRender(true));
+		try {
+			for (let attempt = 0; attempt < 2; attempt++) {
+				if (!tempDir) throw new Error("Native terminal fixture has not been initialized");
+				const socket = await connectSocket(join(tempDir, "terminal.sock"));
+				let buffer = "";
+				let output = "";
+				socket.on("data", (chunk: Buffer) => {
+					buffer += chunk.toString("utf8");
+					for (let newline = buffer.indexOf("\n"); newline >= 0; newline = buffer.indexOf("\n")) {
+						const frame = JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>;
+						buffer = buffer.slice(newline + 1);
+						if (frame.type === "output") output += Buffer.from(String(frame.data), "base64").toString("utf8");
+					}
+				});
+				send(socket, { type: "auth", childId: "child-native-1", token: TOKEN });
+				await vi.waitFor(() => expect(output).toContain("native fullscreen content"));
+				expect(output).toContain("\x1b[?1049h");
+				expect(output).toContain("\x1b[?1006h");
+				expect(output.indexOf("\x1b[?1049h")).toBeLessThan(output.indexOf("native fullscreen content"));
+				socket.destroy();
+				await once(socket, "close");
+			}
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("supports Pi 1.1 program status reports during interactive startup", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "pi-teams-terminal-"));
 		terminal = await createNativeTerminal({

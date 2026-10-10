@@ -78,6 +78,10 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	let focusUnsubscribe: (() => void) | undefined;
 	let focusGeneration = 0;
 	let hubOpen = false;
+	let hubFocus: AgentFocusSnapshot | null = null;
+	let hubFocusRunId: string | null = null;
+	let hubFocusUnsubscribe: (() => void) | undefined;
+	let hubFocusGeneration = 0;
 	let focusReadRevision = 0;
 	let disposed = false;
 	let refreshing = false;
@@ -252,6 +256,11 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	}
 	function closeHub(): void {
 		leftArmed = undefined;
+		hubFocusGeneration++;
+		hubFocusUnsubscribe?.();
+		hubFocusUnsubscribe = undefined;
+		hubFocusRunId = null;
+		hubFocus = null;
 		hubOpen = false;
 		hubGeneration++;
 		const done = hubDone;
@@ -286,6 +295,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		switch (action.kind) {
 			case "select":
 				selection = action.selection;
+				syncHubFocus();
 				requestRender();
 				return;
 			case "clear":
@@ -307,7 +317,44 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		const rows = listView?.rows ?? [];
 		const current = selectionIndex(selection, rows) ?? 0;
 		selection = selectAtIndex(rows, current + delta);
+		syncHubFocus();
 		requestRender();
+	}
+
+	function syncHubFocus(): void {
+		const index = selectionIndex(selection, listView?.rows ?? []) ?? 0;
+		const runId = hubOpen && index > 0 ? (listView?.rows[index - 1]?.id ?? null) : null;
+		if (runId === hubFocusRunId) return;
+		hubFocusGeneration++;
+		hubFocusUnsubscribe?.();
+		hubFocusUnsubscribe = undefined;
+		hubFocusRunId = runId;
+		hubFocus = null;
+		if (!runId) return;
+		const generation = hubFocusGeneration;
+		let revision = 0;
+		const load = async () => {
+			const reading = ++revision;
+			try {
+				const snapshot = await options.focus.read(runId);
+				if (
+					hubOpen &&
+					generation === hubFocusGeneration &&
+					reading === revision &&
+					snapshot.runId === runId &&
+					(snapshot.currentRunId === null || snapshot.currentRunId === runId)
+				) {
+					hubFocus = snapshot;
+					requestRender();
+				}
+			} catch {
+				// Missing child metadata remains unknown; never infer it from run usage.
+			}
+		};
+		hubFocusUnsubscribe = options.focus.subscribe(runId, () => {
+			void load();
+		});
+		void load();
 	}
 
 	function startHubOverlay(): void {
@@ -325,7 +372,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 					const component = createAgentHubComponent(
 						hubTui,
 						theme,
-						() => (hubOpen && listView ? { view: listView, selection, stopArmedFor } : null),
+						() => (hubOpen && listView ? { view: listView, selection, stopArmedFor, focus: hubFocus } : null),
 						handleHubInput,
 						activateHubRow,
 						closeHub,
@@ -361,10 +408,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 				hubDone = undefined;
 				hubHandle = undefined;
 				hubComponent = undefined;
-				if (hubOpen) {
-					hubOpen = false;
-					selection = null;
-				}
+				if (hubOpen) closeHub();
 				requestRender();
 			});
 	}
@@ -468,6 +512,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		if (viewRunId !== null) closeView();
 		hubOpen = true;
 		selection = activatePanel();
+		syncHubFocus();
 		stopArmedFor = null;
 		void refresh();
 		startHubOverlay();
@@ -831,6 +876,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 				rows: listView.rows.filter((row) => isActiveStatus(row.status) || row.resourceState === "cleanup-unconfirmed"),
 			};
 
+			if (hubOpen) syncHubFocus();
 			updateStatusLine();
 
 			if (enabled() && inlineListView.rows.length > 0) {

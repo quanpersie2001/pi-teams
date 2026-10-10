@@ -13,6 +13,8 @@ const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
 const MAX_INPUT_EVENT_BYTES = 4 * 1024 * 1024;
 const AUTH_TIMEOUT_MS = 5_000;
+// biome-ignore lint/complexity/useRegexLiterals: Escape control characters are disallowed in regex literals.
+const DISPLAY_MODE_PATTERN = new RegExp(String.raw`\x1b\[\?(7|1000|1002|1003|1004|1006|1049)([hl])`, "g");
 
 type NativeTerminalOptions = { socketPath: string; childId: string; token: string };
 type Frame = Record<string, unknown>;
@@ -72,6 +74,7 @@ export class NativeTerminal implements Terminal {
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
 	private repaint?: () => void;
+	private readonly displayModes = new Map<number, boolean>();
 	private pendingOutput: string[] = [];
 	private pendingBytes = 0;
 	private writing = false;
@@ -197,7 +200,13 @@ export class NativeTerminal implements Terminal {
 	}
 
 	write(data: string): void {
-		if (!this.socket || !data) return;
+		if (!data) return;
+		// Pi can start its fullscreen TUI before a pane attaches. Retain terminal modes
+		// so each new presentation receives them before the forced repaint.
+		for (const match of data.matchAll(DISPLAY_MODE_PATTERN)) {
+			this.displayModes.set(Number(match[1]), match[2] === "h");
+		}
+		if (!this.socket) return;
 		const bytes = Buffer.from(data);
 		for (let offset = 0; offset < bytes.length; offset += 24 * 1024) {
 			this.send({ type: "output", data: bytes.subarray(offset, offset + 24 * 1024).toString("base64") });
@@ -303,6 +312,9 @@ export class NativeTerminal implements Terminal {
 					this.pendingOutput = [];
 					this.pendingBytes = 0;
 					this.send({ type: "ready", columns: this.columns, rows: this.rows });
+					for (const [mode, enabled] of this.displayModes) {
+						if (enabled || mode === 7) this.write(`\x1b[?${mode}${enabled ? "h" : "l"}`);
+					}
 					this.resizeHandler?.();
 					this.repaint?.();
 					continue;

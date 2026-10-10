@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createAgentFocusPort } from "../../extension-src/pi-teams/app/focus-service.js";
 import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { AgentFocusPort } from "../../extension-src/pi-teams/domain/ui-view.js";
 import type { AgentViewOverlay } from "../../extension-src/pi-teams/features/agent-view/index.js";
 import { registerAgentsCommand } from "../../extension-src/pi-teams/pi/commands.js";
 import { createPiTeamStore } from "../../extension-src/pi-teams/pi/teams-host.js";
@@ -35,7 +36,13 @@ interface Fixture {
 }
 
 async function makeFixture(
-	options: { agentPanel?: boolean; initialEditor?: EditorFactory; now?: () => number; teamCwd?: string } = {},
+	options: {
+		agentPanel?: boolean;
+		initialEditor?: EditorFactory;
+		now?: () => number;
+		teamCwd?: string;
+		focus?: (base: AgentFocusPort) => AgentFocusPort;
+	} = {},
 ): Promise<Fixture> {
 	const host = new FakePiHost({
 		mode: "tui",
@@ -73,7 +80,9 @@ async function makeFixture(
 	});
 	ui = installSubagentsUi(host.extensionContext, {
 		manager: app.manager,
-		focus: createAgentFocusPort({ manager: app.manager, transcripts }),
+		focus:
+			options.focus?.(createAgentFocusPort({ manager: app.manager, transcripts })) ??
+			createAgentFocusPort({ manager: app.manager, transcripts }),
 		settings: () => app.manager.currentSettings,
 		transcripts,
 		...(options.now ? { now: options.now } : {}),
@@ -143,8 +152,60 @@ describe("inline UI installation", () => {
 		try {
 			fx.ui.openHub();
 			const hub = await fx.host.waitForOverlayOpen();
-			expect(hub.component?.render(100)[0]).toContain("team (0) — Team Hub");
+			expect(hub.component?.render(100)[0]).toContain("Team Hub");
+			expect(hub.component?.render(100).join("\n")).toContain("team (0)");
 		} finally {
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("refreshes selected Hub focus metadata without reading from render", async () => {
+		let listener: (() => void) | undefined;
+		let used = 164_000;
+		let reads = 0;
+		const fx = await makeFixture({
+			focus: (base) => ({
+				...base,
+				read: async (id) => {
+					reads++;
+					return {
+						runId: id,
+						currentRunId: id,
+						items: [],
+						truncatedHead: false,
+						closed: false,
+						cwd: null,
+						capabilities: [],
+						model: "provider/model",
+						thinking: "high",
+						context: { usedTokens: used, windowTokens: 1_000_000 },
+					};
+				},
+				subscribe: (_id, callback) => {
+					listener = callback;
+					return () => {
+						listener = undefined;
+					};
+				},
+			}),
+		});
+		try {
+			const id = await fx.spawn("FOCUS_RUN");
+			fx.ui.openHub();
+			const hub = await fx.host.waitForOverlayOpen();
+			fx.host.emitTerminalInput(DOWN); // select child
+			await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).toContain("164K/1M 16%"));
+			expect(hub.component?.render(100).join("\n")).toContain("provider/model");
+			const before = reads;
+			hub.component?.render(100);
+			expect(reads).toBe(before);
+			used = 250_000;
+			listener?.();
+			await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).toContain("250K/1M 25%"));
+			expect(fx.app.manager.get(id)?.status).toBe("running");
+		} finally {
+			fx.backend.complete("run-1", "done");
 			fx.ui.dispose();
 			await fx.app.sessionShutdown();
 		}

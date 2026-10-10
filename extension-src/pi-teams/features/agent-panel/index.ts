@@ -152,10 +152,174 @@ export function createAgentListComponent(
 	};
 }
 
+/** Hub-only data; never inferred from cumulative run usage. */
+export interface AgentHubData extends AgentPanelData {
+	focus: import("../../domain/ui-view.js").AgentFocusSnapshot | null;
+}
+
+function compactTokens(value: number): string {
+	if (value >= 1_000_000) return `${Math.round(value / 1_000_000)}M`;
+	if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
+	return String(value);
+}
+
+function hubStatus(row: AgentListRow): string {
+	if (row.resourceState === "cleanup-unconfirmed") return "cleanup unconfirmed";
+	if (row.resourceState === "idle") return "idle";
+	return row.status;
+}
+
+function hubIdentity(row: AgentListRow, label: string, fg: ThemeFg, fallback: "text" | "muted" | "accent"): string {
+	const color = row.teammateColor;
+	if (!row.teammateName || !color || !/^#[\da-f]{6}$/i.test(color)) return fg(fallback, label);
+	return `\x1b[38;2;${Number.parseInt(color.slice(1, 3), 16)};${Number.parseInt(color.slice(3, 5), 16)};${Number.parseInt(color.slice(5, 7), 16)}m${label}\x1b[39m`;
+}
+
+function hubStatusColor(row: AgentListRow, fg: ThemeFg): string {
+	const status = hubStatus(row);
+	return fg(
+		status === "idle" ? "muted" : status === "cleanup-unconfirmed" ? "error" : statusBadge(row.status).color,
+		status,
+	);
+}
+
+function hubRosterWidth(width: number): number {
+	const inner = Math.max(0, Math.floor(width) - 2);
+	return width >= 70 ? Math.max(22, Math.floor(inner * 0.38)) : inner;
+}
+
+/** Pure layout and click targets share the same window, including short terminals. */
+export function renderAgentHub(
+	data: AgentHubData,
+	fg: ThemeFg,
+	width: number,
+	height: number,
+	now: number,
+): { lines: string[]; targets: ReadonlyMap<number, string> } {
+	const w = Math.max(0, Math.floor(width));
+	const h = Math.max(0, Math.floor(height));
+	if (!w || !h) return { lines: [], targets: new Map() };
+	const inner = Math.max(0, w - 2);
+	const split = w >= 70;
+	const rosterWidth = hubRosterWidth(w);
+	const detailWidth = split ? Math.max(0, inner - rosterWidth - 1) : inner;
+	const selected = selectionIndex(data.selection, data.view.rows) ?? 0;
+	const row = selected > 0 ? data.view.rows[selected - 1] : undefined;
+	const targets = new Map<number, string>();
+	const lines: string[] = [];
+	const frame = (left: string, right = "") => {
+		const part = (text: string, size: number) => {
+			const clipped = truncateToWidth(text, size);
+			return clipped + " ".repeat(Math.max(0, size - visibleWidth(clipped)));
+		};
+		const body = split
+			? `${part(left, rosterWidth)}${fg("borderMuted", "│")}${part(right, detailWidth)}`
+			: part(left, inner);
+		lines.push(truncateToWidth(`${fg("borderMuted", "│")}${body}${fg("borderMuted", "│")}`, w));
+	};
+	const border = (label = "") =>
+		truncateToWidth(
+			`${fg("borderMuted", "┌")}${label}${fg("borderMuted", `${"─".repeat(Math.max(0, inner - visibleWidth(label)))}┐`)}`,
+			w,
+		);
+	lines.push(border(fg("accent", " Team Hub ")));
+	if (h === 1) return { lines, targets };
+	const footerY = h - 2;
+	const bodyEnd = Math.max(0, h - 3);
+	const rosterSlots = Math.max(0, bodyEnd - 2); // header, main, then windowed runs
+	const visibleCount = Math.min(MAX_AGENT_ROWS, rosterSlots, data.view.rows.length);
+	const selAgent = Math.max(0, selected - 1);
+	const start = selAgent < visibleCount ? 0 : selAgent - visibleCount + 1;
+	const roster = new Map<number, string>();
+	roster.set(1, ` ${fg("text", `team (${data.view.rows.length})`)}${start > 0 ? fg("dim", ` · ↑ ${start} more`) : ""}`);
+	if (bodyEnd > 2) {
+		roster.set(
+			2,
+			`${selected === 0 ? fg("accent", "▸") : " "} ${fg(selected === 0 ? "text" : "muted", "main")}  ${fg("accent", "● running")}`,
+		);
+		targets.set(2, "main");
+	}
+	for (let i = start; i < start + visibleCount; i++) {
+		const run = data.view.rows[i];
+		if (!run) continue;
+		const y = i - start + 3;
+		const label = run.teammateName ? `@${run.teammateName}` : run.type;
+		const isSelected = selected === i + 1;
+		roster.set(
+			y,
+			`${isSelected ? hubIdentity(run, "▸", fg, "accent") : " "} ${hubIdentity(run, label, fg, isSelected ? "text" : "muted")}  ${hubStatusColor(run, fg)}${fg("dim", ` · ${run.description}`)}`,
+		);
+		targets.set(y, run.id);
+	}
+	const hiddenBelow = data.view.rows.length - start - visibleCount;
+	if (hiddenBelow > 0 && visibleCount > 0) {
+		const hintY = 3 + visibleCount;
+		if (hintY <= bodyEnd) roster.set(hintY, fg("dim", ` ↓ ${hiddenBelow} more`));
+	}
+	const detail: string[] = [];
+	if (row) {
+		const focus =
+			data.focus?.runId === row.id && (data.focus.currentRunId === null || data.focus.currentRunId === row.id)
+				? data.focus
+				: null;
+		// A settled named teammate retains its child and last focus snapshot; closed history does not.
+		const context =
+			row.resourceState === "idle" || (row.resourceState !== "closed" && !focus?.closed) ? focus?.context : null;
+		const used = context?.usedTokens;
+		const window = context?.windowTokens;
+		const valid =
+			used != null && window != null && Number.isFinite(used) && Number.isFinite(window) && used >= 0 && window > 0;
+		const rawPercent = valid ? (used / window) * 100 : 0;
+		const percent = Math.round(rawPercent);
+		const filled = valid ? Math.max(0, Math.min(10, Math.round(percent / 10))) : 0;
+		const contextColor = rawPercent < 70 ? "success" : rawPercent < 90 ? "warning" : "error";
+		const label = row.teammateName ? `@${row.teammateName}` : row.type;
+		detail.push(` ${hubIdentity(row, label, fg, "text")}  ${hubStatusColor(row, fg)}`);
+		detail.push(` ${fg("muted", "Model     ")}${fg("text", focus?.model ?? "unknown")}`);
+		detail.push(` ${fg("muted", "Thinking  ")}${fg("text", focus?.thinking ?? "unknown")}`);
+		detail.push(` ${fg("text", row.description)}`);
+		detail.push(
+			valid
+				? ` ${fg("muted", "Context   ")}${fg(contextColor, "━".repeat(filled))}${fg("borderMuted", "─".repeat(10 - filled))} ${fg("text", `${compactTokens(used)}/${compactTokens(window)} ${percent}%`)}`
+				: ` ${fg("muted", "Context   unknown")}`,
+		);
+		detail.push(
+			` ${fg("muted", "Elapsed   ")}${fg("text", formatElapsedMs(Math.max(0, (row.completedAt ?? now) - row.startedAt)))}`,
+		);
+		detail.push(` ${fg("muted", "Run tokens  ")}${fg("text", compactTokens(row.totalTokens))}`);
+		if (data.stopArmedFor === row.id) detail.push(fg("error", " x again to ABORT"));
+		else if (row.resourceState === "cleanup-unconfirmed") detail.push(fg("error", " cleanup unconfirmed"));
+	} else {
+		detail.push(` ${fg("text", "main")}  ${fg("accent", "● running")}`);
+		detail.push(fg("muted", " Select an agent to see its details."));
+	}
+	if (split) {
+		for (let y = 1; y <= bodyEnd; y++) frame(roster.get(y) ?? "", detail[y - 1] ?? "");
+	} else {
+		// On narrow terminals only the selected agent's details follow the roster header.
+		for (let y = 1; y <= bodyEnd; y++) {
+			if (y === 1) frame(roster.get(1) ?? "");
+			else frame(detail[y - 2] ?? "");
+		}
+		targets.clear();
+	}
+	if (footerY >= 1) {
+		const hint = truncateToWidth(fg("dim", " ↑↓ select · Enter view · x stop/dismiss · Esc back · Alt+G close"), inner);
+		lines.push(
+			truncateToWidth(
+				`${fg("borderMuted", "│")}${hint}${" ".repeat(Math.max(0, inner - visibleWidth(hint)))}${fg("borderMuted", "│")}`,
+				w,
+			),
+		);
+	}
+	if (h >= 2) lines.push(truncateToWidth(fg("borderMuted", `└${"─".repeat(inner)}┘`), w));
+	return { lines: lines.slice(0, h), targets };
+}
+
 export function createAgentHubComponent(
 	tui: TUI,
 	theme: Theme,
-	getData: () => AgentPanelData | null,
+	getData: () => AgentHubData | null,
 	onInput: (data: string) => void,
 	onFocus: (runId: string) => void,
 	onMain: () => void,
@@ -163,7 +327,7 @@ export function createAgentHubComponent(
 	getNow: () => number = () => Date.now(),
 ): Component & Focusable {
 	const fg = bindThemeFg(theme);
-	const bgStart = theme.bg("customMessageBg", "").replace("\x1b[49m", "");
+	let renderedWidth = tui.terminal.columns;
 	return {
 		focused: true,
 		handleInput: onInput,
@@ -173,50 +337,24 @@ export function createAgentHubComponent(
 				return { handled: true, render: true };
 			}
 			if (event.type !== "click" || event.button !== "left") return undefined;
+			// x=0 is the border; the divider and details begin after the roster.
+			if (event.x < 1 || event.x > hubRosterWidth(renderedWidth)) return undefined;
 			const data = getData();
 			if (!data) return undefined;
-			if (event.y === 2) {
-				onMain();
-				return { handled: true, render: true };
-			}
-			const selectedIndex = selectionIndex(data.selection, data.view.rows) ?? 0;
-			const selectedAgent = Math.max(0, selectedIndex - 1);
-			const visibleCount = Math.min(MAX_AGENT_ROWS, data.view.rows.length);
-			const start = selectedAgent < visibleCount ? 0 : selectedAgent - visibleCount + 1;
-			const rowStart = 3 + Number(start > 0);
-			const index = start + event.y - rowStart;
-			const row = data.view.rows[index];
-			if (!row?.capabilities.viewable || event.y < rowStart || index >= start + visibleCount) return undefined;
-			onFocus(row.id);
-			// The callback closes this Hub; mouse dispatch must not focus its removed component afterward.
+			// Recompute mapping after selection/lifecycle changes, even before the next paint.
+			const target = renderAgentHub(data, fg, renderedWidth, tui.terminal.rows, getNow()).targets.get(event.y);
+			if (!target) return undefined;
+			if (target === "main") onMain();
+			else if (data.view.rows.find((row) => row.id === target)?.capabilities.viewable) onFocus(target);
+			else return undefined;
 			return { handled: true, render: true };
 		},
 		render(width: number): string[] {
-			const count = Math.max(0, Math.floor(tui.terminal.rows));
 			const data = getData();
-			if (!data || width <= 0 || count === 0) return [];
-			const content =
-				data.view.rows.length === 0
-					? [
-							" team (0) — Team Hub",
-							"",
-							"  ● main",
-							"",
-							"  No subagent runs.",
-							"",
-							"  click a child or use ↑↓ / Enter · Esc returns",
-						]
-					: [
-							...renderAgentPanel(data, fg, width, getNow(), true),
-							"",
-							"  click a child or use ↑↓ / Enter · Esc returns · Alt+G closes",
-						];
-			const lines = content.slice(0, count);
-			while (lines.length < count) lines.push("");
-			return lines.map((line) => {
-				const clipped = truncateToWidth(line, width);
-				return `${theme.bg("customMessageBg", clipped)}${" ".repeat(Math.max(0, width - visibleWidth(clipped)))}${bgStart}`;
-			});
+			if (!data) return [];
+			renderedWidth = width;
+			const result = renderAgentHub(data, fg, width, tui.terminal.rows, getNow());
+			return result.lines;
 		},
 		invalidate() {},
 	};
