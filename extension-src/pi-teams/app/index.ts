@@ -147,6 +147,7 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 				teams = new TeamService({
 					sessionId: options.getSessionId?.() ?? "unknown-session",
 					store: options.createTeamStore(options.getSessionId?.() ?? "unknown-session"),
+					discardPending: (name, reason) => mailbox?.discardPending(name, reason),
 				});
 				const roster = teams.sessionStart();
 				manager.setTeamService(teams);

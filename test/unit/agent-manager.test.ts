@@ -455,7 +455,7 @@ describe("AgentManager terminal cleanup failures", () => {
 		]);
 		expect(fixture.store.history[0]).not.toHaveProperty("handle");
 		expect(fixture.store.history[0]?.sessionFile).toBe("/tmp/sessions/failed-close.jsonl");
-		await expect(fixture.manager.resume(record.id, "continue")).rejects.toThrow(/retained child/);
+		await expect(fixture.manager.resume(record.id, "continue")).rejects.toThrow(/cleanup is unconfirmed/);
 	});
 });
 
@@ -608,6 +608,76 @@ describe("session teardown (ADR 0007 §1)", () => {
 		expect(fixture.manager.list()).toEqual([]);
 	});
 
+	it("disposes an idle teammate runtime exactly once at session shutdown", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		let saved: string | undefined;
+		let purges = 0;
+		const team = new TeamService({
+			sessionId: "session-main",
+			discardPending: () => {
+				purges += 1;
+			},
+			store: {
+				teamDir: "/tmp/team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "shutdown",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(run.id, "done");
+		await fixture.manager.whenSettled(run.id);
+		purges = 0;
+		await fixture.manager.shutdownSession();
+		expect(fixture.backend.disposedHandles).toHaveLength(1);
+		expect(purges).toBe(1);
+		expect(fixture.manager.list()).toEqual([]);
+		expect(fixture.manager.teammateStatus("shutdown")?.state).toBe("released");
+	});
+
+	it("retains a teammate recovery receipt when shutdown disposal is uncertain", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "session-main",
+			store: {
+				teamDir: "/tmp/team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "uncertain",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(run.id, "done");
+		await fixture.manager.whenSettled(run.id);
+		fixture.backend.disposeError = new Error("owned child cannot be verified");
+		await expect(fixture.manager.shutdownSession()).rejects.toThrow(/Session shutdown incomplete/);
+		expect(() => fixture.manager.beginSession()).toThrow(/cleanup is unconfirmed/);
+		expect(fixture.manager.teammateStatus("uncertain")).toMatchObject({ state: "idle", availability: "unavailable" });
+		expect(fixture.store.registry).toMatchObject([{ id: run.id, handle: { childId: "child-run-1" } }]);
+		expect(fixture.manager.get(run.id)?.recoveryError).toMatch(/owned child cannot be verified/);
+	});
+
 	it("force-kills an uncooperative child through the enforcement path after the grace", async () => {
 		const fixture = makeManager({ teardownGraceMs: 10 });
 		await load(fixture);
@@ -659,6 +729,8 @@ describe("teammate names (ADR 0007 §2)", () => {
 			run_in_background: true,
 		});
 		await settle(fixture.manager);
+		await expect(fixture.manager.releaseTeammate("scout")).rejects.toThrow(/busy/);
+		await expect(fixture.manager.retireTeammate("scout")).rejects.toThrow(/busy/);
 		await expect(
 			fixture.manager.spawn({ type: "general-purpose", name: "scout", prompt: "y", run_in_background: true }),
 		).rejects.toThrow(/already working on run/);
@@ -666,14 +738,455 @@ describe("teammate names (ADR 0007 §2)", () => {
 		// Teammates persist across assignments: a settled name gains a new run.
 		fixture.backend.complete(active.id, "done");
 		await fixture.manager.whenSettled(active.id);
+		await expect(
+			fixture.manager.spawn({
+				type: "explore",
+				name: "scout",
+				prompt: "next assignment",
+				run_in_background: true,
+			}),
+		).rejects.toThrow(/keeps its specialist role/);
 		const next = await fixture.manager.spawn({
-			type: "explore",
+			type: "general-purpose",
 			name: "scout",
 			prompt: "next assignment",
 			run_in_background: true,
 		});
 		expect(fixture.manager.get(next.id)?.teammateName).toBe("scout");
 	});
+	it("releases the mailbox slot after a known native admission rejection", async () => {
+		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 1 } });
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "session-main",
+			store: {
+				teamDir: "/tmp/team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		let assignmentListener: ((assignment: { runId: string }) => void) | undefined;
+		Object.assign(fixture.backend, {
+			subscribeAssignments: (_handle: unknown, listener: (assignment: { runId: string }) => void) => {
+				assignmentListener = listener;
+				return () => {};
+			},
+			admitAssignment: async () => {
+				const error = new Error("mailbox rejected");
+				Object.assign(error, { name: "ChildProtocolError", code: "busy" });
+				throw error;
+			},
+		});
+		const first = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "mailbox-reject",
+			prompt: "first",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(first.id, "done");
+		await fixture.manager.whenSettled(first.id);
+		assignmentListener?.({ runId: "mailbox-rejected" });
+		await settle(fixture.manager);
+		expect(fixture.manager.get("mailbox-rejected")?.status).toBe("error");
+		const next = await spawnBg(fixture.manager);
+		await settle(fixture.manager);
+		expect(fixture.manager.get(next.id)?.status).toBe("running");
+	});
+
+	it("keeps mailbox admission active and observable when the connection is uncertain", async () => {
+		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 1 } });
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "session-main",
+			store: {
+				teamDir: "/tmp/team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		let assignmentListener: ((assignment: { runId: string }) => void) | undefined;
+		let subscriptions = 0;
+		const subscribe = fixture.backend.subscribe.bind(fixture.backend);
+		Object.assign(fixture.backend, {
+			subscribe: (...args: Parameters<typeof fixture.backend.subscribe>) => {
+				subscriptions += 1;
+				return subscribe(...args);
+			},
+			subscribeAssignments: (_handle: unknown, listener: (assignment: { runId: string }) => void) => {
+				assignmentListener = listener;
+				return () => {};
+			},
+			admitAssignment: async () => {
+				const error = new Error("socket disconnected");
+				Object.assign(error, { name: "ChildProtocolError", code: "disconnected" });
+				throw error;
+			},
+		});
+		const first = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "mailbox-disconnected",
+			prompt: "first",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(first.id, "done");
+		await fixture.manager.whenSettled(first.id);
+		assignmentListener?.({ runId: "mailbox-uncertain" });
+		await settle(fixture.manager);
+		expect(fixture.manager.get("mailbox-uncertain")?.status).toBe("starting");
+		expect(subscriptions).toBeGreaterThan(1);
+		const next = await spawnBg(fixture.manager);
+		expect(fixture.manager.get(next.id)?.status).toBe("queued");
+	});
+
+	it("retries a mailbox assignment after a same-child explicit run settles", async () => {
+		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 1 } });
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "session-main",
+			store: {
+				teamDir: "/tmp/team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		let assignmentListener: ((assignment: { runId: string }) => void) | undefined;
+		Object.assign(fixture.backend, {
+			subscribeAssignments: (_handle: unknown, listener: (assignment: { runId: string }) => void) => {
+				assignmentListener = listener;
+				return () => {};
+			},
+			admitAssignment: async () => {},
+		});
+		const first = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "mailbox-race",
+			prompt: "first",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(first.id, "done");
+		await fixture.manager.whenSettled(first.id);
+		const gate = Promise.withResolvers<void>();
+		fixture.backend.admissionGate = gate.promise;
+		const explicitPromise = fixture.manager.spawn({
+			type: "general-purpose",
+			name: "mailbox-race",
+			prompt: "explicit",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		assignmentListener?.({ runId: "mailbox-pending" });
+		gate.resolve();
+		const explicit = await explicitPromise;
+		await settle(fixture.manager);
+		fixture.backend.complete(explicit.id, "explicit done");
+		await fixture.manager.whenSettled(explicit.id);
+		await settle(fixture.manager);
+		expect(fixture.manager.get("mailbox-pending")?.status).toMatch(/queued|starting|running/);
+	});
+
+	it("applies teammate context policy and lifecycle without losing run artifacts", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "session-main",
+			store: {
+				teamDir: "/tmp/team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		await expect(
+			fixture.manager.spawn({
+				type: "general-purpose",
+				name: "empty",
+				context: "continue",
+				prompt: "no context",
+				run_in_background: true,
+			}),
+		).rejects.toThrow(/no idle live context/);
+		expect(fixture.backend.launches).toHaveLength(0);
+		const first = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "lifecycle",
+			prompt: "one",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		const firstHandle = fixture.manager.get(first.id)?.handle;
+		fixture.backend.complete(first.id, "one done", "/tmp/one.jsonl");
+		const settledFirst = await fixture.manager.whenSettled(first.id);
+		expect(settledFirst?.handle).toBeUndefined();
+		expect(fixture.manager.get(first.id)?.handle).toEqual(firstHandle);
+		expect(fixture.manager.teammateStatus("lifecycle")).toMatchObject({
+			state: "idle",
+			contextAvailable: true,
+			currentRunId: first.id,
+		});
+		expect(fixture.manager.get(first.id)?.handle).toEqual(firstHandle);
+		expect(fixture.backend.disposeAttempts).toHaveLength(0);
+		const continued = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "lifecycle",
+			prompt: "two",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		expect(fixture.backend.launches).toHaveLength(1);
+		expect(fixture.manager.get(first.id)?.sessionFile).toBe("/tmp/one.jsonl");
+		expect(fixture.manager.get(first.id)?.handle).toBeUndefined();
+		fixture.backend.complete(continued.id, "two done", "/tmp/two.jsonl");
+		await fixture.manager.whenSettled(continued.id);
+		// Legacy /agents release by an older run id still routes to the teammate's current owner.
+		await fixture.manager.release(first.id);
+		expect(fixture.backend.disposedHandles).toHaveLength(1);
+		await fixture.manager.releaseTeammate("lifecycle");
+		expect(fixture.manager.teammateStatus("lifecycle")).toMatchObject({
+			state: "released",
+			contextAvailable: false,
+		});
+		await expect(
+			fixture.manager.spawn({
+				type: "general-purpose",
+				name: "lifecycle",
+				context: "continue",
+				prompt: "no",
+				run_in_background: true,
+			}),
+		).rejects.toThrow(/no idle live context/);
+		const fresh = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "lifecycle",
+			prompt: "fresh",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		expect(fixture.backend.launches.at(-1)?.runId).toBe(fresh.id);
+		fixture.backend.complete(fresh.id, "fresh done");
+		await fixture.manager.whenSettled(fresh.id);
+		await fixture.manager.retireTeammate("lifecycle");
+		expect(fixture.manager.teammateStatus("lifecycle")?.state).toBe("retired");
+		await expect(fixture.manager.releaseTeammate("lifecycle")).resolves.toBe(true);
+		expect(fixture.manager.teammateStatus("lifecycle")?.state).toBe("retired");
+		await expect(
+			fixture.manager.spawn({ type: "general-purpose", name: "lifecycle", prompt: "revive", run_in_background: true }),
+		).rejects.toThrow(/retired/);
+		expect(fixture.manager.get(first.id)?.sessionFile).toBe("/tmp/one.jsonl");
+		expect(fixture.manager.get(continued.id)?.handle).toBeUndefined();
+	});
+
+	it("retired names are reserved for the team lifetime and reusable after session shutdown", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		let saved: string | undefined;
+		const makeTeam = (sessionId: string) =>
+			new TeamService({
+				sessionId,
+				store: {
+					teamDir: `/tmp/${sessionId}`,
+					readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+					writeRoster: (roster) => {
+						saved = JSON.stringify(roster);
+					},
+				},
+			});
+		const oldTeam = makeTeam("session-old");
+		oldTeam.sessionStart();
+		fixture.manager.setTeamService(oldTeam);
+		const original = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "reusable",
+			prompt: "old team",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(original.id, "done");
+		await fixture.manager.whenSettled(original.id);
+		await fixture.manager.retireTeammate("reusable");
+		await expect(
+			fixture.manager.spawn({
+				type: "general-purpose",
+				name: "reusable",
+				prompt: "same team",
+				run_in_background: true,
+			}),
+		).rejects.toThrow(/retired/);
+		await fixture.manager.shutdownSession();
+		fixture.manager.beginSession();
+		const newTeam = makeTeam("session-new");
+		newTeam.sessionStart();
+		fixture.manager.setTeamService(newTeam);
+		const reused = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "reusable",
+			prompt: "new team",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(reused.id, "new team done");
+		await fixture.manager.whenSettled(reused.id);
+	});
+
+	it("fresh context verifies disposal and purges only after a settled child closes", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		const sequence: string[] = [];
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "session-main",
+			discardPending: (name) => {
+				sequence.push(`discard:${name}`);
+			},
+			store: {
+				teamDir: "/tmp/team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const first = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "reset",
+			prompt: "old",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(first.id, "old outcome", "/tmp/old.jsonl");
+		await fixture.manager.whenSettled(first.id);
+		sequence.length = 0;
+		const dispose = fixture.backend.dispose.bind(fixture.backend);
+		fixture.backend.dispose = async (handle) => {
+			sequence.push("dispose");
+			await dispose(handle);
+		};
+		const launch = fixture.backend.launch.bind(fixture.backend);
+		fixture.backend.launch = async (input) => {
+			sequence.push("launch");
+			return launch(input);
+		};
+		fixture.backend.disposeError = new Error("child still owns context");
+		await expect(
+			fixture.manager.spawn({
+				type: "general-purpose",
+				name: "reset",
+				context: "fresh",
+				prompt: "new",
+				run_in_background: true,
+			}),
+		).rejects.toThrow(/child still owns context/);
+		expect(sequence).toEqual(["dispose"]);
+		expect(fixture.manager.teammateStatus("reset")).toMatchObject({ state: "idle", availability: "unavailable" });
+		expect(fixture.backend.launches).toHaveLength(1);
+		fixture.backend.disposeError = undefined;
+		const fresh = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "reset",
+			context: "fresh",
+			prompt: "new",
+			run_in_background: true,
+		});
+		expect(sequence).toEqual(["dispose", "dispose", "discard:reset", "launch"]);
+		await settle(fixture.manager);
+		expect(fixture.manager.get(first.id)).toMatchObject({
+			status: "completed",
+			result: "old outcome",
+			sessionFile: "/tmp/old.jsonl",
+		});
+		fixture.backend.complete(fresh.id, "fresh outcome");
+		await fixture.manager.whenSettled(fresh.id);
+	});
+
+	it("keeps teammate unavailable when inbox archival fails after verified disposal", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		let failPurge = false;
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "session-main",
+			discardPending: () => {
+				if (failPurge) throw new Error("inbox is read-only");
+			},
+			store: {
+				teamDir: "/tmp/team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "mailbox",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(run.id, "done");
+		await fixture.manager.whenSettled(run.id);
+		failPurge = true;
+		await expect(fixture.manager.releaseTeammate("mailbox")).rejects.toThrow(/inbox is read-only/);
+		expect(fixture.manager.teammateStatus("mailbox")).toMatchObject({ state: "released", availability: "unavailable" });
+		expect(team.current?.members[0]).toMatchObject({ availability: "unavailable" });
+		expect(fixture.backend.disposedHandles).toHaveLength(1);
+		failPurge = false;
+		await expect(fixture.manager.releaseTeammate("mailbox")).resolves.toBe(true);
+		expect(fixture.manager.teammateStatus("mailbox")).toMatchObject({ state: "released", availability: "available" });
+	});
+
+	it("serializes concurrent named admission and rejects a second assignment as busy", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		const gate = Promise.withResolvers<void>();
+		fixture.backend.admissionGate = gate.promise;
+		const firstPromise = fixture.manager.spawn({
+			type: "general-purpose",
+			name: "serial",
+			prompt: "one",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		const secondPromise = fixture.manager.spawn({
+			type: "general-purpose",
+			name: "serial",
+			prompt: "two",
+			run_in_background: true,
+		});
+		gate.resolve();
+		const first = await firstPromise;
+		await expect(secondPromise).rejects.toThrow(/already working/);
+		expect(fixture.manager.list().filter((record) => record.teammateName === "serial")).toHaveLength(1);
+		await settle(fixture.manager);
+		fixture.backend.complete(first.id, "done");
+		await fixture.manager.whenSettled(first.id);
+	});
+
 	it("freezes normalized teammate color and rejects changes before model admission", async () => {
 		const fixture = makeManager();
 		await load(fixture);
@@ -959,6 +1472,30 @@ describe("AgentManager dispose", () => {
 		expect(fixture.manager.hasRunning()).toBe(false);
 		expect(fixture.backend.disposedHandles.length).toBe(2);
 		await expect(fixture.manager.spawn({ type: "general-purpose", prompt: "x" })).rejects.toThrow(/disposed/);
+	});
+
+	it("keeps the teammate-owned process receipt on disposal uncertainty", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "dispose-recovery",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(run.id, "done");
+		await fixture.manager.whenSettled(run.id);
+		fixture.backend.disposeError = new Error("shutdown could not verify child");
+		await fixture.manager.dispose();
+		expect(fixture.store.registry).toMatchObject([
+			{
+				id: run.id,
+				handle: { childId: "child-run-1" },
+				recoveryError: expect.stringContaining("shutdown could not verify child"),
+			},
+		]);
+		expect(fixture.store.history).toMatchObject([{ id: run.id, status: "completed", result: "done" }]);
 	});
 });
 

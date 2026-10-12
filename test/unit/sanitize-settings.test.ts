@@ -7,6 +7,15 @@ import {
 } from "../../extension-src/pi-teams/domain/config.js";
 
 describe("sanitizeSettings", () => {
+	it("defaults agentInlinePanel on and rejects non-boolean values to that default", () => {
+		expect(DEFAULT_SUBAGENTS_SETTINGS.agentInlinePanel).toBe(true);
+		expect(sanitizeSettings({}).agentInlinePanel).toBe(true);
+		expect(sanitizeSettings({ agentInlinePanel: false }).agentInlinePanel).toBe(false);
+		for (const value of ["false", 0, null]) {
+			expect(sanitizeSettings({ agentInlinePanel: value }).agentInlinePanel).toBe(true);
+		}
+	});
+
 	it("keeps valid values as-is", () => {
 		expect(
 			sanitizeSettings({
@@ -22,9 +31,11 @@ describe("sanitizeSettings", () => {
 				strictModelAdmission: false,
 				fallbackSubagent: "general-purpose",
 				agentPanel: false,
+				agentInlinePanel: false,
 				backend: "headless",
 			}),
 		).toEqual({
+			tasks: { autoCascade: false, reminders: false },
 			maxConcurrent: 8,
 			defaultMaxTurns: 50,
 			graceTurns: 0,
@@ -37,6 +48,7 @@ describe("sanitizeSettings", () => {
 			strictModelAdmission: false,
 			fallbackSubagent: "general-purpose",
 			agentPanel: false,
+			agentInlinePanel: false,
 			backend: "headless",
 		});
 	});

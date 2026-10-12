@@ -3,6 +3,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createModelTools } from "../../extension-src/pi-teams/pi/model-tools.js";
 
@@ -14,6 +15,7 @@ interface FixtureModel {
 interface FixtureProvider {
 	baseUrl: string;
 	api: string;
+	apiKey?: string;
 	models: FixtureModel[];
 }
 
@@ -53,10 +55,11 @@ afterEach(async () => {
 	}
 });
 
-function provider(models: FixtureModel[]): FixtureProvider {
+function provider(models: FixtureModel[], apiKey = "fixture-key"): FixtureProvider {
 	return {
 		baseUrl: "https://model-tools.invalid/v1",
 		api: "openai-completions",
+		apiKey,
 		models,
 	};
 }
@@ -86,8 +89,17 @@ function tool(): ModelTool {
 	return found as ModelTool;
 }
 
+async function currentContext(): Promise<never> {
+	const runtime = await ModelRuntime.create({
+		authPath: join(agentDir, "auth.json"),
+		modelsPath: join(agentDir, "models.json"),
+		allowModelNetwork: false,
+	});
+	return { modelRegistry: { getAvailable: () => runtime.getAvailableSnapshot() } } as never;
+}
+
 async function runText(args: Record<string, unknown> = {}): Promise<string> {
-	const raw = await tool().execute("call", args, undefined, undefined, undefined as never);
+	const raw = await tool().execute("call", args, undefined, undefined, await currentContext());
 	const first = raw.content[0];
 	if (first?.type !== "text") throw new Error("Tool returned no text");
 	return first.text ?? "";
@@ -119,6 +131,17 @@ describe("list_models tool", () => {
 		]);
 	});
 
+	it("uses only the current Pi session's model list", async () => {
+		await baseFixture();
+		const ctx = {
+			modelRegistry: {
+				getAvailable: () => [{ provider: "session-only", id: "selected", name: "Selected model" }],
+			},
+		} as never;
+		const raw = await tool().execute("call", { query: "selected" }, undefined, undefined, ctx);
+		expect(raw.content[0]?.text).toBe("session-only/selected — Selected model");
+	});
+
 	it("filters case-insensitively on the canonical ref", async () => {
 		await baseFixture();
 		expect((await runText({ query: "TOOLFIXTURE-B" })).split("\n")).toEqual([
@@ -136,7 +159,7 @@ describe("list_models tool", () => {
 	it("reports an explicit empty result with the query", async () => {
 		await baseFixture();
 		expect(await runText({ query: "toolfixture-no-such-model" })).toBe(
-			'No registered model matches "toolfixture-no-such-model".',
+			'No available model matches "toolfixture-no-such-model".',
 		);
 	});
 
@@ -176,7 +199,7 @@ describe("list_models tool", () => {
 			'▸ list_models("toolfixture")',
 		);
 		expect(rendered(list.renderCall({}, undefined, undefined))).toContain("▸ list_models()");
-		const raw = await list.execute("call", { query: "toolfixture-" }, undefined, undefined, undefined as never);
+		const raw = await list.execute("call", { query: "toolfixture-" }, undefined, undefined, await currentContext());
 		expect(rendered(list.renderResult(raw, { expanded: false, isPartial: false }, undefined, undefined))).toContain(
 			"toolfixture-a/alpha — Zephyr Quokka",
 		);

@@ -32,6 +32,35 @@ describe("TeamService", () => {
 		expect(store.written).toHaveLength(1);
 	});
 
+	it("does not restore persisted busy or idle members as live teammates", () => {
+		const store = memoryStore();
+		const original = new TeamService({ sessionId: "sess-a", store });
+		original.sessionStart();
+		original.recordAssignment({ name: "scout", type: "scout", runId: "run-1" });
+		original.setLifecycle("scout", "busy");
+		original.recordAssignment({ name: "retired", type: "scout", runId: "run-2" });
+		original.setLifecycle("retired", "retired");
+		const restarted = new TeamService({ sessionId: "sess-a", store });
+		expect(restarted.sessionStart().members).toMatchObject([
+			{ name: "scout", lifecycle: "released" },
+			{ name: "retired", lifecycle: "retired" },
+		]);
+	});
+
+	it("forwards an optional archive reason when discarding pending mailbox entries", async () => {
+		const reasons: Array<string | undefined> = [];
+		const service = new TeamService({
+			sessionId: "sess-a",
+			store: memoryStore(),
+			discardPending: async (_name, reason) => {
+				reasons.push(reason);
+			},
+		});
+		await service.discardPending("scout", "fresh");
+		await service.discardPending("scout");
+		expect(reasons).toEqual(["fresh", undefined]);
+	});
+
 	it("records assignments without duplicating members", () => {
 		const store = memoryStore();
 		const service = new TeamService({ sessionId: "sess-a", store, now: () => 5 });
@@ -39,8 +68,16 @@ describe("TeamService", () => {
 		service.recordAssignment({ name: "scout", type: "scout", runId: "run-1" });
 		service.recordAssignment({ name: "scout", type: "scout", runId: "run-2" });
 		service.recordAssignment({ name: "dev", type: "general-purpose", runId: "run-3" });
+		service.setAvailability("scout", "unavailable", "child disconnected");
+		service.setLifecycle("scout", "released");
 		expect(service.current?.members).toMatchObject([
-			{ name: "scout", lastRunId: "run-2" },
+			{
+				name: "scout",
+				lastRunId: "run-2",
+				lifecycle: "released",
+				availability: "unavailable",
+				recoveryError: "child disconnected",
+			},
 			{ name: "dev", lastRunId: "run-3" },
 		]);
 	});

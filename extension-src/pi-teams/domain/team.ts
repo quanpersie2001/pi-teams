@@ -13,6 +13,10 @@ export interface TeamMember {
 	color?: string;
 	/** Latest admitted run carrying this teammate name. */
 	lastRunId?: string;
+	/** Lifecycle state; absent in older persisted rosters means idle/released by runtime. */
+	lifecycle?: "idle" | "busy" | "released" | "retired";
+	availability?: "available" | "unavailable";
+	recoveryError?: string;
 	firstAssignedAt?: number;
 	lastAssignedAt?: number;
 }
@@ -60,6 +64,8 @@ export function ensureMemberIdentity(
 ): { roster: TeamRoster; color?: string } {
 	const existing = roster.members.find((member) => member.name === identity.name);
 	if (existing) {
+		if (existing.type !== identity.type)
+			throw new Error(`Teammate "@${identity.name}" keeps its specialist role; use a new name for a different role.`);
 		if (identity.color !== undefined && existing.color !== identity.color)
 			throw new Error(
 				`Teammate "@${identity.name}" already has color ${existing.color ?? "the default"}; its identity color cannot change.`,
@@ -70,6 +76,7 @@ export function ensureMemberIdentity(
 		name: identity.name,
 		type: identity.type,
 		...(identity.color !== undefined ? { color: identity.color } : {}),
+		lifecycle: "released",
 		firstAssignedAt: at,
 		lastAssignedAt: at,
 	};
@@ -99,13 +106,15 @@ export function upsertMember(
 	assignment: { name: string; type: string; runId: string; at: number; color?: string },
 ): TeamRoster {
 	const existing = roster.members.find((member) => member.name === assignment.name);
+	if (existing && existing.type !== assignment.type)
+		throw new Error(`Teammate "@${assignment.name}" keeps its specialist role; use a new name for a different role.`);
 	const members = existing
 		? roster.members.map((member) =>
 				member === existing
 					? {
 							...member,
-							type: assignment.type,
 							lastRunId: assignment.runId,
+							lifecycle: "busy" as const,
 							lastAssignedAt: assignment.at,
 							...(member.color !== undefined ? { color: member.color } : {}),
 						}
@@ -118,6 +127,7 @@ export function upsertMember(
 					type: assignment.type,
 					...(assignment.color !== undefined ? { color: assignment.color } : {}),
 					lastRunId: assignment.runId,
+					lifecycle: "busy" as const,
 					firstAssignedAt: assignment.at,
 					lastAssignedAt: assignment.at,
 				},

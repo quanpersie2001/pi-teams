@@ -2,11 +2,11 @@
 
 ## Layout and ownership
 
-The inline panel stays below Main's native editor. Down from an empty Main prompt selects inline bottom navigation at Main without opening an overlay. `/agents`, Alt+G or two consecutive Left presses within 500 ms at the start of Main's document opens the native Team Hub with Main and current teammates/runs; an empty Hub still exposes Main. Selecting a child opens an opaque remote-focus overlay with native transcript components and its own composer. There is one parent renderer: no child InteractiveMode is mounted. Returning preserves Main's draft. `agentPanel: false` hides the UI without stopping children.
+The existing Agents inline panel remains below Main's native editor. `/agents panel [show|hide|toggle]` controls only that panel for the current session; `/agents panel` toggles it. The override is not persisted, and `agentInlinePanel` in `teams.json` sets the startup default. The dedicated Tasks widget is above the native editor, before Main's composer. It shows only pending, in-progress and in-review tasks; completed/cancelled tasks disappear immediately from this widget, and counts include only those eligible visible tasks. It displays at most two task rows plus the existing overflow count. When no eligible tasks remain, the widget is removed with no blank line. Task records are not deleted or autocleared: the Hub retains all task history and read access. Down from an empty Main prompt selects inline bottom navigation at Main without opening an overlay. `/agents` opens the Team Hub on Agents; `/tasks` opens it on Tasks. Alt+G toggles the Hub, reopening on the last-used tab (Agents initially); two consecutive Left presses within 500 ms at the start of Main's document opens it on that tab too. The Hub contains current teammates/runs and session Tasks. Selecting a child opens an opaque remote-focus overlay with native transcript components and its own composer. There is one parent renderer: no child InteractiveMode is mounted. Returning preserves Main's draft. The optional inline Agents hide leaves Tasks, both Hub tabs, global shortcuts, child focus, transcript, editor and runtime available. `agentPanel: false` is the legacy master switch and disables broader UI without stopping children; it is not an inline-only setting.
 
 ```text
-Main: conversation → native editor → agents panel → native footer
-Hub: Main + child rows → keyboard or fullscreen mouse selection
+Main: conversation → Tasks widget (when eligible tasks exist) → native editor → Agents panel (when visible) → native footer
+Hub: Agents tab (Main + child rows) | Tasks tab (task list/details)
 View: child header → native transcript → separate composer → viewer controls
 ```
 
@@ -41,7 +41,33 @@ Hub and inline rows share a compact layout: one selection/status-colored circle,
 | `x` on settled selection | dismiss row, not resource cleanup |
 | `o` on attachable selection | open verified native pane |
 
-Fullscreen Hub row clicks select a child through Pi's public mouse API. Regular mode uses keyboard navigation. The inline panel still belongs to Pi's native viewport; it is not a second terminal UI.
+Fullscreen Agents Hub row clicks select a child through Pi's public mouse API. In the Tasks tab, clicks select a task row; wheel input scrolls task details. Regular mode uses keyboard navigation. The inline panel still belongs to Pi's native viewport; it is not a second terminal UI.
+
+## Tasks Hub
+
+The unified Tasks UI shares the Team Hub overlay and is available through `/tasks` or its Tasks tab. `/agents` explicitly selects Agents. Alt+G opens/closes the Hub and preserves the last-used tab (initially Agents); the Main document-start double-Left gesture opens the Hub without changing that preference. Tab or Shift+Tab switches between the Hub tabs. Those keys are consumed by the Hub and are not task-form navigation; task create/edit prompts use Pi's normal input/select dialogs.
+
+The Tasks tab renders the exact summary header `● 4 tasks (1 done, 1 in progress, 2 open)` for that example board, omitting zero-count categories. Every pending task counts as open, including blocked tasks; there is also a blocked-only filter. Status counts distinguish done, in progress, open, in review and cancelled. Status glyph precedence is completed (success) and cancelled (dim), active attempt (cyan `#00d7ff`), latest failed/stopped attempt (error), claimed (blue `#3b82f6`), review (purple `#a855f7`), blocked (amber `#f59e0b`), then open (default text). Task owner/assignee names use their teammate roster identity color when available. List rows use `├─` and `└─` branches, show task short code, owner/assignee and title, and mark blockers. The dedicated inline Tasks widget sits above the editor, uses the same header and status/identity rendering, and shows only pending/in-progress/in-review tasks (up to two rows plus a remaining-count line). Completed and cancelled tasks are immediately excluded; when all tasks are terminal it disappears without a blank line. These are presentation rules only: records remain in the Hub and available through task-history/read paths.
+
+| Input | Action |
+|---|---|
+| `/tasks` | Open Tasks tab |
+| `/agents` | Open Agents tab |
+| Alt+G | Toggle Hub; reopening returns to last-used tab |
+| Tab / Shift+Tab | Switch Hub tabs (Agents ↔ Tasks); not form navigation |
+| ↑ / ↓, PgUp / PgDn, Home / End | Select task or move through the list; in details, scroll |
+| Enter | Open task details; in details, return to list |
+| Esc | Return from details to list; from list, close Hub |
+| `n` / `e` | Create task / edit selected pending task |
+| `c` | Claim pending task, or release the current in-progress claim when no attempt is running |
+| `x` / `k` | Choose an enabled agent type and execute/retry an eligible in-progress task / confirm stop of a running attempt |
+| `r` / `a` | Submit a review-requested task for review / prompt for outcome and accept completion |
+| `o` / `d` / `v` | Read latest attempt output / confirm cancellation of pending task / open latest attempt's view when available |
+| `/` / `f` | Search tasks / choose status or blocked filter |
+
+Create prompts cover title, description, scope paths/out-of-scope paths, constraints, expected output, context background/decisions/references (references as JSON), acceptance criteria, dependencies (task codes), assignee and whether review is required. Editing a pending task covers those same fields and uses the expected requirement revision; stale edits surface the backend conflict. The completion prompt collects summary, artifacts, verification checks (JSON), and remaining issues. The optional root `executionPlan` (`type`, optional `name`, `color`, `model`, `maxTurns`) remains tool-only. Details show status, identity, description, acceptance criteria, scope, expected output, constraints, context/references, blockers, latest-run metrics, outcome/verification and attempt status/errors/partial result where present. Execution records an attempt; accepting task completion remains explicit, and stopping an attempt does not complete the task.
+
+Manual smoke checklist (not yet performed): confirm Tasks appears above the editor and Agents below it; move all tasks to terminal states and confirm the Tasks widget disappears without a blank line while Hub history/read still shows records; hide and show Agents with `/agents panel hide` and `/agents panel show`, confirming both Hub tabs remain usable and Hub/native editor focus is preserved.
 
 Main arrow gestures require native editor ownership and no autocomplete or other visible overlay. Slash-command menus, text/multiline cursor movement and other dialogs keep their arrows, even when Main's detached draft is empty. Double Left requires line 0/column 0; a nonempty draft at that boundary is preserved. Other input, text/focus/session changes or elapsed time reset the pair. Kitty held-repeat events do not count; legacy terminals without repeat metadata cannot distinguish a held repeat from another press. Inline navigation selects only visible active/uncertain rows, not hidden settled Hub history.
 
@@ -97,6 +123,10 @@ Esc and panel dismissal do not kill active execution; closing a native viewer di
 ```
 
 Release without `--worktree` retains checkout. With it, cleanup is only appropriate after review/test/integration and refuses dirty/unpreserved changes. Preserved commits/branches remain. UI never auto-merges or cherry-picks.
+
+## Unified Tasks Hub
+
+The Tasks Hub is the first-party task workflow, with session-scoped records distinct from agent runs. Its task history uses status-colored attempt markers and retains teammate identity when available, run ID, result-file pointer, outcome, artifacts and remaining issues. Task details show prerequisites and dependents; derived blockers and attempt outcomes remain visible. Task status is not inferred from a run's completion. Interactive manual TUI smoke testing has not been performed; focused automated UI tests pass.
 
 ## Completion delivery
 

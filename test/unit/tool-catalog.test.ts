@@ -1,7 +1,5 @@
 // Guards the registered tool catalog: the exact names each registrar publishes
-// and the collision rule (skip a name pi.getAllTools() already reports). Docs
-// drifted for months claiming only four team_task_* tools exist, so these
-// assertions are the regression guard against re-shrinking the catalog.
+// and the collision rule (skip a name pi.getAllTools() already reports).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
@@ -32,29 +30,36 @@ const MANAGER = {} as unknown as AgentManager;
 const REGISTRY = {} as unknown as AgentRegistry;
 
 describe("team task tool catalog", () => {
-	it("keeps TEAM_TASK_TOOL_NAMES to the six canonical names in order", () => {
-		expect(TEAM_TASK_TOOL_NAMES).toEqual([
-			"team_task_create",
-			"team_task_update",
-			"team_task_edit",
-			"team_task_cancel",
-			"team_task_get",
-			"team_task_list",
-		]);
+	it("keeps child task tools to canonical unified CRUD names", () => {
+		expect(TEAM_TASK_TOOL_NAMES).toEqual(["tasks_create", "tasks_list", "tasks_get", "tasks_update", "tasks_cancel"]);
 	});
 
-	it("builds exactly the six catalogued team_task_* tools in constant order", () => {
+	it("builds exactly the child-safe unified task tools in constant order", () => {
 		const tools = createTeamTaskTools(() => undefined);
 		expect(tools.map((tool) => tool.name)).toEqual([...TEAM_TASK_TOOL_NAMES]);
 	});
 });
 
 describe("subagent tool registration", () => {
-	it("registers Agent, get_subagent_result and steer_subagent", () => {
+	it("registers orchestration and lead-only teammate lifecycle tools", () => {
 		const { pi, registered } = fakePi();
 		const registrations = registerSubagentTools(pi, MANAGER, REGISTRY);
-		expect(registrations).toEqual([{ name: "Agent" }, { name: "get_subagent_result" }, { name: "steer_subagent" }]);
-		expect(registered).toEqual(["Agent", "get_subagent_result", "steer_subagent"]);
+		expect(registrations).toEqual([
+			{ name: "Agent" },
+			{ name: "get_subagent_result" },
+			{ name: "steer_subagent" },
+			{ name: "teammate_status" },
+			{ name: "teammate_release" },
+			{ name: "teammate_retire" },
+		]);
+		expect(registered).toEqual([
+			"Agent",
+			"get_subagent_result",
+			"steer_subagent",
+			"teammate_status",
+			"teammate_release",
+			"teammate_retire",
+		]);
 	});
 
 	it("skips names already returned by pi.getAllTools()", () => {
@@ -64,8 +69,11 @@ describe("subagent tool registration", () => {
 			{ name: "Agent", skipped: true },
 			{ name: "get_subagent_result", skipped: true },
 			{ name: "steer_subagent" },
+			{ name: "teammate_status" },
+			{ name: "teammate_release" },
+			{ name: "teammate_retire" },
 		]);
-		expect(registered).toEqual(["steer_subagent"]);
+		expect(registered).toEqual(["steer_subagent", "teammate_status", "teammate_release", "teammate_retire"]);
 	});
 });
 

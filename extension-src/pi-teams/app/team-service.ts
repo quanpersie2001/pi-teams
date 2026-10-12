@@ -16,11 +16,14 @@ export interface TeamStore {
 	writeRoster(roster: TeamRoster): void;
 }
 
+export type PendingMailboxDiscardReason = "release" | "retire" | "fresh" | "context-reset";
+
 export interface TeamServiceOptions {
 	sessionId: string;
 	store: TeamStore;
 	now?: () => number;
 	warn?: (message: string) => void;
+	discardPending?: (name: string, reason?: PendingMailboxDiscardReason) => void | Promise<void>;
 }
 
 export class TeamService {
@@ -29,12 +32,16 @@ export class TeamService {
 	private readonly store: TeamStore;
 	private readonly now: () => number;
 	private readonly warn: (message: string) => void;
+	private readonly discardPendingCallback:
+		| ((name: string, reason?: PendingMailboxDiscardReason) => void | Promise<void>)
+		| undefined;
 
 	constructor(options: TeamServiceOptions) {
 		this.sessionId = options.sessionId;
 		this.store = options.store;
 		this.now = options.now ?? (() => Date.now());
 		this.warn = options.warn ?? ((message) => console.warn(`[pi-teams] ${message}`));
+		this.discardPendingCallback = options.discardPending;
 	}
 
 	get teamDir(): string {
@@ -56,8 +63,16 @@ export class TeamService {
 		const teamId = deriveTeamId(this.sessionId);
 		const existing = this.store.readRoster();
 		if (existing && existing.teamId === teamId && existing.sessionId === this.sessionId) {
-			this.roster = existing;
-			return existing;
+			// A persisted roster is identity/history, never a live child receipt.
+			this.roster = {
+				...existing,
+				members: existing.members.map((member) => ({
+					...member,
+					lifecycle: member.lifecycle === "retired" ? "retired" : "released",
+				})),
+			};
+			this.persist();
+			return this.roster;
 		}
 		this.roster = {
 			version: 1,
@@ -98,6 +113,40 @@ export class TeamService {
 	recordAssignment(assignment: { name: string; type: string; runId: string; color?: string }): void {
 		if (!this.roster) return;
 		this.roster = upsertMember(this.roster, { ...assignment, at: this.now() });
+		this.persist();
+	}
+
+	async discardPending(name: string, reason?: PendingMailboxDiscardReason): Promise<void> {
+		await this.discardPendingCallback?.(name, reason);
+	}
+
+	setAvailability(name: string, availability: "available" | "unavailable", recoveryError?: string): void {
+		if (!this.roster) return;
+		const member = this.roster.members.find((candidate) => candidate.name === name);
+		if (!member) return;
+		this.roster = {
+			...this.roster,
+			members: this.roster.members.map((candidate) => {
+				if (candidate.name !== name) return candidate;
+				const next = { ...candidate, availability };
+				if (recoveryError !== undefined) next.recoveryError = recoveryError;
+				else delete next.recoveryError;
+				return next;
+			}),
+		};
+		this.persist();
+	}
+
+	setLifecycle(name: string, lifecycle: NonNullable<TeamRoster["members"][number]["lifecycle"]>): void {
+		if (!this.roster) return;
+		const member = this.roster.members.find((candidate) => candidate.name === name);
+		if (!member || member.lifecycle === lifecycle) return;
+		this.roster = {
+			...this.roster,
+			members: this.roster.members.map((candidate) =>
+				candidate.name === name ? { ...candidate, lifecycle } : candidate,
+			),
+		};
 		this.persist();
 	}
 

@@ -302,16 +302,27 @@ describe("native child model admission", () => {
 		});
 	});
 
-	it("lists native models with sorted refs, display names, query filtering, and a pre-cap total", async () => {
+	it("lists available native models with sorted refs, display names, query filtering, and a pre-cap total", async () => {
 		await fixture({
-			"admission-a": provider([{ id: "alpha", name: "Alpha display name" }]),
-			"admission-b": provider([
-				{ id: "second", name: "Second display name" },
-				{ id: "first", name: "First display name" },
-			]),
+			"admission-a": provider([{ id: "alpha", name: "Alpha display name" }], "fixture-a-key"),
+			"admission-b": provider(
+				[
+					{ id: "second", name: "Second display name" },
+					{ id: "first", name: "First display name" },
+				],
+				"fixture-b-key",
+			),
+			"admission-unavailable": provider([{ id: "hidden" }]),
 		});
+		const runtime = await ModelRuntime.create({
+			authPath: join(agentDir, "auth.json"),
+			modelsPath: join(agentDir, "models.json"),
+			allowModelNetwork: false,
+		});
+		const models = runtime.getAvailableSnapshot();
+		expect(listNativeModels(models, { query: "admission-unavailable" })).toEqual({ total: 0, rows: [] });
 		// The runtime also ships its built-in catalog, so scope exact expectations to the fixture query.
-		expect(await listNativeModels({ agentDir, query: "admission-" })).toEqual({
+		expect(listNativeModels(models, { query: "admission-" })).toEqual({
 			total: 3,
 			rows: [
 				{ ref: "admission-a/alpha", name: "Alpha display name" },
@@ -319,27 +330,27 @@ describe("native child model admission", () => {
 				{ ref: "admission-b/second", name: "Second display name" },
 			],
 		});
-		expect(await listNativeModels({ agentDir, query: "ADMISSION-B" })).toEqual({
+		expect(listNativeModels(models, { query: "ADMISSION-B" })).toEqual({
 			total: 2,
 			rows: [
 				{ ref: "admission-b/first", name: "First display name" },
 				{ ref: "admission-b/second", name: "Second display name" },
 			],
 		});
-		expect(await listNativeModels({ agentDir, query: "second" })).toEqual({
+		expect(listNativeModels(models, { query: "second" })).toEqual({
 			total: 1,
 			rows: [{ ref: "admission-b/second", name: "Second display name" }],
 		});
-		expect(await listNativeModels({ agentDir, query: "admission-", limit: 2 })).toEqual({
+		expect(listNativeModels(models, { query: "admission-", limit: 2 })).toEqual({
 			total: 3,
 			rows: [
 				{ ref: "admission-a/alpha", name: "Alpha display name" },
 				{ ref: "admission-b/first", name: "First display name" },
 			],
 		});
-		expect(await listNativeModels({ agentDir, query: "no-such-model" })).toEqual({ total: 0, rows: [] });
-		// Without a query every native model is eligible, capped at the default limit of 50.
-		const all = await listNativeModels({ agentDir });
+		expect(listNativeModels(models, { query: "no-such-model" })).toEqual({ total: 0, rows: [] });
+		// Without a query every available native model is eligible, capped at the default limit of 50.
+		const all = listNativeModels(models);
 		expect(all.total).toBeGreaterThanOrEqual(3);
 		expect(all.rows).toHaveLength(Math.min(50, all.total));
 		expect(all.rows[0]).toEqual({ ref: "admission-a/alpha", name: "Alpha display name" });

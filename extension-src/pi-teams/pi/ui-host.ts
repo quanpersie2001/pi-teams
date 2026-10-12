@@ -13,6 +13,7 @@ import type { ThinkingLevel } from "../domain/agent-definition.js";
 import { isActiveStatus } from "../domain/agent-run.js";
 import type { ChildControlCommand } from "../domain/child-protocol.js";
 import type { SubagentsSettings } from "../domain/config.js";
+import type { TaskContext, TaskOutcome, TaskProjection, TaskSpec, TaskStatus } from "../domain/task-board.js";
 import type { AgentFocusPort, AgentFocusSnapshot, AgentListView } from "../domain/ui-view.js";
 import {
 	type AgentPanelData,
@@ -23,10 +24,12 @@ import {
 import {
 	activatePanel,
 	applyStopConfirm,
+	dispatchHubKey,
 	dispatchPanelKey,
+	hubRows,
+	hubSelection,
 	PANEL_PAGE_SIZE,
 	type PanelSelection,
-	selectAtIndex,
 	selectionIndex,
 } from "../features/agent-panel/panel-keys.js";
 import {
@@ -36,6 +39,15 @@ import {
 	createAgentTranscriptPane,
 	createAgentViewOverlay,
 } from "../features/agent-view/index.js";
+import {
+	createTasksHubComponent,
+	inlineTasks,
+	renderInlineTasks,
+	type TaskFilter,
+	type TasksHubData,
+	visibleTasks,
+} from "../features/tasks/index.js";
+import { bindThemeFg } from "../shared/theme.js";
 import type { TranscriptSource } from "./transcript-host.js";
 
 /** Elapsed/stats re-render cadence while something is active. */
@@ -44,19 +56,64 @@ const TICK_MS = 1000;
 const HUB_DOUBLE_LEFT_MS = 500;
 
 const PANEL_WIDGET_KEY = "teams-agents";
+const TASK_WIDGET_KEY = "teams-tasks";
 const STATUS_KEY = "teams";
 
+export interface TasksUiPort {
+	snapshot(): TaskProjection[];
+	subscribe(listener: () => void): () => void;
+	create(input: {
+		title: string;
+		description?: string;
+		dependencies?: string[];
+		spec?: TaskSpec;
+		context?: TaskContext;
+		assignee?: string;
+		reviewRequested?: boolean;
+	}): TaskProjection;
+	update(input: {
+		id: string;
+		expectedRequirementRevision?: number;
+		status?: TaskStatus;
+		title?: string;
+		description?: string;
+		dependencies?: string[];
+		spec?: TaskSpec;
+		context?: TaskContext;
+		assignee?: string | null;
+		reviewRequested?: boolean;
+		outcome?: TaskOutcome;
+	}): TaskProjection;
+	cancel(id: string): TaskProjection;
+	execute(id: string, type: string): Promise<{ task: TaskProjection | undefined; runId: string }>;
+	output(
+		id: string,
+		wait?: boolean,
+	): Promise<{
+		taskId: string;
+		attempt?: import("../domain/task-board.js").TaskAttempt;
+		result?: string;
+		error?: string;
+	}>;
+	stop(id: string): Promise<boolean>;
+	colors(): { name: string; color?: string }[];
+	executionTypes(): string[];
+}
 export interface SubagentsUiOptions {
 	manager: AgentManager;
 	focus: AgentFocusPort;
 	settings: () => SubagentsSettings;
 	transcripts: TranscriptSource;
+	tasks?: TasksUiPort;
 	now?: () => number;
 }
 export interface SubagentsUiHandle {
 	/** Open the transcript view for a run (defaults to the newest visible one). */
 	openView(runId?: string): void;
 	openHub(): void;
+	openAgents(): void;
+	openTasks(): void;
+	setInlineAgentsVisible(visible: boolean | "toggle"): void;
 	closeView(): void;
 	/** Rebuild snapshots + widgets (also called on lifecycle events/ticks). */
 	refresh(): void;
@@ -80,6 +137,17 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	let focusUnsubscribe: (() => void) | undefined;
 	let focusGeneration = 0;
 	let hubOpen = false;
+	let hubTab: "agents" | "tasks" = "agents";
+	let lastHubTab: "agents" | "tasks" = "agents";
+	let taskRows: readonly TaskProjection[] = [];
+	let taskColorIndex = new Map<string, string>();
+	let taskSelection: string | null = null;
+	let taskFilter: TaskFilter = "all";
+	let taskQuery = "";
+	let taskDetail = false;
+	const taskDetailScroll = new Map<string, number>();
+	let taskError: string | null = null;
+	let taskUnsubscribe: (() => void) | undefined;
 	let hubFocus: AgentFocusSnapshot | null = null;
 	let hubFocusRunId: string | null = null;
 	let hubFocusUnsubscribe: (() => void) | undefined;
@@ -91,6 +159,8 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	let leftArmed: { editor: Editor | undefined; sessionId: string; text: string; pressedAt: number } | undefined;
 
 	let panelRegistered = false;
+	let taskWidgetRegistered = false;
+	let inlineAgentsOverride: boolean | undefined;
 	let tui: TUI | undefined;
 	let overlayDone: (() => void) | undefined;
 	let overlayHandle: OverlayHandle | undefined;
@@ -118,6 +188,10 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 
 	function enabled(): boolean {
 		return !disposed && options.settings().agentPanel;
+	}
+
+	function inlineAgentsEnabled(): boolean {
+		return enabled() && (inlineAgentsOverride ?? options.settings().agentInlinePanel);
 	}
 
 	function requestRender(): void {
@@ -152,7 +226,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			PANEL_WIDGET_KEY,
 			(widgetTui, theme) => {
 				tui = widgetTui;
-				return createAgentListComponent(
+				const agents = createAgentListComponent(
 					widgetTui,
 					theme,
 					() => {
@@ -162,10 +236,36 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 					},
 					now,
 				);
+				return agents;
 			},
 			{ placement: "belowEditor" },
 		);
 		panelRegistered = true;
+	}
+
+	function syncInlineAgentWidget(): void {
+		if (inlineAgentsEnabled() && (inlineListView?.rows.length ?? 0) > 0) {
+			if (!panelRegistered) installPanel();
+		} else if (panelRegistered) {
+			removeWidgets(PANEL_WIDGET_KEY);
+		}
+	}
+
+	function installTaskWidget(): void {
+		if (!options.tasks || taskWidgetRegistered || inlineTasks(taskRows).length === 0) return;
+		ctx.ui.setWidget(
+			TASK_WIDGET_KEY,
+			(widgetTui, theme) => {
+				tui = widgetTui;
+				return {
+					render: (width: number) =>
+						renderInlineTasks(taskRows, taskColorIndex, bindThemeFg(theme), width, listView?.rows ?? [], now()),
+					invalidate() {},
+				};
+			},
+			{ placement: "aboveEditor" },
+		);
+		taskWidgetRegistered = true;
 	}
 
 	function startViewOverlay(): void {
@@ -258,6 +358,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	}
 	function closeHub(): void {
 		leftArmed = undefined;
+		lastHubTab = hubTab;
 		hubFocusGeneration++;
 		hubFocusUnsubscribe?.();
 		hubFocusUnsubscribe = undefined;
@@ -273,6 +374,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		hubComponent = undefined;
 		hubPromise = undefined;
 		selection = null;
+		taskDetail = false;
 		if (done) done();
 		else {
 			component?.invalidate();
@@ -286,33 +388,421 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		openView(runId);
 	}
 
+	function getTasksHubData(): TasksHubData {
+		return {
+			tasks: taskRows,
+			selection: taskSelection,
+			filter: taskFilter,
+			query: taskQuery,
+			detail: taskDetail,
+			detailScroll: taskDetailScroll.get(taskSelection ?? "") ?? 0,
+			rosterColors: taskColorIndex,
+			runs: listView?.rows ?? [],
+			now: now(),
+			error: taskError,
+		};
+	}
+
+	function refreshTasks(): void {
+		if (!options.tasks || disposed) return;
+		try {
+			taskRows = options.tasks.snapshot();
+			taskColorIndex = new Map(
+				(options.tasks.colors() ?? []).flatMap((item) => (item.color ? [[item.name, item.color] as const] : [])),
+			);
+			if (!taskRows.some((task) => task.id === taskSelection)) taskSelection = taskRows[0]?.id ?? null;
+			if (enabled() && inlineTasks(taskRows).length > 0) installTaskWidget();
+			else if (taskWidgetRegistered) removeWidgets(TASK_WIDGET_KEY);
+		} catch (error) {
+			taskError = error instanceof Error ? error.message : String(error);
+		}
+		requestRender();
+	}
+
+	function switchHubTab(tab: "agents" | "tasks"): void {
+		if (tab === "tasks" && !options.tasks) return;
+		hubTab = tab;
+		lastHubTab = tab;
+		if (tab === "tasks") refreshTasks();
+		requestRender();
+	}
+
+	async function taskAction(run: () => unknown | Promise<unknown>): Promise<void> {
+		try {
+			await run();
+			taskError = null;
+			refreshTasks();
+		} catch (error) {
+			taskError = error instanceof Error ? error.message : String(error);
+			notify(taskError, "error");
+			requestRender();
+		}
+	}
+
+	const splitLines = (value: string): string[] =>
+		value
+			.split("\n")
+			.map((entry) => entry.trim())
+			.filter(Boolean);
+	const splitList = (value: string): string[] =>
+		value
+			.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean);
+	async function promptTaskFields(
+		task?: TaskProjection,
+	): Promise<{ spec: TaskSpec; context: TaskContext } | undefined> {
+		const paths = await ctx.ui.input("Scope paths (comma-separated)", task?.spec.scope?.paths?.join(", ") ?? "");
+		if (paths === undefined) return;
+		const outOfScope = await ctx.ui.input(
+			"Out of scope (comma-separated)",
+			task?.spec.scope?.outOfScope?.join(", ") ?? "",
+		);
+		if (outOfScope === undefined) return;
+		const constraints = await ctx.ui.input("Constraints (one per line)", task?.spec.constraints?.join("\n") ?? "");
+		if (constraints === undefined) return;
+		const expectedOutput = await ctx.ui.input("Expected output", task?.spec.expectedOutput ?? "");
+		if (expectedOutput === undefined) return;
+		const decisions = await ctx.ui.input("Context decisions (one per line)", task?.context.decisions?.join("\n") ?? "");
+		if (decisions === undefined) return;
+		const background = await ctx.ui.input("Context background", task?.context.background ?? "");
+		if (background === undefined) return;
+		const refsText = await ctx.ui.input(
+			"Context references JSON (kind, target, optional note)",
+			JSON.stringify(task?.context.references ?? []),
+		);
+		if (refsText === undefined) return;
+		let references: TaskContext["references"];
+		try {
+			const parsed: unknown = JSON.parse(refsText || "[]");
+			if (
+				!Array.isArray(parsed) ||
+				parsed.some(
+					(r) =>
+						!r ||
+						!["file", "url", "artifact"].includes(r.kind) ||
+						typeof r.target !== "string" ||
+						(r.note !== undefined && typeof r.note !== "string"),
+				)
+			)
+				throw new Error("Expected an array of { kind, target, note? } references.");
+			references = parsed;
+		} catch (error) {
+			notify(`Invalid task references: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+		const acceptanceCriteria = await ctx.ui.input(
+			"Acceptance criteria (one per line)",
+			task?.spec.acceptanceCriteria?.join("\n") ?? "",
+		);
+		if (acceptanceCriteria === undefined) return;
+		return {
+			spec: {
+				acceptanceCriteria: splitLines(acceptanceCriteria),
+				scope: { paths: splitList(paths), outOfScope: splitList(outOfScope) },
+				constraints: splitLines(constraints),
+				expectedOutput,
+			},
+			context: { background, decisions: splitLines(decisions), references },
+		};
+	}
+
+	async function promptTaskOutcome(task: TaskProjection): Promise<TaskOutcome | undefined> {
+		const summary = await ctx.ui.input("Completion summary", task.outcome?.summary ?? "");
+		if (summary === undefined) return;
+		const artifacts = await ctx.ui.input(
+			"Outcome artifacts (comma-separated)",
+			task.outcome?.artifacts?.join(", ") ?? "",
+		);
+		if (artifacts === undefined) return;
+		const verificationText = await ctx.ui.input(
+			"Verification JSON (check, outcome passed|failed|not_run, optional evidence)",
+			JSON.stringify(task.outcome?.verification ?? []),
+		);
+		if (verificationText === undefined) return;
+		let verification: TaskOutcome["verification"];
+		try {
+			const parsed: unknown = JSON.parse(verificationText || "[]");
+			if (
+				!Array.isArray(parsed) ||
+				parsed.some(
+					(v) =>
+						!v ||
+						typeof v.check !== "string" ||
+						!["passed", "failed", "not_run"].includes(v.outcome) ||
+						(v.evidence !== undefined && typeof v.evidence !== "string"),
+				)
+			)
+				throw new Error("Expected an array of verification checks with a valid outcome.");
+			verification = parsed;
+		} catch (error) {
+			notify(`Invalid verification data: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+		const remaining = await ctx.ui.input(
+			"Remaining issues (one per line)",
+			task.outcome?.remainingIssues?.join("\n") ?? "",
+		);
+		if (remaining === undefined) return;
+		return { summary, artifacts: splitList(artifacts), verification, remainingIssues: splitLines(remaining) };
+	}
+
+	async function handleTasksInput(data: string): Promise<void> {
+		if (matchesKey(data, "tab") || matchesKey(data, "shift+tab")) {
+			switchHubTab("agents");
+			return;
+		}
+		if (matchesKey(data, "escape")) {
+			if (taskDetail) {
+				taskDetail = false;
+				requestRender();
+			} else closeHub();
+			return;
+		}
+		const tasks = visibleTasks(getTasksHubData());
+		if (!tasks.some((task) => task.id === taskSelection)) taskSelection = tasks[0]?.id ?? null;
+		let index = tasks.findIndex((task) => task.id === taskSelection);
+		if (index < 0) index = 0;
+		const move = (delta: number) => {
+			if (tasks.length) taskSelection = tasks[Math.max(0, Math.min(tasks.length - 1, index + delta))]?.id ?? null;
+			requestRender();
+		};
+		const scroll = (delta: number) => {
+			if (!taskSelection) return;
+			taskDetailScroll.set(taskSelection, Math.max(0, (taskDetailScroll.get(taskSelection) ?? 0) + delta));
+			requestRender();
+		};
+		if (matchesKey(data, "up")) {
+			if (taskDetail) scroll(-1);
+			else move(-1);
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			if (taskDetail) scroll(1);
+			else move(1);
+			return;
+		}
+		if (matchesKey(data, "pageUp")) {
+			if (taskDetail) scroll(-Math.max(1, (tui?.terminal.rows ?? 12) - 7));
+			else move(-Math.max(1, (tui?.terminal.rows ?? 12) - 7));
+			return;
+		}
+		if (matchesKey(data, "pageDown")) {
+			if (taskDetail) scroll(Math.max(1, (tui?.terminal.rows ?? 12) - 7));
+			else move(Math.max(1, (tui?.terminal.rows ?? 12) - 7));
+			return;
+		}
+		if (matchesKey(data, "home")) {
+			taskSelection = tasks[0]?.id ?? null;
+			requestRender();
+			return;
+		}
+		if (matchesKey(data, "end")) {
+			taskSelection = tasks.at(-1)?.id ?? null;
+			requestRender();
+			return;
+		}
+		const task = tasks.find((item) => item.id === taskSelection);
+		if (matchesKey(data, "return")) {
+			taskDetail = !taskDetail;
+			requestRender();
+			return;
+		}
+		if (matchesKey(data, "/")) {
+			const value = await ctx.ui.input("Search tasks", taskQuery);
+			if (value !== undefined) taskQuery = value;
+			requestRender();
+			return;
+		}
+		if (matchesKey(data, "f")) {
+			const selected = await ctx.ui.select("Filter tasks", [
+				"all",
+				"open",
+				"blocked",
+				"in_progress",
+				"in_review",
+				"completed",
+				"cancelled",
+			]);
+			if (selected) taskFilter = selected as TaskFilter;
+			refreshTasks();
+			return;
+		}
+		if (matchesKey(data, "n")) {
+			const title = await ctx.ui.input("Task title");
+			if (!title?.trim()) return;
+			const description = await ctx.ui.input("Task description (optional)");
+			if (description === undefined) return;
+			const fields = await promptTaskFields();
+			if (!fields) return;
+			const dependencies = await ctx.ui.input("Dependencies (task codes, comma-separated, optional)");
+			if (dependencies === undefined) return;
+			const members = options.tasks?.colors().map((member) => member.name) ?? [];
+			const assigneeChoice = await ctx.ui.select("Assignee", ["Unassigned", ...members.map((name) => `@${name}`)]);
+			if (assigneeChoice === undefined) return;
+			const review = await ctx.ui.select("Require review before completion?", ["No", "Yes"]);
+			if (review === undefined) return;
+			await taskAction(() => {
+				const created = options.tasks?.create({
+					title,
+					...(description ? { description } : {}),
+					...(dependencies.trim()
+						? {
+								dependencies: dependencies
+									.split(",")
+									.map((item) => item.trim())
+									.filter(Boolean),
+							}
+						: {}),
+					spec: fields.spec,
+					context: fields.context,
+					...(assigneeChoice !== "Unassigned" ? { assignee: assigneeChoice.replace(/^@/, "") } : {}),
+					reviewRequested: review === "Yes",
+				});
+				taskSelection = created?.id ?? null;
+			});
+			return;
+		}
+		if (!task || !options.tasks) return;
+		if (matchesKey(data, "e") && task.status === "pending") {
+			const title = await ctx.ui.input("Task title", task.title);
+			if (!title?.trim()) return;
+			const description = await ctx.ui.input("Task description", task.description ?? "");
+			if (description === undefined) return;
+			const fields = await promptTaskFields(task);
+			if (!fields) return;
+			const dependencies = await ctx.ui.input(
+				"Dependencies (task codes, comma-separated)",
+				task.dependencies.join(", "),
+			);
+			if (dependencies === undefined) return;
+			const members = options.tasks?.colors().map((member) => member.name) ?? [];
+			const currentAssignee = task.assignee ? `@${task.assignee}` : "Unassigned";
+			const assigneeChoice = await ctx.ui.select("Assignee", [
+				currentAssignee,
+				...members.map((name) => `@${name}`).filter((name) => name !== currentAssignee),
+				...(currentAssignee === "Unassigned" ? [] : ["Unassigned"]),
+			]);
+			if (assigneeChoice === undefined) return;
+			const currentReview = task.reviewRequested ? "Yes" : "No";
+			const review = await ctx.ui.select("Require review before completion?", [
+				currentReview,
+				currentReview === "Yes" ? "No" : "Yes",
+			]);
+			if (review === undefined) return;
+			await taskAction(() =>
+				options.tasks?.update({
+					id: task.id,
+					expectedRequirementRevision: task.requirementRevision,
+					title,
+					description,
+					dependencies: splitList(dependencies),
+					spec: fields.spec,
+					context: fields.context,
+					assignee: assigneeChoice === "Unassigned" ? null : assigneeChoice.replace(/^@/, ""),
+					reviewRequested: review === "Yes",
+				}),
+			);
+			return;
+		}
+		if (matchesKey(data, "c")) {
+			if (task.status === "pending")
+				await taskAction(() => options.tasks?.update({ id: task.id, status: "in_progress" }));
+			else if (task.status === "in_progress" && !task.attempts.some((attempt) => attempt.status === "running"))
+				await taskAction(() => options.tasks?.update({ id: task.id, status: "pending" }));
+			return;
+		}
+		if (
+			matchesKey(data, "x") &&
+			task.status === "in_progress" &&
+			!task.attempts.some((attempt) => attempt.status === "running")
+		) {
+			const types = options.tasks.executionTypes();
+			if (!types.length) {
+				notify("No enabled agent types are available for task execution.", "warning");
+				return;
+			}
+			const type = await ctx.ui.select("Execute task with agent type", types);
+			if (!type) return;
+			await taskAction(() => options.tasks?.execute(task.id, type));
+			return;
+		}
+		if (
+			matchesKey(data, "r") &&
+			task.status === "in_progress" &&
+			task.reviewRequested &&
+			!task.attempts.some((attempt) => attempt.status === "running")
+		) {
+			await taskAction(() =>
+				options.tasks?.update({
+					id: task.id,
+					expectedRequirementRevision: task.requirementRevision,
+					status: "in_review",
+				}),
+			);
+			return;
+		}
+		if (
+			matchesKey(data, "a") &&
+			(task.status === "in_progress" || task.status === "in_review") &&
+			!task.attempts.some((attempt) => attempt.status === "running")
+		) {
+			const outcome = await promptTaskOutcome(task);
+			if (!outcome) return;
+			await taskAction(() =>
+				options.tasks?.update({
+					id: task.id,
+					expectedRequirementRevision: task.requirementRevision,
+					status: "completed",
+					outcome,
+				}),
+			);
+			return;
+		}
+		if (matchesKey(data, "k") && task.attempts.some((attempt) => attempt.status === "running")) {
+			const confirmed = await ctx.ui.confirm("Stop task execution?", `${task.code ?? task.id}: ${task.title}`);
+			if (confirmed) await taskAction(() => options.tasks?.stop(task.id));
+			return;
+		}
+		if (matchesKey(data, "o")) {
+			const result = await options.tasks.output(task.id);
+			notify(result.error ?? result.result ?? "No task output yet.", result.error ? "error" : "info");
+			return;
+		}
+		if (matchesKey(data, "d") && task.status === "pending") {
+			const confirmed = await ctx.ui.confirm("Cancel task?", `${task.code ?? task.id}: ${task.title}`);
+			if (confirmed) await taskAction(() => options.tasks?.cancel(task.id));
+			return;
+		}
+		if (matchesKey(data, "v")) {
+			const run = task.attempts.at(-1)?.runId;
+			if (run && listView?.rows.some((row) => row.id === run && row.capabilities.viewable)) {
+				closeHub();
+				openView(run);
+			}
+		}
+	}
+
 	function handleHubInput(data: string): void {
 		if (matchesKey(data, "alt+g")) {
 			closeHub();
 			return;
 		}
-		const rows = listView?.rows ?? [];
-		if (selection === null) selection = activatePanel();
-		// The Hub's roster window is derived from the terminal height, so a paged
-		// jump must move one *rendered Hub window* — not the inline panel's fixed
-		// page size. Intercept here so dispatchPanelKey keeps its six-row paging
-		// contract for the inline panel (features/agent-panel/panel-keys.ts).
-		const pageDown = matchesKey(data, "pageDown");
-		if (pageDown || matchesKey(data, "pageUp")) {
-			const terminalRows = tui?.terminal?.rows;
-			// Degenerate fallback only: a host that never reports a usable height
-			// still pages, by the inline size, instead of refusing to move.
-			const page =
-				typeof terminalRows === "number" && terminalRows > 0
-					? Math.max(1, hubRosterCapacity(terminalRows))
-					: PANEL_PAGE_SIZE;
-			const current = selectionIndex(selection, rows) ?? 0;
-			selection = selectAtIndex(rows, current + (pageDown ? page : -page));
-			syncHubFocus();
-			requestRender();
+		if (hubTab === "tasks") {
+			handleTasksInput(data);
 			return;
 		}
-		const action = dispatchPanelKey(data, selection, rows, "panel");
+		if (matchesKey(data, "tab") || matchesKey(data, "shift+tab")) {
+			switchHubTab("tasks");
+			return;
+		}
+		const rows = hubRows(listView?.rows ?? []);
+		const terminalRows = tui?.terminal?.rows;
+		const page =
+			typeof terminalRows === "number" && terminalRows > 0
+				? Math.max(1, hubRosterCapacity(terminalRows))
+				: PANEL_PAGE_SIZE;
+		const action = dispatchHubKey(data, selection, rows, page);
 		switch (action.kind) {
 			case "select":
 				selection = action.selection;
@@ -335,14 +825,14 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	}
 
 	function moveHubSelection(delta: number): void {
-		const rows = listView?.rows ?? [];
-		const current = selectionIndex(selection, rows) ?? 0;
-		selection = selectAtIndex(rows, current + delta);
+		const rows = hubRows(listView?.rows ?? []);
+		selection = hubSelection(selection, rows, delta);
 		syncHubFocus();
 		requestRender();
 	}
 
 	function syncHubFocus(): void {
+		if (hubOpen) selection = hubSelection(selection, hubRows(listView?.rows ?? []));
 		const index = selectionIndex(selection, listView?.rows ?? []) ?? 0;
 		const runId = hubOpen && index > 0 ? (listView?.rows[index - 1]?.id ?? null) : null;
 		if (runId === hubFocusRunId) return;
@@ -390,16 +880,44 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 						return { render: () => [], invalidate() {} };
 					}
 					tui = hubTui;
-					const component = createAgentHubComponent(
+					const agentComponent = createAgentHubComponent(
 						hubTui,
 						theme,
-						() => (hubOpen && listView ? { view: listView, selection, stopArmedFor, focus: hubFocus } : null),
+						() =>
+							hubOpen && listView
+								? { view: listView, selection, stopArmedFor, focus: hubFocus, activeTab: hubTab }
+								: null,
 						handleHubInput,
 						activateHubRow,
-						closeHub,
 						moveHubSelection,
 						now,
 					);
+					const tasksComponent = createTasksHubComponent(
+						hubTui,
+						theme,
+						() => (hubOpen && hubTab === "tasks" ? getTasksHubData() : null),
+						(id) => {
+							taskSelection = id;
+							requestRender();
+						},
+						(delta) => {
+							if (taskDetail && taskSelection) {
+								taskDetailScroll.set(taskSelection, Math.max(0, (taskDetailScroll.get(taskSelection) ?? 0) + delta));
+							} else {
+								const visible = visibleTasks(getTasksHubData());
+								const index = visible.findIndex((task) => task.id === taskSelection);
+								taskSelection = visible[Math.max(0, Math.min(visible.length - 1, index + delta))]?.id ?? null;
+							}
+							requestRender();
+						},
+					);
+					const component: Component = {
+						render: (width) => (hubTab === "tasks" ? tasksComponent.render(width) : agentComponent.render(width)),
+						invalidate: () => {
+							agentComponent.invalidate();
+							tasksComponent.invalidate();
+						},
+					};
 					hubDone = () => done(undefined);
 					hubComponent = component;
 					return component;
@@ -437,6 +955,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	function removeWidgets(...keys: string[]): void {
 		for (const key of keys) ctx.ui.setWidget(key, undefined);
 		if (keys.includes(PANEL_WIDGET_KEY)) panelRegistered = false;
+		if (keys.includes(TASK_WIDGET_KEY)) taskWidgetRegistered = false;
 	}
 
 	// -- actions ---------------------------------------------------------------
@@ -532,11 +1051,31 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		}
 		if (viewRunId !== null) closeView();
 		hubOpen = true;
-		selection = activatePanel();
+		hubTab = options.tasks ? lastHubTab : "agents";
+		selection = hubSelection(null, hubRows(listView?.rows ?? []));
 		syncHubFocus();
 		stopArmedFor = null;
 		void refresh();
 		startHubOverlay();
+		requestRender();
+	}
+
+	function openAgents(): void {
+		if (!hubOpen) openHub();
+		hubTab = "agents";
+		lastHubTab = "agents";
+		requestRender();
+	}
+
+	function openTasks(): void {
+		if (!options.tasks) {
+			notify("Tasks are unavailable for this session.", "warning");
+			return;
+		}
+		if (!hubOpen) openHub();
+		hubTab = "tasks";
+		lastHubTab = "tasks";
+		refreshTasks();
 		requestRender();
 	}
 
@@ -813,6 +1352,10 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			return undefined;
 		}
 
+		if (!inlineAgentsEnabled()) {
+			leftArmed = undefined;
+			return undefined;
+		}
 		const rows = inlineListView?.rows ?? [];
 		if (text !== "" || rows.length === 0) {
 			leftArmed = undefined;
@@ -900,11 +1443,9 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			if (hubOpen) syncHubFocus();
 			updateStatusLine();
 
-			if (enabled() && inlineListView.rows.length > 0) {
-				if (!panelRegistered) installPanel();
-			} else if (panelRegistered) {
-				removeWidgets(PANEL_WIDGET_KEY);
-			}
+			syncInlineAgentWidget();
+			if (enabled() && inlineTasks(taskRows).length > 0) installTaskWidget();
+			else if (taskWidgetRegistered) removeWidgets(TASK_WIDGET_KEY);
 
 			const runId = viewRunId;
 			if (runId !== null) {
@@ -981,6 +1522,12 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		}
 	}
 
+	// Task snapshots are refreshed on local mutations and filesystem changes from peers.
+	if (options.tasks) {
+		taskUnsubscribe = options.tasks.subscribe(() => refreshTasks());
+		refreshTasks();
+	}
+
 	// Lifecycle events trigger a debounced snapshot refresh.
 	const unsubscribeLifecycle = manager.subscribe(() => {
 		if (!disposed) void refresh();
@@ -1002,6 +1549,18 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	return {
 		openView,
 		openHub,
+		openAgents,
+		openTasks,
+		setInlineAgentsVisible(visible) {
+			inlineAgentsOverride = visible === "toggle" ? !inlineAgentsEnabled() : visible;
+			if (!inlineAgentsEnabled() && !hubOpen) {
+				selection = null;
+				stopArmedFor = null;
+			}
+			syncInlineAgentWidget();
+			requestRender();
+			void refresh();
+		},
 		closeView,
 		refresh: () => {
 			void refresh();
@@ -1023,13 +1582,17 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			try {
 				closeView();
 				closeHub();
-				removeWidgets(PANEL_WIDGET_KEY);
+				removeWidgets(PANEL_WIDGET_KEY, TASK_WIDGET_KEY);
 				ctx.ui.setStatus(STATUS_KEY, undefined);
 			} catch {
 				/* stale context during shutdown */
 			}
+			taskUnsubscribe?.();
+			taskUnsubscribe = undefined;
 			viewData = null;
 			listView = null;
+			taskRows = [];
+			taskDetailScroll.clear();
 			inlineListView = null;
 			selection = null;
 			viewDrafts.clear();

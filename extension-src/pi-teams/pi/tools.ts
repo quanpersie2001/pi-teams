@@ -13,6 +13,7 @@ import type { DeliveryService } from "../app/delivery-service.js";
 import type { MailboxService } from "../app/mailbox-service.js";
 import { isMailboxAddress } from "../domain/mailbox.js";
 import { LEAD_ADDRESS, normalizeTeammateColor, teammateNameProblem } from "../domain/team.js";
+import { isTeammateMessageAvailable } from "./teammate-routing.js";
 import { existingToolNames, type ToolRegistration } from "./tool-registration.js";
 
 /** Register the lead's sole peer-messaging tool; targets are validated against the live roster. */
@@ -20,6 +21,7 @@ export function registerLeadSendMessageTool(
 	pi: ExtensionAPI,
 	getMailbox: () => MailboxService | undefined,
 	getTeammateNames: () => readonly string[],
+	getTeammateStatus?: (name: string) => ReturnType<AgentManager["teammateStatus"]>,
 ): ToolRegistration {
 	const tool = defineTool({
 		name: "send_message",
@@ -37,6 +39,23 @@ export function registerLeadSendMessageTool(
 				return { content: [{ type: "text" as const, text: "No active team mailbox." }], details: undefined };
 			if (!isMailboxAddress(args.target) || args.target === LEAD_ADDRESS || !getTeammateNames().includes(args.target))
 				return { content: [{ type: "text" as const, text: `Unknown teammate: ${args.target}` }], details: undefined };
+			const status = getTeammateStatus?.(args.target);
+			if (getTeammateStatus && !isTeammateMessageAvailable(status)) {
+				const reason = status?.recoveryError ? `: ${status.recoveryError}` : "";
+				const blockedAs = status?.state === "released" || status?.state === "retired" ? status.state : "unavailable";
+				const stateNote = status ? ` (state ${status.state})` : "";
+				return {
+					content: [
+						{ type: "text" as const, text: `Message not sent: @${args.target} is ${blockedAs}${stateNote}${reason}.` },
+					],
+					details: {
+						target: args.target,
+						state: status?.state ?? "unknown",
+						availability: status?.availability ?? "unavailable",
+						queued: false,
+					},
+				};
+			}
 			const sent = mailbox.send(args.target, args.message);
 			return {
 				content: [
@@ -145,28 +164,76 @@ const agentParameters = Type.Object({
 				"Defaults per configuration — agents run detached by default, returning their ID immediately; you are notified on completion. Set false only when your very next action depends on the result; the call then blocks and returns the agent's output inline.",
 		}),
 	),
+	context: Type.Optional(
+		Type.Union([Type.Literal("continue"), Type.Literal("fresh")], {
+			description:
+				"Optional named-teammate context policy. When omitted, an idle retained context continues; a new/released teammate starts fresh. Explicit continue requires an idle retained context and fails if released/unavailable. Explicit fresh closes a verified-idle retained child, then starts a new session under the same name/color; pending mailbox messages are archived, not replayed.",
+		}),
+	),
 	resume: Type.Optional(
 		Type.String({
 			description:
-				"Cold-resume a finished run after its child has been released. A named teammate with a retained idle child should instead receive send_message or a new Agent assignment under the same name/color; use steer_subagent while it is running.",
+				"Cold-resume a finished run from its persisted transcript into a new run. For a named teammate, explicitly release its retained context first; retired identities cannot be cold-resumed/reassigned as teammates. Cold resume is distinct from Agent context: continue reuses an idle context; fresh replaces it. Include the required new-spawn fields only when not resuming.",
 		}),
 	),
 });
 
+function createTeammateLifecycleTool(manager: AgentManager, name: "teammate_release" | "teammate_retire") {
+	const retire = name === "teammate_retire";
+	return defineTool({
+		name,
+		label: retire ? "Retire Teammate" : "Release Teammate",
+		description: retire
+			? "Permanently retire a settled teammate identity. Busy teammates must finish first; retirement is idempotent and does not alter task-board claims. Retired names cannot be implicitly resurrected. Lead-only tool."
+			: "Release a settled teammate's retained live child/context. Busy teammates must finish first; release is idempotent and does not alter task-board claims. Use teammate_status to inspect state. Lead-only tool.",
+		parameters: Type.Object({ name: Type.String({ description: "Exact teammate name (without @)." }) }),
+		async execute(_id, args: { name: string }) {
+			try {
+				const changed = retire ? await manager.retireTeammate(args.name) : await manager.releaseTeammate(args.name);
+				if (!changed) return textResult(`Unknown teammate: ${args.name}`, { name: args.name, changed: false });
+				const status = manager.teammateStatus(args.name);
+				if (!status)
+					return textResult(`Lifecycle operation completed for @${args.name}, but its current state is unavailable.`, {
+						name: args.name,
+						state: null,
+						changed: true,
+					});
+				return textResult(`Teammate @${args.name} is now ${status.state}. Task-board claims are unchanged.`, {
+					...status,
+					changed: true,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return textResult(`${retire ? "Retire" : "Release"} failed for @${args.name}: ${message}`, {
+					name: args.name,
+					action: retire ? "retire" : "release",
+					changed: false,
+					error: message,
+					recovery:
+						"Wait for the teammate to become idle, inspect teammate_status/recoveryError, then retry or recover the transcript explicitly.",
+				});
+			}
+		},
+	});
+}
+
 /**
- * Build and return the three orchestration tools bound to a manager and the
- * live registry. Exported pure so tests can exercise execute() without a live Pi host.
+ * Build and return the orchestration tools bound to a manager and live registry.
+ * Exported pure so tests can exercise execute() without a live Pi host.
  */
 export function createSubagentTools(manager: AgentManager, registry: AgentRegistry, delivery?: DeliveryService) {
 	const agentTool = defineTool({
 		name: "Agent",
 		label: "Agent",
 		description:
-			"Spawn/delegate a named, colored specialist teammate. Use Agent whenever the user explicitly asks for subagents, teammates, delegation or parallel work, even for short tasks; also use it proactively for independent investigations, implementation and review that can run in parallel. Every NEW spawn MUST include all four required fields — subagent_type, description, name, and color (a unique teammate name and a distinct #RGB or #RRGGBB color). Resume needs only resume and prompt. Do not delegate trivial work better done directly or spawn overlapping tasks. A pinned model remains primary; authentication and fallback are checked before launch. In interactive sessions, a batch containing only detached launches ends the coordinator turn; their completion notifications start the next turn. Do not wait or poll for them.",
+			"Spawn/delegate a named, colored specialist teammate. Use Agent whenever the user explicitly asks for subagents, teammates, delegation or parallel work, even for short tasks; also use it proactively for independent investigations, implementation and review that can run in parallel. Every NEW spawn MUST include all four required fields — subagent_type, description, name, and color (a unique teammate name and a distinct #RGB or #RRGGBB color). Resume needs only resume and prompt. Do not delegate trivial work better done directly or spawn overlapping tasks. A pinned model remains primary; authentication and fallback are checked before launch. For named teammates, omitted context continues an idle retained conversation and starts fresh when no context is retained (new or released identity); explicit continue without an idle retained context fails. Explicit fresh replaces a verified-idle context under the same fixed identity, archiving pending mailbox messages instead of replaying them. Retired teammates cannot be assigned or resumed as teammates. Cold resume after explicit release recovers transcript in a distinct new run. In interactive sessions, a batch containing only detached launches ends the coordinator turn; their completion notifications start the next turn. Do not wait or poll for them.",
 		promptSnippet: "Spawn named, colored subagents when asked; delegate independent work in parallel",
 		promptGuidelines: [
 			"Prefer delegating two or more independent subtasks to parallel teammates instead of doing them sequentially yourself",
 			"Recognize delegation and parallel-work requests regardless of phrasing or language",
+			"For named teammates, omitted context preserves an idle context and starts fresh for new/released identities; explicit continue requires idle context, while explicit fresh replaces only a verified-idle retained context",
+			"Use teammate_status to distinguish idle, busy (including queued), released and retired; check availability/recoveryError separately",
+			"Use teammate_release or teammate_retire only after work settles; these actions do not change task-board claims",
 			"For multi-part coordinated work, track it on the team task board (create → claim → complete)",
 		],
 		parameters: agentParameters,
@@ -178,7 +245,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 			return {
 				descriptions: {
 					Agent:
-						"Spawn/delegate a named, colored specialist teammate. When the user asks to spawn subagents/teammates, delegate, or work in parallel, use Agent rather than doing all independent parts yourself, even if each part is short. Also consider parallel agents for independent research, implementation and review; avoid overlapping or trivial tasks. Every NEW spawn MUST include all four required fields — subagent_type, description, name, and color (a unique teammate name and a distinct #RGB or #RRGGBB color). Resume needs only resume and prompt and inherits the original name/color. Give each agent a bounded, self-contained prompt. In interactive sessions, a batch of detached launches ends this turn; the completion notification starts a new turn. Do not poll or call get_subagent_result(wait: true) for a passive background report; reserve it for explicit immediate dependencies. A teammate's progress message is not a completion signal: let the pending report arrive rather than waiting on it. Retained idle teammates accept send_message or a new assignment under the same name/color, not cold resume. A pinned model remains primary; authentication and fallback are checked before launch.\n\n" +
+						"Spawn/delegate a named, colored specialist teammate. When the user asks to spawn subagents/teammates, delegate, or work in parallel, use Agent rather than doing all independent parts yourself, even if each part is short. Also consider parallel agents for independent research, implementation and review; avoid overlapping or trivial tasks. Every NEW spawn MUST include all four required fields — subagent_type, description, name, and color (a unique teammate name and a distinct #RGB or #RRGGBB color). Resume needs only resume and prompt and inherits the original name/color. Give each agent a bounded, self-contained prompt. In interactive sessions, a batch of detached launches ends this turn; the completion notification starts a new turn. Do not poll or call get_subagent_result(wait: true) for a passive background report; reserve it for explicit immediate dependencies. A teammate's progress message is not a completion signal: let the pending report arrive rather than waiting on it. For named teammates, omitted context continues an idle retained context and starts fresh for new/released identities; explicit continue without idle context fails. Choose context: fresh explicitly to replace a verified-idle retained context, preserving role/name/color and archiving pending mailbox messages. Retired identities cannot be implicitly resurrected. Use teammate_status to inspect lifecycle state (busy includes queued) and availability/recoveryError; use teammate_release or teammate_retire only for settled teammates, leaving task-board claims unchanged. A pinned model remains primary; authentication and fallback are checked before launch.\n\n" +
 						`Use an exact canonical name from the live enabled catalog below. ` +
 						`Available agent types:\n${agents.length > 0 ? agents.join("\n") : "- (none)"}`,
 				},
@@ -240,6 +307,7 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 				timeout: params.timeout as number | undefined,
 				idle_timeout: params.idle_timeout as number | undefined,
 				run_in_background: params.run_in_background as boolean | undefined,
+				context: params.context as SpawnRequest["context"],
 			};
 
 			try {
@@ -360,7 +428,14 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 					...(settled.budgetSeconds !== undefined ? { budgetSeconds: settled.budgetSeconds } : {}),
 				});
 			} catch (error) {
-				return textResult(error instanceof Error ? error.message : String(error));
+				const message = error instanceof Error ? error.message : String(error);
+				return textResult(message, {
+					error: message,
+					...(typeof params.name === "string" ? { teammateName: params.name } : {}),
+					...(params.context === "fresh" ? { requestedContext: "fresh" } : {}),
+					recovery:
+						"Check teammate_status for current state/contextAvailable and recovery availability; explicit context: continue requires an idle retained context, while context: fresh replaces only a verified-idle retained context. Cold transcript resume of a named run requires explicit release.",
+				});
 			}
 		},
 	});
@@ -434,7 +509,25 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 		},
 	});
 
-	return [agentTool, getResultTool, steerTool];
+	const teammateStatusTool = defineTool({
+		name: "teammate_status",
+		label: "Teammate Status",
+		description:
+			"Inspect a named teammate's lifecycle state, recovery availability and live-context availability. State is idle, busy (including queued work), released, or retired. `contextAvailable` is true only for idle with a verified backend/handle and no recovery/unavailability; `currentRunId` names the live runtime owner, while `lastRunId` is the latest assignment artifact. Use this before deciding whether to continue, start fresh, message, release or retire. Lead-only tool.",
+		parameters: Type.Object({ name: Type.String({ description: "Exact teammate name (without @)." }) }),
+		execute: async (_id, args: { name: string }) => {
+			const status = manager.teammateStatus(args.name);
+			if (!status) return textResult(`Unknown teammate: ${args.name}`, { name: args.name, found: false });
+			return textResult(
+				`@${status.name}: ${status.state}; ${status.availability}; context ${status.contextAvailable ? "available" : "unavailable"}${status.currentRunId ? ` (live run ${status.currentRunId})` : ""}${status.lastRunId ? ` (last run ${status.lastRunId})` : ""}${status.recoveryError ? ` — ${status.recoveryError}` : ""}`,
+				{ ...status },
+			);
+		},
+	});
+	const teammateReleaseTool = createTeammateLifecycleTool(manager, "teammate_release");
+	const teammateRetireTool = createTeammateLifecycleTool(manager, "teammate_retire");
+
+	return [agentTool, getResultTool, steerTool, teammateStatusTool, teammateReleaseTool, teammateRetireTool];
 }
 
 /**

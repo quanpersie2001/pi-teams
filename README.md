@@ -26,7 +26,7 @@ https://github.com/user-attachments/assets/2f715c97-838d-461c-a6a2-7122ae26facf
 - **Session-owned runs** — other sessions never adopt or control a conversation's live runs. Session end/switch/shutdown tears children down (abort → bounded grace → verified force-kill); control-socket loss stops an orphan with an annotated partial result. Startup archives stale owned rows instead of re-adopting them; foreign-owner rows remain untouched.
 - **Workspace choice** — shared files by default, or opt-in Git worktrees with retained commits/checkouts and explicit cleanup.
 - **Extension integration** — signed peer mailboxes and public events RPC for consumers that own scheduling, retries, and review policy.
-- **Shared team board** — durable tasks, atomic self-claim and dependency unlocking; consumer scheduling, retries, acceptance and review remain outside the runtime.
+- **Unified Tasks** — session-scoped task records with typed requirements/context/outcomes, dependencies and execution-attempt history; completion is explicit and distinct from run settlement.
 
 ---
 
@@ -96,12 +96,20 @@ Children do not inherit the parent's conversation automatically. For change revi
 
 | Input | Action |
 |---|---|
-| `/agents` or **Alt+G** | Open the Main/children Team Hub |
+| `/agents` | Open the Team Hub on Agents |
+| `/tasks` | Open the Team Hub on Tasks |
+| **Alt+G** | Toggle the Team Hub; reopening uses its last tab (Agents initially) |
 | `/teams-backend [auto\|headless]` | Show or switch the launcher mode for this session (session-start value comes from settings/env) |
 | **Left twice within 500 ms** at Main's document start or from bottom navigation | Open Hub without losing the draft |
 | **Down** from empty Main | Enter the visible inline bottom navigation |
-| **Arrows / Enter** in navigation | Select / view a child |
-| **Enter** in the child composer | Assign an idle named teammate or cold-resume a settled session |
+| **Arrows / Enter** in the Agents Hub | Select / open a child |
+| **Tab / Shift+Tab** in the Hub | Switch between Agents and Tasks; these keys are owned by the Hub, not task forms |
+| **↑/↓, Enter, Esc** in Tasks | Select task / open or leave details / return from details or close Hub |
+| **n / e** in Tasks | Create task / edit a pending task |
+| **c / x / r / a** in Tasks | Claim or release / choose agent type and execute or retry / request review / enter outcome and accept completion |
+| **k / o / d / v** in Tasks | Stop attempt / read output / cancel pending task / view latest attempt |
+| **/** or **f** in Tasks | Search / filter tasks |
+| **Enter** in the child composer | Assign an idle named teammate/start fresh or cold-resume an explicitly released run |
 | **Esc** in a child view | Return without aborting |
 | **Alt+Left/Right / Alt+Up** with an empty child composer | Switch siblings / return to Main |
 | **Ctrl+X twice / Alt+O** with an empty child composer | Abort / open a verified live native pane |
@@ -114,25 +122,32 @@ HerdR/tmux's six-child threshold counts every live runtime-owned child, includin
 
 | Tool | Purpose |
 |---|---|
-| `Agent` | Launch a specialist with an explicit assignment — optionally `name:` it a teammate of this session's team (`@name` becomes its messaging/board address; a name is refused while that teammate is still working, and a settled name means a new assignment for the same teammate) — or resume a settled run by `resume` run ID |
+| `Agent` | Launch a specialist with an explicit assignment — optionally `name:` it a teammate of this session's team (`@name` becomes its messaging/board address; a name is refused while busy, and role/name/color stay fixed). For named teammates, omitted context continues an idle retained child and starts fresh for a new/released identity; explicit `context: "continue"` requires an idle retained context, while `context: "fresh"` explicitly replaces one after verified idle close. `resume` with a settled run ID is separate transcript recovery and requires explicit release for a named teammate. |
+| `teammate_status` | Inspect lifecycle state (`idle`, `busy` including queued work, `released`, `retired`), recovery availability, `contextAvailable`, live `currentRunId` and artifact `lastRunId` |
+| `teammate_release` | Release a settled teammate's retained native child/context; idempotent and does not change task-board claims |
+| `teammate_retire` | Retire a settled identity; idempotent, cannot be implicitly resurrected, and leaves board claims unchanged |
 | `list_models` | Resolve a model reference before spawning: optional `query` (string) and `limit` (number) return up to `limit` (default 50) matching `provider/id — display name` rows sorted canonically, plus the total match count |
 | `get_subagent_result` | Read a run's durable full result from `result.md`; use `wait: true` only when the current turn explicitly needs the answer immediately, not for passive background completions |
 | `steer_subagent` | Send guidance to an active run |
-| `send_message` | Send `{ target, message }` through a signed peer mailbox. A teammate addresses another teammate or the lead; the lead addresses teammates only, so `target: "lead"` is refused |
-| `team_task_create` | Create `{ title, description?, dependencies? }` in the current team's board |
-| `team_task_update` | Claim a pending task (`in_progress`), release your own claim (`pending`) or complete it (`completed`) |
-| `team_task_edit` | Replace a task's description with `{ id, description }`; only a pending task can be edited, so release a claim first |
-| `team_task_cancel` | Cancel a task by `{ id }`; only a pending task can be cancelled (release a claim first), and it is refused while another task depends on it |
-| `team_task_list` | List current-team tasks with their current `blockedBy` dependency IDs |
-| `team_task_get` | Read one current-team task by ID |
+| `send_message` | Queue `{ target, message }` through a signed peer mailbox. Teammates may address peers or lead; lead may address teammates only. Released, retired, and unavailable recipients are rejected; queued is not delivered. |
+| `tasks_create` | Create a session task with typed requirements/context, dependencies, optional review request and optional `executionPlan` |
+| `tasks_list` | List session tasks and derived blockers |
+| `tasks_get` | Read a task, its outcome and attempt history |
+| `tasks_update` | Edit pending requirements/plan or explicitly claim/release/request review/accept completion |
+| `tasks_cancel` | Cancel an eligible pending task |
+| `tasks_execute` | Execute an unblocked pending or claimed task through the existing AgentManager |
+| `tasks_output` | Read output from the latest execution attempt |
+| `tasks_stop` | Stop a running attempt; does not complete the task |
 
-Named teammates stay alive while idle, but their multiplexer panes close. A new assignment under the same name reuses its native child and specialist role and reopens its pane when presentation is eligible; mailbox messages start an assignment when idle or steer the active turn. The bridge watches its inbox automatically—models never poll. In the main composer, `@name message` routes directly to a live teammate; unresolved mentions retain normal inline behavior.
-`Agent(name: "review-api", color: "#e879f9")` sets a required creation-time color for model-facing spawns (`#RGB` or `#RRGGBB`). Identity is stored in the team roster, not agent frontmatter. Later `Agent` assignments must pass the same color (the roster preserves it); attempts to change it fail before model admission. Native viewers and companion renderers receive the effective name/color; cold continuation never automatically restores another team's identity.
-A named teammate's settled child is normally retained while idle. To continue its live conversation, `send_message` to the teammate or give it a new `Agent` assignment under the same name/color. Cold `Agent(resume: ...)` requires explicit release of the retained child first; do not release merely to deliver a peer reply.
+Named teammates stay alive while idle, but their multiplexer panes close. When context is omitted, an idle retained child continues; a new or released identity starts fresh. Explicit `context: "continue"` requires an idle retained child and fails without one. Explicit `context: "fresh"` closes a verified-idle retained child and starts a new session without changing role/name/color. Pending mailbox files for that teammate are archived with a reset reason before successful release, retirement, or fresh-context replacement; they are never replayed into a fresh session. `busy` includes queued work. Teammate lifecycle state is separate from recovery availability. `contextAvailable` is true only for idle teammates with a verified backend/handle and no runtime or roster unavailability; `currentRunId` identifies the live runtime owner, while `lastRunId` identifies the latest assignment artifact and may remain after release. Use `teammate_status` before lifecycle actions. `send_message` queues for eligible idle or busy recipients; released, retired, and unavailable recipients are refused. A queued receipt is not delivery confirmation. Bridges watch mailboxes automatically—models never poll. In the main composer, `@name message` routes to an eligible teammate; unresolved mentions retain normal inline behavior.
+`Agent(name: "review-api", color: "#e879f9")` sets creation-time identity (`#RGB` or `#RRGGBB`). Identity is stored in the team roster, not agent frontmatter. Later assignments preserve role and color. `teammate_release` frees retained execution/context; released teammates start fresh by default, while explicit `context: "continue"` fails. `teammate_retire` prevents future assignment under that identity. Neither lifecycle operation changes task-board claims.
+Cold `Agent(resume: ...)` is distinct: it starts a new run from persisted transcript after release; it does not restore a live teammate handle or automatically bind another team's mailbox/board context.
 
-Mailboxes use one owner-only, HMAC-signed file per message under `.pi/teams/t/<team-id>/inboxes/<name>/`. Invalid entries are quarantined with a warning. Messages are untrusted content and cannot approve permissions. Files are consumed only after native injection; they survive runtime reload as artifacts, but never revive a stopped session's children.
+Mailboxes use one owner-only, HMAC-signed file per message under `.pi/teams/t/<team-id>/inboxes/<name>/`. Invalid entries are quarantined with a warning. Messages are untrusted content and cannot approve permissions. Files are consumed only after native injection; they survive ordinary reload as artifacts, but pending entries are archived for that teammate on successful release, retirement, fresh-context replacement, or cold resume. A queued receipt is not delivery confirmation.
 
-The lead and named teammates share `.pi/teams/t/<team-id>/tasks/<id>.json`. Files are atomic and owner-only; exclusive lock directories serialize competing claims. A dependency remains `pending` until claimed, but completing its prerequisites removes its blockers immediately. Only the claimant can release or complete a task; completed tasks are terminal. A new session binds tools to its own team, and cold continuation never receives an old team's mailbox or board context.
+The session-scoped unified Tasks board stores atomic owner-only task records. Tasks include typed spec/context/outcome, optional execution plan and attempt history; `Task` remains distinct from each referenced `AgentRun`. Claiming is explicit, execution does not accept completion, and only explicit owner/coordinator acceptance completes. Stopping an attempt does not complete the task. The Tasks Hub provides list/detail, search/filter and task actions; create/edit prompts cover title, description, scope paths/out-of-scope paths, constraints, expected output, acceptance criteria, dependencies, context background/decisions/references (references entered as JSON), assignee and review requirement. Completion prompts collect summary, artifacts, verification JSON and remaining issues. The optional root `executionPlan` (`type`, `name?`, `color?`, `model?`, `maxTurns?`) is tool-only and is accepted only by `tasks_create`/`tasks_update`, not `tasks_execute`; `tasks_update { executionPlan: null }` clears it on a pending task. An empty `expectedOutput` is a valid spec patch. The board does not survive as a cross-session workflow.
+
+Optional automation is configured with `tasks: { "autoCascade": false, "reminders": false }` in `.pi/teams.json` or `~/.pi/agent/teams.json`. Cascade runs only for explicitly planned pending dependencies after a newly observed accepted completion (including peer board-service updates; no startup replay). Automation reservation atomically validates the captured requirement revision and `expectedStatus: "pending"` before mutation, so stale automation cannot overwrite a manual claim; manual `tasks_execute` is unchanged. A mismatch (including while waiting to reserve) skips launch before spawn without owner/attempt mutation and clears dedupe without immediate rescheduling. Each planned task is launched at most once per service; only typed reservation-lock conflicts are retried before launch (bounded 100/250/500 ms), never spawn failures, and retry exhaustion clears dedupe for a later completion trigger. Reminders are lead-only, bounded, every four turns, and reset by `tasks_*` tool results. Both are off by default. The task implementation contains no copied external content.
 
 ---
 
@@ -232,7 +247,7 @@ Use the packaged [`create-agent` skill](skills/create-agent/SKILL.md), adapted f
 /skill:create-agent Create a read-only database schema reviewer for this project
 ```
 
-The skill writes project specialists under `.pi/agents/` by default, selects minimal supported tools, and provides an invocation example. Start a new session or restart Pi after creating/changing definitions, then confirm the canonical type appears before dispatching. For delegating to spawned teammates — parallel runs, the shared task board, and recovery from failed `Agent`/`team_task` calls — use the packaged [`team-lead` skill](skills/team-lead/SKILL.md) (`/skill:team-lead`).
+The skill writes project specialists under `.pi/agents/` by default, selects minimal supported tools, and provides an invocation example. Start a new session or restart Pi after creating/changing definitions, then confirm the canonical type appears before dispatching. For delegating to spawned teammates — parallel runs, the shared task board, and recovery from failed `Agent`/`tasks_*` calls — use the packaged [`team-lead` skill](skills/team-lead/SKILL.md) (`/skill:team-lead`).
 
 ---
 
@@ -249,7 +264,7 @@ Worktree runs retain commits/checkouts for manual review and cherry-pick. Cleanu
 
 Cleanup refuses dirty/unpreserved changes and retains preserved branches. There is no automatic merge, cherry-pick, or force-prune. Worktrees isolate filesystems, not tools running as the same OS user.
 
-Anonymous children close after durable finalization; named teammates retain idle execution until explicit release or session teardown. Multiplexer panes close at native idle settlement and reopen on a new assignment without replacing retained workers or their context/style. Settled closed and idle rows leave the inline panel but remain in Hub history. Hub and inline rows show a compact name, description, elapsed time and token count. Uncertain cleanup stays visible and retains its receipt; cold resume requires persisted native history and starts a new execution process.
+Anonymous children close after durable finalization; named teammates retain idle execution until explicit release or session teardown. Multiplexer panes close at native idle settlement and reopen on a new assignment without replacing retained workers or their context/style. Settled closed and idle rows leave the inline Agents panel but remain in Hub history. Tasks render in a dedicated widget above the editor (eligible pending/in-progress/in-review only); terminal tasks disappear from that widget but remain in Hub history/read access. `/agents panel [show|hide|toggle]` (bare command toggles) hides/shows only inline Agents for the session; `agentInlinePanel` sets its startup default. Hub and inline rows show a compact name, description, elapsed time and token count. Uncertain cleanup stays visible and retains its receipt; cold resume requires persisted native history and starts a new execution process.
 
 ---
 
@@ -264,7 +279,7 @@ Anonymous children close after durable finalization; named teammates retain idle
 | [Architecture](docs/ARCHITECTURE.md) | Process boundaries, ownership, recovery, and layers |
 | [Changelog](CHANGELOG.md) | Product changes |
 
-This package owns specialist execution, not task orchestration. Scheduling, retries, dependencies, and review policy belong to consumers such as `pi-tasks`.
+First-party task workflow is session-scoped; cross-session scheduling is not delivered. The versioned events RPC remains compatibility for third-party consumers. Disable the separate legacy `pi-tasks` extension when using unified Tasks; its standalone workflow is not the unified board. Interactive manual TUI smoke testing remains pending.
 
 ---
 

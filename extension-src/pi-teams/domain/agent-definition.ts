@@ -1,7 +1,7 @@
 // Specialist agent definition contracts.
 //
 // A definition describes the worker (type, prompt, model policy, tool
-// allowlist), never the work — task priority/dependencies belong to pi-tasks.
+// allowlist), never the work — requirements/dependencies belong to Tasks.
 // A snapshot is the immutable resolved invocation captured at spawn time so
 // active runs survive agent-file reloads unchanged.
 

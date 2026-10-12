@@ -51,9 +51,20 @@ export function projectSettingsPath(configCwd: string): string {
  * of the keys contributed by both levels, fed to sanitizeSettings afterwards.
  */
 export function mergeSettings(global: unknown, project: unknown): Record<string, unknown> {
-	const merged: Record<string, unknown> = {};
-	if (typeof global === "object" && global !== null) Object.assign(merged, global);
-	if (typeof project === "object" && project !== null) Object.assign(merged, project);
+	const globalRecord = typeof global === "object" && global !== null ? (global as Record<string, unknown>) : {};
+	const projectRecord = typeof project === "object" && project !== null ? (project as Record<string, unknown>) : {};
+	const merged = { ...globalRecord, ...projectRecord };
+	if ("tasks" in globalRecord || "tasks" in projectRecord) {
+		const globalTasks =
+			typeof globalRecord.tasks === "object" && globalRecord.tasks !== null
+				? (globalRecord.tasks as Record<string, unknown>)
+				: {};
+		const projectTasks =
+			typeof projectRecord.tasks === "object" && projectRecord.tasks !== null
+				? (projectRecord.tasks as Record<string, unknown>)
+				: {};
+		merged.tasks = { ...globalTasks, ...projectTasks };
+	}
 	return merged;
 }
 

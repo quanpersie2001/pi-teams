@@ -1,12 +1,15 @@
 // Operational settings contract and pure sanitization.
 //
-// Exactly the thirteen accepted operational keys. Values are read from
-// ~/.pi/agent/teams.json (global) and <project>/.pi/teams.json
-// (overrides), then passed through sanitizeSettings before use.
+// Operational settings are read from ~/.pi/agent/teams.json (global) and
+// <project>/.pi/teams.json (project overrides), then sanitized before use.
+// Task automation toggles are nested under `tasks` and default off.
 
 import { MAX_BUDGET_SECONDS } from "./time-policy.js";
 
+export type TasksAutomationSettings = { autoCascade: boolean; reminders: boolean };
+
 export type SubagentsSettings = {
+	tasks: TasksAutomationSettings;
 	maxConcurrent: number;
 	defaultMaxTurns: number;
 	graceTurns: number;
@@ -21,6 +24,7 @@ export type SubagentsSettings = {
 	strictModelAdmission: boolean;
 	fallbackSubagent: string;
 	agentPanel: boolean;
+	agentInlinePanel: boolean;
 	/** Multiplexer mode: auto-detect (herdr → tmux → headless) or forced headless. */
 	backend: BackendMode;
 };
@@ -29,6 +33,7 @@ export const MIN_MAX_CONCURRENT = 1;
 export const MAX_MAX_CONCURRENT = 1024;
 
 export const DEFAULT_SUBAGENTS_SETTINGS: Readonly<SubagentsSettings> = {
+	tasks: { autoCascade: false, reminders: false },
 	maxConcurrent: 4,
 	defaultMaxTurns: 30,
 	graceTurns: 3,
@@ -41,6 +46,7 @@ export const DEFAULT_SUBAGENTS_SETTINGS: Readonly<SubagentsSettings> = {
 	strictModelAdmission: true,
 	fallbackSubagent: "none",
 	agentPanel: true,
+	agentInlinePanel: true,
 	backend: "auto",
 };
 
@@ -106,7 +112,12 @@ function budgetOrZero(value: unknown): number {
  */
 export function sanitizeSettings(raw: unknown): SubagentsSettings {
 	const source = toRecord(raw);
+	const tasks = toRecord(source.tasks);
 	return {
+		tasks: {
+			autoCascade: boolOr(tasks.autoCascade, DEFAULT_SUBAGENTS_SETTINGS.tasks.autoCascade),
+			reminders: boolOr(tasks.reminders, DEFAULT_SUBAGENTS_SETTINGS.tasks.reminders),
+		},
 		maxConcurrent: clampInt(
 			source.maxConcurrent,
 			DEFAULT_SUBAGENTS_SETTINGS.maxConcurrent,
@@ -127,6 +138,7 @@ export function sanitizeSettings(raw: unknown): SubagentsSettings {
 				? source.fallbackSubagent
 				: DEFAULT_SUBAGENTS_SETTINGS.fallbackSubagent,
 		agentPanel: boolOr(source.agentPanel, DEFAULT_SUBAGENTS_SETTINGS.agentPanel),
+		agentInlinePanel: boolOr(source.agentInlinePanel, DEFAULT_SUBAGENTS_SETTINGS.agentInlinePanel),
 		backend: backendModeOr(source.backend),
 	};
 }

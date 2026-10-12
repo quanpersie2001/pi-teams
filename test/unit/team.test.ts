@@ -48,7 +48,7 @@ describe("upsertMember", () => {
 		expect(first.members).toHaveLength(1);
 		expect(first.members[0]).toMatchObject({ name: "scout", type: "scout", lastRunId: "run-1" });
 
-		const second = upsertMember(first, { name: "scout", type: "explore", runId: "run-2", at: 20 });
+		const second = upsertMember(first, { name: "scout", type: "scout", runId: "run-2", at: 20 });
 		expect(second.members).toHaveLength(1);
 		expect(second.members[0]).toMatchObject({
 			name: "scout",
@@ -58,6 +58,9 @@ describe("upsertMember", () => {
 		});
 		// Input roster untouched (pure).
 		expect(first.members[0]?.lastRunId).toBe("run-1");
+		expect(() => upsertMember(first, { name: "scout", type: "explore", runId: "run-3", at: 30 })).toThrow(
+			/keeps its specialist role/,
+		);
 	});
 	it("freezes member identity color across assignments", () => {
 		const created = ensureMemberIdentity(roster(), { name: "scout", type: "scout", color: "#abcdef" }, 5);

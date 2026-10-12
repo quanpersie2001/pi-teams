@@ -131,7 +131,17 @@ export interface RpcRequest {
 /** RPC reply envelope — success carries optional data, failure an error string. */
 export type RpcReply<T = void> = { success: true; data?: T } | { success: false; error: string };
 
-export type SubagentsRpcOp = "ping" | "spawn" | "status" | "steer" | "stop" | "resume" | "release";
+export type SubagentsRpcOp =
+	| "ping"
+	| "spawn"
+	| "status"
+	| "steer"
+	| "stop"
+	| "resume"
+	| "release"
+	| "teammate_status"
+	| "teammate_release"
+	| "teammate_retire";
 
 export const SUBAGENTS_RPC_OPS: readonly SubagentsRpcOp[] = [
 	"ping",
@@ -141,6 +151,9 @@ export const SUBAGENTS_RPC_OPS: readonly SubagentsRpcOp[] = [
 	"stop",
 	"resume",
 	"release",
+	"teammate_status",
+	"teammate_release",
+	"teammate_retire",
 ];
 
 /** Request channel for an RPC operation. */

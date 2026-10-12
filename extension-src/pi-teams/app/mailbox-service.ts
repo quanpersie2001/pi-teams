@@ -8,7 +8,7 @@
 // not node built-ins).
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { MailboxMessage } from "../domain/mailbox.js";
 import { isMailboxAddress, MAILBOX_TEXT_MAX_CHARS, parseMailboxMessage } from "../domain/mailbox.js";
@@ -85,6 +85,30 @@ export class MailboxService {
 			}
 			this.warn(`mailbox write to ${target} failed: ${error instanceof Error ? error.message : String(error)}`);
 			return { delivered: false, error: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	/** Archive pending entries for this participant so a replacement context cannot replay them. */
+	async discardPending(
+		participant: string,
+		reason: "release" | "retire" | "fresh" | "context-reset" = "context-reset",
+	): Promise<void> {
+		if (!isMailboxAddress(participant)) throw new Error("invalid mailbox participant address");
+		const mailbox = this.mailboxOf(participant);
+		let entries: string[];
+		try {
+			entries = readdirSync(mailbox).filter((name) => name.endsWith(".json"));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		if (entries.length === 0) return;
+		const archiveDir = join(mailbox, "archive");
+		mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+		chmodSync(archiveDir, 0o700);
+		for (const entry of entries) {
+			const archived = `${Date.now()}-${reason}-${entry}`;
+			renameSync(join(mailbox, entry), join(archiveDir, archived));
 		}
 	}
 

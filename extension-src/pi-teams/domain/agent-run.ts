@@ -1,8 +1,8 @@
 // AgentRun domain model and lifecycle state machine.
 //
 // AgentRun is the execution record of one specialist invocation. It contains no
-// task-domain fields (title, dependencies, priority, acceptance criteria) —
-// those belong to pi-tasks, which maps its Task state onto these statuses.
+// task requirements, dependencies or acceptance criteria — those belong to
+// the unified Tasks domain, which links runs through execution attempts.
 
 import type { AgentBackendHandle } from "./backend.js";
 import type { AgentOwner, DeliveryPolicy, ParentSessionRef } from "./delivery.js";

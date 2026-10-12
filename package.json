@@ -21,6 +21,7 @@
 		"agent-runtime"
 	],
 	"pi": {
+		"image": "https://raw.githubusercontent.com/quanpersie2001/pi-teams/main/assets/preview.png",
 		"extensions": [
 			"./extension-src/pi-teams/pi/index.ts"
 		],

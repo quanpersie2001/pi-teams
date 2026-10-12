@@ -20,18 +20,25 @@ Canonical vocabulary for docs, ADRs, tools and UI copy. One entity, four layers 
 - **Team** — session-scoped set: lead + teammates + roster + mailboxes + board. One team per session.
 - **Roster** — `.pi/teams/t/<team-id>/config.json` members list; how participants discover each other.
 - **Mailbox** — per-participant message directory `.pi/teams/t/<team-id>/inboxes/<name>/`, one file per message. The replacement for the removed in-memory "scoped inbox" — do not say "inbox" in new prose.
-- **Board task** — a `.pi/teams/t/<team-id>/tasks/<id>.json` coordination item (`pending | in_progress | completed` + deps) claimed via `team_task_*` tools. Deliberately distinct from **Task** (capital T): the durable entity owned by `pi-tasks`.
+- **Task** — the session-scoped unified work entity managed by `tasks_*`; carries typed spec/context/outcome and attempts. Distinct from **AgentRun**, which executes an attempt and has its own lifecycle.
 - **Idle notification** — the runtime-authored `teammate-notification` push to the lead when a teammate finishes (turn settles): preview + `resultFile` pointer. Lead-only.
 
 ## Addresses and identifiers
 
 - **Specialist type** — definition name; selects the role at spawn (`subagent_type`).
-- **Teammate name** — the team-unique address: mailbox path segment, `send_message` target, `@name` composer mention, board actor. Not the definition name.
+- **Teammate name** — the team-unique address: mailbox path segment, `send_message` target, `@name` composer mention, board actor. Not the definition name. Role/name/color are fixed for the identity.
+- **Teammate lifecycle state** — `idle | busy | released | retired`; busy includes queued work. State describes the retained teammate lifecycle, not the run-result status.
+- **Teammate availability** — `available | unavailable` plus optional `recoveryError`, separate from lifecycle state. Legacy roster entries without availability are treated as available. `contextAvailable` is true only when idle, backend/handle are verified by runtime ownership checks, and there is no runtime/roster unavailability; it is not a process-liveness poll/proof.
+- **Continue context** — named-teammate assignment reusing an idle retained child/session. With omitted policy it is the default only when idle context exists; explicit `continue` without one fails.
+- **Fresh context** — default for a new/released teammate without a retained child, or an explicit replacement of a verified-idle child with a new session under the same identity; pending mailbox messages for that teammate are archived with a reset reason, not replayed.
+- **Live run id** (`currentRunId`) — runtime-owned current execution for a teammate; absent after release. Distinct from `lastRunId`, which identifies the latest assignment artifact and may persist after release.
+- **Cold resume** — persisted transcript recovery into a new run after explicit release of a retained teammate context; retired identities cannot be resumed/reassigned. Distinct from live context continuation.
+- **Queued mailbox receipt** — confirmation that a signed message file was enqueued, not that native injection/delivery completed.
 - **Run id** — `AgentRun` identifier (`Task-7`); `get_subagent_result`/resume key.
 
 ## Verbs
 
-- **Spawn** — admit and launch a run. **Steer** — mid-run guidance to a child. **Settle** — reach the native terminal state (`agent_settled` owns settlement). **Teardown** — session-end shutdown of all children (graceful + preserve, ADR 0007). **Cold resume** — reopen a settled run's persisted JSONL in a new child; an artifact action, never re-adoption.
+- **Spawn** — admit and launch a run. **Steer** — mid-run guidance to a child. **Settle** — reach the native terminal state (`agent_settled` owns settlement). **Release teammate** — dispose a settled teammate's retained live context and archive its pending mailbox messages with a reset reason; does not change board claims. **Retire teammate** — release plus prevent future implicit reuse. **Teardown** — session-end shutdown of all children (graceful + preserve, ADR 0007). **Cold resume** — reopen a settled run's persisted JSONL in a new child; an artifact action, never re-adoption.
 
 ## Legacy terms
 

@@ -2,7 +2,7 @@
 
 ## 1. Agent definitions
 
-A definition describes a specialist, not a Task. Put task priority, dependencies, acceptance criteria and retry policy in the consumer's assignment prompt, not the agent file.
+A definition describes a specialist, not a Task. Define work requirements and context on session-scoped Tasks with `tasks_create`; agent definitions continue to describe execution roles.
 
 Bundled specialists:
 
@@ -83,7 +83,7 @@ Public `Agent`/spawn RPC expose only their documented inputs; internal invocatio
 
 Model admission first tries the resolved primary. If it cannot resolve a native model/auth, it tries the caller model ignored by a pin, captured parent model, then authenticated native candidates in stable `provider/id` order — unless the primary is a model requested explicitly in the invocation (`Agent`'s `model`) and `strictModelAdmission` is on (default), in which case an ambiguous request fails admission listing the candidate models and an unregistered request fails admission naming the reference, instead of falling back. A definition/agent-file pin is not subject to strict admission and keeps this fallback. With neither a pin nor invocation model, the parent model is primary. No usable model rejects before run ID, queue slot, worktree or child/pane creation.
 
-Pass model references canonically as `provider/modelId` — to `Agent`, in a definition `model` pin, or wherever a model is requested. A bare name is accepted only while it resolves to exactly one registered model: `glm-5.3-flash` exists in five providers (`opencode`, `opencode-go`, `radius`, `zai`, `zai-coding-cn`), so requesting it is ambiguous, whereas `zai/glm-5.3-flash` resolves exactly. Resolve a reference with the read-only `list_models` tool before spawning. With `strictModelAdmission` on (default), an ambiguous model passed in the invocation (`Agent`'s `model`) fails admission listing the candidate models, and an unregistered one fails admission with a distinct message naming the reference, instead of falling back; a definition/agent-file pin is unaffected and still falls back with a recorded note, as does a model that resolves but has no usable authentication. See [Operational settings](#5-operational-settings).
+Pass model references canonically as `provider/modelId` — to `Agent`, in a definition `model` pin, or wherever a model is requested. A bare name is accepted only while it resolves to exactly one registered model: `glm-5.3-flash` exists in five providers (`opencode`, `opencode-go`, `radius`, `zai`, `zai-coding-cn`), so requesting it is ambiguous, whereas `zai/glm-5.3-flash` resolves exactly. Use the read-only `list_models` tool to query the current Pi session's `/models` list before spawning (it does not list the entire registered catalog). With `strictModelAdmission` on (default), an ambiguous model passed in the invocation (`Agent`'s `model`) fails admission listing the candidate models, and an unregistered one fails admission with a distinct message naming the reference, instead of falling back; a definition/agent-file pin is unaffected and still falls back with a recorded note, as does a model that resolves but has no usable authentication. See [Operational settings](#5-operational-settings).
 
 Admission uses the native child's `ModelRuntime`, `models.json` and `auth.json` in Pi's agent directory. Catalog refresh is offline; native auth may refresh OAuth. This does **not** check provider availability, remote key acceptance, billing or quota. Launch rechecks after queueing and the child guards dispatch. `model` and optional `modelFallback` in replies/status/lifecycle/history describe the actual selection.
 
@@ -121,6 +121,7 @@ Defaults:
 
 ```json
 {
+  "tasks": { "autoCascade": false, "reminders": false },
   "maxConcurrent": 4,
   "defaultMaxTurns": 30,
   "defaultTimeout": 0,
@@ -133,12 +134,15 @@ Defaults:
   "strictModelAdmission": true,
   "fallbackSubagent": "none",
   "agentPanel": true,
+  "agentInlinePanel": true,
   "backend": "auto"
 }
 ```
 
 | Setting | Behavior |
 |---|---|
+| `tasks.autoCascade` | Default `false`. Enables microtask-deferred cascade after accepted task completion, for pending dependents with an explicit `executionPlan` and no remaining blockers. Only dependents whose prerequisites include a newly completed task ID/code are considered; prior completions are not replayed at startup. Execution uses normal TaskExecutionService admission and launches each planned task at most once per service. Only typed reservation-lock conflicts get bounded async retries (100/250/500 ms) before launch; spawn failures are not retried. Teardown cancels queued cascade/retry work before freezing task-execution admissions and shutting down children. |
+| `tasks.reminders` | Default `false`. Enables a hidden transient lead-context summary every four lead turns; any `tasks_*` tool result resets the cadence. Relevant tasks are unassigned/lead-assigned pending, lead-owned in-progress, or review-requested in-review. Summaries are limited to 10 items / 1,700 serialized JSON characters; no reminder is added when none are relevant. Children do not receive reminders. |
 | `maxConcurrent` | One active-run capacity for foreground and background; excess runs queue. Floored/clamped to 1–1024. |
 | `defaultMaxTurns` | Default turn limit when not pinned/requested; `0` means unlimited. Floored/clamped to >=0. |
 | `defaultTimeout` | Default whole-run budget in seconds for runs without an invocation/definition budget; `0` means unlimited (default). Negative values clamp to `0`; positive non-integers are invalid and fall back to `0`; values above 2147483 clamp to that cap. |
@@ -150,7 +154,8 @@ Defaults:
 | `strictAgentFiles` | Strict mode fails loading on malformed files or validated invalid fields, naming the source path. Lenient mode skips unreadable/unparseable files, but corrects invalid fields with warnings while retaining the specialist. |
 | `strictModelAdmission` | Default `true`. A model passed explicitly in the spawn invocation (`Agent`'s `model`) must resolve to exactly one registered native model; an ambiguous invocation reference fails admission with an error listing the sorted candidate models, and an unregistered one fails admission with a distinct message naming the reference and no candidates, instead of falling back to the parent's model. A model pinned in a definition/agent-file is unaffected: it keeps its documented fallback to the caller/definition/parent model with a recorded note. Auth-based fallback is unaffected too: a model that resolves but has no usable authentication still falls back with a recorded note. With `false`, the old behavior is restored for the invocation `model` as well: fall back to the caller/definition/parent model and record `Model fallback: ...` in the agent result. |
 | `fallbackSubagent` | Specialist name to use when requested type is unknown/disabled/ambiguous; `none` rejects. Empty/mistyped values default to `none`. |
-| `agentPanel` | Enables inline panel, Hub and remote child focus; no effect on lifecycle or automatic cleanup. |
+| `agentPanel` | Legacy master switch for all Team UI: inline Agents, inline Tasks, Hub and remote child focus. Setting it to `false` disables broader UI; it is not an inline-only switch. No effect on lifecycle or automatic cleanup. |
+| `agentInlinePanel` | Default `true`. Enables only the inline Agents panel at session startup; Tasks inline rendering remains independently available. `/agents panel [show|hide|toggle]` overrides Agents visibility for the current session only (no argument toggles); it does not persist to `teams.json`. Configure this key to change the startup default. |
 | `backend` | Presentation mode: `auto` (default) detects HerdR → tmux, otherwise no viewer; `headless` never attaches a multiplexer. Execution always uses independent native SDK workers. Explicit `herdr`/`tmux` forcing is env-only. `/teams-backend [auto\|headless]` switches selection for future children in the current session. |
 
 Both settings files are read at each `session_start`, merged per key (`project > global`), then sanitized. Missing/unreadable files contribute nothing; corrupt JSON warns and contributes nothing. Unknown keys are dropped and mistyped values use built-in defaults. Project values are not sanitized independently before overriding global values. The runtime only reads these files; operators own edits.

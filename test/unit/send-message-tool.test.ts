@@ -51,15 +51,33 @@ async function send(tool: SendTool, target: string, message: string): Promise<st
 	return first.text ?? "";
 }
 
-function leadTool(getMailbox: () => MailboxService | undefined, names: readonly string[]): SendTool {
+function leadTool(
+	getMailbox: () => MailboxService | undefined,
+	names: readonly string[],
+	getStatus?: (name: string) =>
+		| {
+				state: "idle" | "busy" | "released" | "retired";
+				availability: "available" | "unavailable";
+				recoveryError?: string;
+		  }
+		| undefined,
+): SendTool {
 	return capturedTool((pi) => {
-		registerLeadSendMessageTool(pi, getMailbox, () => names);
+		registerLeadSendMessageTool(pi, getMailbox, () => names, getStatus);
 	});
 }
 
-function teammateTool(self: string, members: readonly string[]): SendTool {
+function teammateTool(
+	self: string,
+	members: readonly string[],
+	states: Record<string, { lifecycle?: string; availability?: string; recoveryError?: string }> = {},
+): SendTool {
 	const service = new MailboxService({ teamDir: root, teamKey: TEAM_KEY, self });
-	writeFileSync(join(root, "config.json"), JSON.stringify({ members: members.map((name) => ({ name })) }), "utf8");
+	writeFileSync(
+		join(root, "config.json"),
+		JSON.stringify({ members: members.map((name) => ({ name, ...states[name] })) }),
+		"utf8",
+	);
 	return capturedTool((pi) => {
 		pi.registerTool(createChildMailboxTool(service));
 	});
@@ -94,6 +112,35 @@ describe("lead send_message", () => {
 		]);
 	});
 
+	it("rejects released, retired and unavailable teammates without queueing", async () => {
+		const lead = new MailboxService({ teamDir: root, teamKey: TEAM_KEY, self: "lead" });
+		for (const state of ["released", "retired", "unavailable"] as const) {
+			const tool = leadTool(
+				() => lead,
+				["worker"],
+				() => ({
+					state: state === "unavailable" ? "idle" : state,
+					availability: state === "unavailable" ? "unavailable" : "available",
+					recoveryError: state === "unavailable" ? "worker cleanup uncertain" : undefined,
+				}),
+			);
+			const result = await tool.execute("call", { target: "worker", message: "hello" });
+			expect(result.content[0]?.text).toContain("Message not sent");
+			expect(result.details).toMatchObject({ queued: false });
+		}
+		expect(new MailboxService({ teamDir: root, teamKey: TEAM_KEY, self: "worker" }).receive()).toEqual([]);
+	});
+
+	it("still queues for busy teammates because messages wait for their active turn", async () => {
+		const lead = new MailboxService({ teamDir: root, teamKey: TEAM_KEY, self: "lead" });
+		const tool = leadTool(
+			() => lead,
+			["worker"],
+			() => ({ state: "busy", availability: "available" }),
+		);
+		expect(await send(tool, "worker", "hello")).toBe("Message queued for @worker.");
+	});
+
 	it("reports the underlying send failure verbatim", async () => {
 		const failing = {
 			send: () => ({ delivered: false, error: "mailbox is read-only" }),
@@ -117,5 +164,18 @@ describe("teammate send_message", () => {
 	it("refuses an address absent from the roster file", async () => {
 		const tool = teammateTool("worker", ["worker", "reviewer"]);
 		expect(await send(tool, "ghost", "hello")).toBe("Unknown teammate: ghost");
+	});
+
+	it("rejects released, retired and explicitly unavailable roster members", async () => {
+		for (const [name, state] of [
+			["released", { lifecycle: "released" }],
+			["retired", { lifecycle: "retired" }],
+			["uncertain", { availability: "unavailable", recoveryError: "cleanup uncertain" }],
+		] as const) {
+			const tool = teammateTool("worker", ["worker", name], { [name]: state });
+			const result = await tool.execute("call", { target: name, message: "hello" });
+			expect(result.content[0]?.text).toContain("Message not sent");
+			expect(result.details).toMatchObject({ queued: false });
+		}
 	});
 });

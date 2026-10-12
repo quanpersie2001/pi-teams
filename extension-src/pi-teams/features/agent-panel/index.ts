@@ -13,7 +13,7 @@ import type { AgentListRow, AgentListView } from "../../domain/ui-view.js";
 import { formatElapsedMs } from "../../shared/elapsed.js";
 import { statusBadge } from "../../shared/status.js";
 import { bindThemeFg, type ThemeFg } from "../../shared/theme.js";
-import { PANEL_PAGE_SIZE, type PanelSelection, selectionIndex } from "./panel-keys.js";
+import { hubRows, hubSelection, PANEL_PAGE_SIZE, type PanelSelection, selectionIndex } from "./panel-keys.js";
 
 /** Max agent rows rendered at once; extras collapse into "↓ N more" hints. */
 /** Alias kept for readability: the rendered window equals the paged jump. */
@@ -29,17 +29,16 @@ export const MAX_AGENT_ROWS = PANEL_PAGE_SIZE;
 export const HUB_SPLIT_MIN_WIDTH = 70;
 /** Roster share of the inner width once the Hub splits. */
 export const HUB_ROSTER_RATIO = 0.6;
-/** Body lines one Hub roster row occupies: the row itself plus its separator blank line. */
+/** Body lines one Hub roster row occupies: name/status plus description. */
 export const HUB_ROW_LINES = 2;
 
 /**
  * Roster rows the Hub can show at a given terminal height. Mirrors renderAgentHub:
- * one top border, one header line, one main row, one blank line after main, then
- * HUB_ROW_LINES per teammate row, keeping one line free for the "↓ N more" hint.
+ * top border, footer and bottom border, reserving two body lines for
+ * a window hint and the idle divider. Each teammate occupies two lines.
  */
 export function hubRosterCapacity(height: number): number {
-	const bodyEnd = Math.max(0, Math.floor(height) - 3);
-	return Math.floor(Math.max(0, bodyEnd - 4) / HUB_ROW_LINES);
+	return Math.floor(Math.max(0, Math.floor(height) - 5) / HUB_ROW_LINES);
 }
 
 /** Data the host hands the renderer at paint time (already immutable). */
@@ -178,6 +177,7 @@ export function createAgentListComponent(
 /** Hub-only data; never inferred from cumulative run usage. */
 export interface AgentHubData extends AgentPanelData {
 	focus: import("../../domain/ui-view.js").AgentFocusSnapshot | null;
+	activeTab?: "agents" | "tasks";
 }
 
 function compactTokens(value: number): string {
@@ -188,6 +188,8 @@ function compactTokens(value: number): string {
 
 function hubStatus(row: AgentListRow): string {
 	if (row.resourceState === "cleanup-unconfirmed") return "cleanup unconfirmed";
+	if (row.teammateAvailability === "unavailable") return "unavailable";
+	if (row.teammateState && row.teammateState !== "busy") return row.teammateState;
 	if (row.resourceState === "idle") return "idle";
 	return row.status;
 }
@@ -201,7 +203,11 @@ function hubIdentity(row: AgentListRow, label: string, fg: ThemeFg, fallback: "t
 function hubStatusColor(row: AgentListRow, fg: ThemeFg): string {
 	const status = hubStatus(row);
 	return fg(
-		status === "idle" ? "muted" : status === "cleanup-unconfirmed" ? "error" : statusBadge(row.status).color,
+		status === "idle" || status === "released" || status === "retired"
+			? "muted"
+			: status === "cleanup unconfirmed" || status === "unavailable"
+				? "error"
+				: statusBadge(row.status).color,
 		status,
 	);
 }
@@ -226,8 +232,9 @@ export function renderAgentHub(
 	const split = w >= HUB_SPLIT_MIN_WIDTH;
 	const rosterWidth = hubRosterWidth(w);
 	const detailWidth = split ? Math.max(0, inner - rosterWidth - 1) : inner;
-	const selected = selectionIndex(data.selection, data.view.rows) ?? 0;
-	const row = selected > 0 ? data.view.rows[selected - 1] : undefined;
+	const rows = hubRows(data.view.rows);
+	const selected = hubSelection(data.selection, rows);
+	const row = rows.find((row) => row.id === selected);
 	const targets = new Map<number, string>();
 	const lines: string[] = [];
 	const frame = (left: string, right = "") => {
@@ -236,49 +243,54 @@ export function renderAgentHub(
 			return clipped + " ".repeat(Math.max(0, size - visibleWidth(clipped)));
 		};
 		const body = split
-			? `${part(left, rosterWidth)}${fg("borderMuted", "│")}${part(right, detailWidth)}`
+			? `${part(left, rosterWidth)}${fg("accent", "│")}${part(` ${right}`, detailWidth)}`
 			: part(left, inner);
-		lines.push(truncateToWidth(`${fg("borderMuted", "│")}${body}${fg("borderMuted", "│")}`, w));
+		lines.push(truncateToWidth(`${fg("accent", "│")}${body}${fg("accent", "│")}`, w));
 	};
 	const border = (label = "") =>
 		truncateToWidth(
-			`${fg("borderMuted", "┌")}${label}${fg("borderMuted", `${"─".repeat(Math.max(0, inner - visibleWidth(label)))}┐`)}`,
+			`${fg("accent", "╭")}${label}${fg("accent", `${"─".repeat(Math.max(0, inner - visibleWidth(label)))}╮`)}`,
 			w,
 		);
-	lines.push(border(fg("accent", " Team Hub ")));
+	lines.push(
+		border(`${fg("accent", ` Team Hub (${rows.length}) `)}${fg("accent", "[Agents]")} ${fg("muted", "[Tasks]")} `),
+	);
 	if (h === 1) return { lines, targets };
 	const footerY = h - 2;
 	const bodyEnd = Math.max(0, h - 3);
 	const capacity = hubRosterCapacity(h);
-	const visibleCount = Math.min(capacity, data.view.rows.length);
-	const selAgent = Math.max(0, selected - 1);
-	const start = selAgent < visibleCount ? 0 : selAgent - visibleCount + 1;
+	const visibleCount = Math.min(capacity, rows.length);
+	const selAgent = Math.max(
+		0,
+		rows.findIndex((row) => row.id === selected),
+	);
+	const start = visibleCount === 0 || selAgent < visibleCount ? 0 : selAgent - visibleCount + 1;
 	const roster = new Map<number, string>();
-	roster.set(1, ` ${fg("text", `team (${data.view.rows.length})`)}${start > 0 ? fg("dim", ` · ↑ ${start} more`) : ""}`);
-	if (bodyEnd > 2) {
-		roster.set(
-			2,
-			`${selected === 0 ? fg("accent", "▸") : " "} ${fg(selected === 0 ? "text" : "muted", "main")}  ${fg("accent", "● running")}`,
-		);
-		targets.set(2, "main");
-	}
+	let y = 1;
+	if (start > 0) roster.set(y++, fg("dim", ` ↑ ${start} more`));
+	const idleCount = rows.filter((row) => row.resourceState === "idle").length;
+	let idleDivider = false;
 	for (let i = start; i < start + visibleCount; i++) {
-		const run = data.view.rows[i];
+		const run = rows[i];
 		if (!run) continue;
-		const y = 4 + HUB_ROW_LINES * (i - start);
+		if (run.resourceState === "idle" && !idleDivider) {
+			const label = `─ Idle (${idleCount}) `;
+			roster.set(y++, fg("borderMuted", label + "─".repeat(Math.max(0, rosterWidth - visibleWidth(label)))));
+			idleDivider = true;
+		}
 		const label = run.teammateName ? `@${run.teammateName}` : run.type;
-		const isSelected = selected === i + 1;
+		const isSelected = selected === run.id;
 		roster.set(
 			y,
-			`${isSelected ? hubIdentity(run, "▸", fg, "accent") : " "} ${hubIdentity(run, label, fg, isSelected ? "text" : "muted")}  ${hubStatusColor(run, fg)}${fg("dim", ` · ${run.description}`)}`,
+			`${isSelected ? fg("accent", "›") : " "} ${hubIdentity(run, label, fg, isSelected ? "text" : "muted")}  ${hubStatusColor(run, fg)}`,
 		);
+		roster.set(y + 1, fg("dim", `  ${run.description}`));
 		targets.set(y, run.id);
+		targets.set(y + 1, run.id);
+		y += HUB_ROW_LINES;
 	}
-	const hiddenBelow = data.view.rows.length - start - visibleCount;
-	if (hiddenBelow > 0 && visibleCount > 0) {
-		const hintY = 4 + HUB_ROW_LINES * visibleCount;
-		if (hintY <= bodyEnd) roster.set(hintY, fg("dim", ` ↓ ${hiddenBelow} more`));
-	}
+	const hiddenBelow = rows.length - start - visibleCount;
+	if (hiddenBelow > 0 && visibleCount > 0 && y <= bodyEnd) roster.set(y, fg("dim", ` ↓ ${hiddenBelow} more`));
 	const detail: string[] = [];
 	if (row) {
 		const focus =
@@ -298,6 +310,7 @@ export function renderAgentHub(
 		const contextColor = rawPercent < 70 ? "success" : rawPercent < 90 ? "warning" : "error";
 		const label = row.teammateName ? `@${row.teammateName}` : row.type;
 		detail.push(` ${hubIdentity(row, label, fg, "text")}  ${hubStatusColor(row, fg)}`);
+		if (row.teammateState) detail.push(` ${fg("muted", "Run outcome ")}${fg("text", row.status)}`);
 		detail.push(` ${fg("muted", "Model     ")}${fg("text", focus?.model ?? "unknown")}`);
 		detail.push(` ${fg("muted", "Thinking  ")}${fg("text", focus?.thinking ?? "unknown")}`);
 		detail.push(` ${fg("text", row.description)}`);
@@ -313,29 +326,30 @@ export function renderAgentHub(
 		if (data.stopArmedFor === row.id) detail.push(fg("error", " x again to ABORT"));
 		else if (row.resourceState === "cleanup-unconfirmed") detail.push(fg("error", " cleanup unconfirmed"));
 	} else {
-		detail.push(` ${fg("text", "main")}  ${fg("accent", "● running")}`);
 		detail.push(fg("muted", " Select an agent to see its details."));
 	}
 	if (split) {
 		for (let y = 1; y <= bodyEnd; y++) frame(roster.get(y) ?? "", detail[y - 1] ?? "");
 	} else {
-		// On narrow terminals only the selected agent's details follow the roster header.
+		// On narrow terminals show only the selected agent's details.
 		for (let y = 1; y <= bodyEnd; y++) {
-			if (y === 1) frame(roster.get(1) ?? "");
-			else frame(detail[y - 2] ?? "");
+			frame(detail[y - 1] ?? "");
 		}
 		targets.clear();
 	}
 	if (footerY >= 1) {
-		const hint = truncateToWidth(fg("dim", " ↑↓ select · Enter view · x stop/dismiss · Esc back · Alt+G close"), inner);
+		const hint = truncateToWidth(
+			fg("dim", " ↑↓ select · Enter view · Tab Tasks · x stop/dismiss · Esc back · Alt+G close"),
+			inner,
+		);
 		lines.push(
 			truncateToWidth(
-				`${fg("borderMuted", "│")}${hint}${" ".repeat(Math.max(0, inner - visibleWidth(hint)))}${fg("borderMuted", "│")}`,
+				`${fg("accent", "│")}${hint}${" ".repeat(Math.max(0, inner - visibleWidth(hint)))}${fg("accent", "│")}`,
 				w,
 			),
 		);
 	}
-	if (h >= 2) lines.push(truncateToWidth(fg("borderMuted", `└${"─".repeat(inner)}┘`), w));
+	if (h >= 2) lines.push(truncateToWidth(fg("accent", `╰${"─".repeat(inner)}╯`), w));
 	return { lines: lines.slice(0, h), targets };
 }
 
@@ -345,7 +359,6 @@ export function createAgentHubComponent(
 	getData: () => AgentHubData | null,
 	onInput: (data: string) => void,
 	onFocus: (runId: string) => void,
-	onMain: () => void,
 	onWheel: (delta: number) => void,
 	getNow: () => number = () => Date.now(),
 ): Component & Focusable {
@@ -367,8 +380,7 @@ export function createAgentHubComponent(
 			// Recompute mapping after selection/lifecycle changes, even before the next paint.
 			const target = renderAgentHub(data, fg, renderedWidth, tui.terminal.rows, getNow()).targets.get(event.y);
 			if (!target) return undefined;
-			if (target === "main") onMain();
-			else if (data.view.rows.find((row) => row.id === target)?.capabilities.viewable) onFocus(target);
+			if (data.view.rows.find((row) => row.id === target)?.capabilities.viewable) onFocus(target);
 			else return undefined;
 			return { handled: true, render: true };
 		},

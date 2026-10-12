@@ -42,7 +42,7 @@ import {
 	subagentsRpcReplyChannel,
 	toRunSnapshot,
 } from "../domain/integration-protocol.js";
-import type { AgentManager } from "./agent-manager.js";
+import type { AgentManager, TeammateStatus } from "./agent-manager.js";
 
 /** Extension id used as the default RPC-caller owner (the reference consumer). */
 export const PI_TASKS_EXTENSION_ID = "pi-tasks";
@@ -144,6 +144,12 @@ export class IntegrationService {
 					return { requestId, envelope: await this.handleResume(raw) };
 				case "release":
 					return { requestId, envelope: await this.handleRelease(raw) };
+				case "teammate_status":
+					return { requestId, envelope: this.handleTeammateStatus(raw) };
+				case "teammate_release":
+					return { requestId, envelope: await this.handleTeammateLifecycle(raw, "release") };
+				case "teammate_retire":
+					return { requestId, envelope: await this.handleTeammateLifecycle(raw, "retire") };
 				default:
 					return { requestId, envelope: rpcError(`unknown operation "${op}"`) };
 			}
@@ -154,11 +160,14 @@ export class IntegrationService {
 
 	// -- op handlers (each validates strictly, throws RpcFailure on bad input) --
 
-	private handlePing(raw: unknown): RpcReply<{ version: number }> {
+	private handlePing(raw: unknown): RpcReply<{ version: number; capabilities?: string[] }> {
 		parseRequest(raw, (payload) => {
 			optionalNumber(payload, "version"); // echoed by callers; tolerated absent
 		});
-		return rpcSuccess({ version: PROTOCOL_VERSION });
+		return rpcSuccess({
+			version: PROTOCOL_VERSION,
+			capabilities: ["teammate_status", "teammate_release", "teammate_retire", "spawn_context"],
+		});
 	}
 
 	private async handleSpawn(raw: unknown): Promise<RpcReply<{ id: string; model?: string; modelFallback?: string }>> {
@@ -171,9 +180,18 @@ export class IntegrationService {
 				optionalBoolean(options, "isBackground");
 				optionalNumber(options, "maxTurns");
 				optionalString(options, "model");
+				optionalString(options, "name");
+				optionalString(options, "color");
+				optionalString(options, "context");
+				if (options.name === "" || options.color === "")
+					throw new RpcFailure("options.name and options.color must be non-empty when present");
+				if (options.context !== undefined && options.context !== "continue" && options.context !== "fresh")
+					throw new RpcFailure('options.context must be "continue" or "fresh"');
+				if ((options.color !== undefined || options.context !== undefined) && options.name === undefined)
+					throw new RpcFailure("options.color and options.context require options.name");
 				// Wire shape uses isBackground; anything else in options is foreign.
 				for (const key of Object.keys(options)) {
-					if (!["description", "isBackground", "maxTurns", "model"].includes(key)) {
+					if (!["description", "isBackground", "maxTurns", "model", "name", "color", "context"].includes(key)) {
 						throw new RpcFailure(`unexpected option "${key}"`);
 					}
 				}
@@ -189,6 +207,23 @@ export class IntegrationService {
 			...(spawned.model !== undefined ? { model: spawned.model } : {}),
 			...(spawned.modelFallback !== undefined ? { modelFallback: spawned.modelFallback } : {}),
 		});
+	}
+
+	private handleTeammateStatus(raw: unknown): RpcReply<unknown> {
+		const payload = parseRequest(raw, (p) => requireString(p, "name"));
+		const status = this.manager.teammateStatus(payload.name as string);
+		return rpcSuccess(status ?? null);
+	}
+
+	private async handleTeammateLifecycle(raw: unknown, action: "release" | "retire"): Promise<RpcReply<TeammateStatus>> {
+		const payload = parseRequest(raw, (p) => requireString(p, "name"));
+		const name = payload.name as string;
+		const changed =
+			action === "release" ? await this.manager.releaseTeammate(name) : await this.manager.retireTeammate(name);
+		if (!changed) throw new Error(`Teammate "@${name}" was not found.`);
+		const status = this.manager.teammateStatus(name);
+		if (!status) throw new Error(`Lifecycle operation completed for "@${name}", but current status is unavailable.`);
+		return rpcSuccess(status);
 	}
 
 	private handleStatus(raw: unknown): RpcReply<AgentRunSnapshot | null> {
@@ -353,12 +388,23 @@ function payloadToRecord(payload: Record<string, unknown>): {
 	run_in_background?: boolean;
 	model?: string;
 	max_turns?: number;
+	name?: string;
+	color?: string;
+	context?: "continue" | "fresh";
 	owner?: AgentOwner;
 	delivery?: DeliveryPolicy;
 } {
 	const options =
 		payload.options !== undefined
-			? (payload.options as { description?: unknown; isBackground?: unknown; maxTurns?: unknown; model?: unknown })
+			? (payload.options as {
+					description?: unknown;
+					isBackground?: unknown;
+					maxTurns?: unknown;
+					model?: unknown;
+					name?: unknown;
+					color?: unknown;
+					context?: unknown;
+				})
 			: {};
 	const request: ReturnType<typeof payloadToRecord> = {
 		type: payload.type as string,
@@ -373,6 +419,11 @@ function payloadToRecord(payload: Record<string, unknown>): {
 	if (model !== undefined) request.model = model;
 	const maxTurns = numberOrUndefined(options, "maxTurns");
 	if (maxTurns !== undefined) request.max_turns = maxTurns;
+	const name = stringOrUndefined(options, "name");
+	if (name !== undefined) request.name = name;
+	const color = stringOrUndefined(options, "color");
+	if (color !== undefined) request.color = color;
+	if (options.context === "continue" || options.context === "fresh") request.context = options.context;
 
 	// Ownership defaults for RPC callers (docs/INTEGRATION.md): extension
 	// caller by construction → pi-tasks extension owner + "event" delivery.

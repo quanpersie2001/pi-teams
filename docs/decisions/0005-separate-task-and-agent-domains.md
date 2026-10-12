@@ -1,6 +1,8 @@
 # ADR 0005: Tách Task domain khỏi Subagent runtime
 
-- **Status:** Accepted (amended by [ADR 0007](./0007-session-bound-agent-teams.md): the runtime owns a session-scoped team coordination board and peer mailboxes; durable task management stays with `pi-tasks`)
+- **Status:** Superseded by [ADR 0009](./0009-unified-session-tasks.md) for task ownership (historical decision retained).
+
+> **Amendment:** ADR 0009 merges the first-party task workflow into pi-teams as session-scoped unified Tasks. The public integration RPC remains retained compatibility for third-party consumers.
 
 ## Context
 

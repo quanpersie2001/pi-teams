@@ -6,7 +6,10 @@ import { describe, expect, it } from "vitest";
 import {
 	activatePanel,
 	applyStopConfirm,
+	dispatchHubKey,
 	dispatchPanelKey,
+	hubRows,
+	hubSelection,
 	type PanelRowLike,
 	selectAtIndex,
 	selectionIndex,
@@ -119,5 +122,39 @@ describe("two-step stop confirmation", () => {
 		// x on a different row re-targets the arm instead of firing.
 		const retargeted = applyStopConfirm("run-1", "run-2", { confirm: true });
 		expect(retargeted).toEqual({ armedFor: "run-2", fire: false });
+	});
+});
+
+describe("Hub-only selection and navigation", () => {
+	const grouped = hubRows([
+		{ id: "idle", resourceState: "idle" },
+		{ id: "queued", status: "queued", resourceState: "pending" },
+		{ id: "failed", status: "error", resourceState: "closed" },
+		{ id: "running", status: "running", resourceState: "open" },
+	]);
+	it("opens on the first non-idle row, or the first idle row, and recovers vanished selections", () => {
+		expect(grouped.map((row) => row.id)).toEqual(["queued", "failed", "running", "idle"]);
+		for (const selection of [null, "main", "vanished"]) expect(hubSelection(selection, grouped)).toBe("queued");
+		expect(hubSelection(null, [{ id: "idle" }])).toBe("idle");
+		expect(
+			hubSelection(null, [
+				{ id: "failed", status: "error", resourceState: "closed" },
+				{ id: "idle", status: "completed", resourceState: "idle" },
+			]),
+		).toBe("idle");
+		expect(hubSelection(null, [])).toBeNull();
+		expect(dispatchHubKey(ENTER, null, [], 2)).toEqual({ kind: "unhandled" });
+	});
+	it("clamps arrows, wheel and Home at the first teammate, pages in grouped order", () => {
+		for (const key of [UP, HOME])
+			expect(dispatchHubKey(key, "queued", grouped, 2)).toEqual({ kind: "select", selection: "queued" });
+		expect(hubSelection("queued", grouped, -1)).toBe("queued");
+		expect(dispatchHubKey(DOWN, "running", grouped, 2)).toEqual({ kind: "select", selection: "idle" });
+		expect(dispatchHubKey(PAGE_DOWN, "queued", grouped, 2)).toEqual({ kind: "select", selection: "running" });
+		expect(dispatchHubKey(PAGE_UP, "idle", grouped, 2)).toEqual({ kind: "select", selection: "failed" });
+		expect(dispatchHubKey(END, "queued", grouped, 2)).toEqual({ kind: "select", selection: "idle" });
+		expect(dispatchHubKey(ENTER, "failed", grouped, 2)).toEqual({ kind: "enter", taskId: "failed" });
+		expect(dispatchHubKey("x", "idle", grouped, 2)).toEqual({ kind: "stop", taskId: "idle" });
+		expect(dispatchHubKey(ESC, "queued", grouped, 2)).toEqual({ kind: "clear" });
 	});
 });

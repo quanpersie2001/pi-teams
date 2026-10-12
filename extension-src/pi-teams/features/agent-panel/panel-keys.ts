@@ -99,6 +99,50 @@ export function dispatchPanelKey(
 	return { kind: "unhandled" };
 }
 
+/** Stable Hub order: non-idle rows first, retained idle resources last. */
+export function hubRows<T extends PanelRowLike & { resourceState: string }>(rows: readonly T[]): T[] {
+	return [...rows.filter((row) => row.resourceState !== "idle"), ...rows.filter((row) => row.resourceState === "idle")];
+}
+
+/** Hub navigation never visits the implicit Main row used by the inline panel. */
+export function hubSelection(
+	selection: PanelSelection,
+	rows: readonly (PanelRowLike & { status?: string; resourceState?: string })[],
+	delta = 0,
+): PanelSelection {
+	if (!rows.length) return null;
+	let index = rows.findIndex((row) => row.id === selection);
+	if (index < 0) {
+		index = rows.findIndex((row) => row.status === "queued" || row.status === "starting" || row.status === "running");
+		if (index < 0) index = rows.findIndex((row) => row.resourceState === "idle");
+		index = Math.max(0, index);
+	}
+	return rows[Math.max(0, Math.min(rows.length - 1, index + delta))]?.id ?? null;
+}
+
+export function dispatchHubKey(
+	data: string,
+	selection: PanelSelection,
+	rows: readonly PanelRowLike[],
+	pageSize: number,
+): PanelKeyAction {
+	if (matchesKey(data, "escape")) return { kind: "clear" };
+	for (const [key, delta] of [
+		["up", -1],
+		["down", 1],
+		["pageUp", -pageSize],
+		["pageDown", pageSize],
+	] as const) {
+		if (matchesKey(data, key)) return { kind: "select", selection: hubSelection(selection, rows, delta) };
+	}
+	if (matchesKey(data, "home")) return { kind: "select", selection: rows[0]?.id ?? null };
+	if (matchesKey(data, "end")) return { kind: "select", selection: rows.at(-1)?.id ?? null };
+	const target = hubSelection(selection, rows);
+	if (target && matchesKey(data, "return")) return { kind: "enter", taskId: target };
+	if (target && matchesKey(data, "x")) return { kind: "stop", taskId: target };
+	return { kind: "unhandled" };
+}
+
 /**
  * Two-step stop confirmation state: the first x arms the target, the second
  * confirms, any other target/key disarms. Pure so the table is testable.

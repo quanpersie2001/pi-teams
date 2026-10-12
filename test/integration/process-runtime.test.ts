@@ -99,7 +99,7 @@ async function localProvider(
 								index: 0,
 								id: `native-task-${requests.length}`,
 								type: "function",
-								function: { name: "team_task_create", arguments: JSON.stringify({ title: "Cold continuation task" }) },
+								function: { name: "tasks_create", arguments: JSON.stringify({ title: "Cold continuation task" }) },
 							},
 						],
 					}
@@ -988,24 +988,28 @@ describe("real process runtime", () => {
 
 	it("refuses stale disposal when the authenticated child PID disagrees with the launcher identity", async () => {
 		const provider = await localProvider({ holdFirst: true });
-		const original = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 15_000 });
+		const { launcher, exited } = observedHeadlessLauncher();
+		const original = new ProcessAgentExecutionBackend({ launchers: [launcher], connectTimeoutMs: 15_000 });
 		const disposer = new ProcessAgentExecutionBackend({ launcherHint: "headless", connectTimeoutMs: 2_000 });
 		let originalHandle: AgentBackendHandle | undefined;
+		let serialized: SerializableBackendHandle | undefined;
 		try {
 			originalHandle = await original.launch(launchInput("identity-mismatch", provider.cwd));
 			await provider.firstRequest;
-			const serialized = original.serializeHandle(originalHandle);
+			serialized = original.serializeHandle(originalHandle);
 			if (!serialized?.launcher.pid) throw new Error("Fixture launcher identity was not serializable");
 			original.detach(originalHandle);
 			const mismatched = { ...serialized, launcher: { ...serialized.launcher, pid: serialized.launcher.pid + 1 } };
 			await expect(disposer.disposePersisted(mismatched)).rejects.toThrow(/PID/);
 		} finally {
 			provider.releaseFirst();
-			if (originalHandle) {
-				// Releasing the provider is not the SDK's idle boundary.
-				const handle = originalHandle;
-				await vi.waitFor(() => original.dispose(handle), { timeout: 10_000 });
+			if (serialized) {
+				// Clean up only the fixture's verified original launcher identity.
+				// Reconnecting to poll idle can race detached-child self-termination.
+				await launcher.terminate(serialized.launcher);
+				await exited;
 			}
+			if (originalHandle) await original.dispose(originalHandle);
 		}
 	}, 60_000);
 	it("self-terminates a detached child through control-socket loss (ADR 0007)", async () => {
@@ -1367,6 +1371,134 @@ describe("real process runtime", () => {
 			expect(store.readHistory().every((entry) => !("handle" in entry))).toBe(true);
 		} finally {
 			await manager.dispose();
+		}
+	}, 60_000);
+
+	it("keeps, resets, releases, and retires native teammate contexts", async () => {
+		const provider = await localProvider();
+		const { launcher, launched, spawned } = observedHeadlessLaunchers();
+		const backend = new ProcessAgentExecutionBackend({ launchers: [launcher], connectTimeoutMs: 15_000 });
+		const settings = sanitizeSettings({ backgroundByDefault: true, worktreeIsolation: false });
+		const registry = new AgentRegistry({
+			sources: [],
+			loader: async () => [
+				{
+					sourcePath: join(provider.cwd, "worker.md"),
+					filenameStem: "worker",
+					frontmatter: { name: "worker", model: "local-test/local-model", tools: "none", max_turns: 1 },
+					body: "Use the local deterministic provider.",
+				},
+			],
+			settings,
+		});
+		await registry.load();
+		const team = new TeamService({
+			sessionId: "native-teammate-contexts",
+			store: createPiTeamStore(provider.cwd, "native-teammate-contexts"),
+		});
+		team.sessionStart();
+		const manager = new AgentManager({
+			registry,
+			settings,
+			backends: [backend],
+			cwd: provider.cwd,
+			configCwd: provider.cwd,
+		});
+		manager.setTeamService(team);
+		const prompts = [
+			"First assignment: retain context marker IRIS-21.",
+			"Continue the IRIS-21 work.",
+			"Start clean with marker MAPLE-84.",
+		];
+		try {
+			const first = await manager.spawn({ type: "worker", name: "native-worker", prompt: prompts[0] ?? "" });
+			expect((await manager.whenSettled(first.id))?.status).toBe("completed");
+			const firstChild = launched[0];
+			const firstSession = manager.get(first.id)?.sessionFile;
+			if (!firstChild || !firstSession) throw new Error("initial teammate child omitted its identity or session");
+			const firstPid = firstChild.handle.pid;
+			if (firstPid === undefined) throw new Error("initial teammate child omitted its PID");
+			expect(firstPid).toBeGreaterThan(0);
+			expect(firstPid).not.toBe(process.pid);
+			expect(manager.teammateStatus("native-worker")).toMatchObject({ state: "idle", availability: "available" });
+
+			const continued = await manager.spawn({
+				type: "worker",
+				name: "native-worker",
+				context: "continue",
+				prompt: prompts[1] ?? "",
+			});
+			expect((await manager.whenSettled(continued.id))?.status).toBe("completed");
+			expect(launched).toHaveLength(1);
+			expect(firstChild.handle.pid).toBe(firstPid);
+			process.kill(firstPid, 0);
+			expect(manager.get(continued.id)?.sessionFile).toBe(firstSession);
+			const continuation = JSON.parse(provider.requests[1] ?? "{}") as {
+				messages?: Array<{ role: string; content: unknown }>;
+			};
+			expect(continuation.messages?.some((message) => JSON.stringify(message.content).includes(prompts[0] ?? ""))).toBe(
+				true,
+			);
+			expect(
+				continuation.messages?.some((message) => JSON.stringify(message.content).includes("process-child-ok")),
+			).toBe(true);
+
+			const fresh = await manager.spawn({
+				type: "worker",
+				name: "native-worker",
+				context: "fresh",
+				prompt: prompts[2] ?? "",
+			});
+			expect((await manager.whenSettled(fresh.id))?.status).toBe("completed");
+			const freshChild = launched[1];
+			const freshSession = manager.get(fresh.id)?.sessionFile;
+			if (!freshChild || !freshSession) throw new Error("fresh teammate omitted its new child identity or session");
+			const freshPid = freshChild.handle.pid;
+			if (freshPid === undefined) throw new Error("fresh teammate child omitted its PID");
+			expect(freshPid).not.toBe(firstPid);
+			expect(freshChild.handle.childId).not.toBe(firstChild.handle.childId);
+			expect(freshSession).not.toBe(firstSession);
+			await firstChild.exited;
+			const freshRequest = JSON.parse(provider.requests[2] ?? "{}") as {
+				messages?: Array<{ role: string; content: unknown }>;
+			};
+			const freshMessages = JSON.stringify(freshRequest.messages ?? []);
+			expect(freshMessages).toContain(prompts[2]);
+			expect(freshMessages).not.toContain("IRIS-21");
+			expect(freshMessages).not.toContain(prompts[0] ?? "");
+
+			expect(await manager.releaseTeammate("native-worker")).toBe(true);
+			await freshChild.exited;
+			expect(freshChild.handle.pid).toBeGreaterThan(0);
+			expect(() => process.kill(freshPid, 0)).toThrow(/ESRCH/);
+			expect(manager.teammateStatus("native-worker")).toMatchObject({ state: "released", availability: "available" });
+
+			const afterRelease = await manager.spawn({
+				type: "worker",
+				name: "native-worker",
+				prompt: "New default context after release.",
+			});
+			expect((await manager.whenSettled(afterRelease.id))?.status).toBe("completed");
+			const defaultChild = launched[2];
+			const defaultSession = manager.get(afterRelease.id)?.sessionFile;
+			if (!defaultChild || !defaultSession) throw new Error("released teammate did not start a new default context");
+			const defaultPid = defaultChild.handle.pid;
+			if (defaultPid === undefined) throw new Error("post-release teammate child omitted its PID");
+			expect(defaultPid).not.toBe(freshPid);
+			expect(defaultSession).not.toBe(freshSession);
+
+			expect(await manager.retireTeammate("native-worker")).toBe(true);
+			await defaultChild.exited;
+			expect(() => process.kill(defaultPid, 0)).toThrow(/ESRCH/);
+			expect(manager.teammateStatus("native-worker")).toMatchObject({ state: "retired", availability: "available" });
+			await expect(
+				manager.spawn({ type: "worker", name: "native-worker", prompt: "A retired teammate cannot be assigned." }),
+			).rejects.toThrow(/retired/i);
+			expect(launched).toHaveLength(3);
+		} finally {
+			await manager.dispose();
+			await Promise.all(launched.map((child) => child.exited));
+			expect(spawned.every((child) => child.exitCode !== null || child.signalCode !== null)).toBe(true);
 		}
 	}, 60_000);
 

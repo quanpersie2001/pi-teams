@@ -3,7 +3,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { createAgentFocusPort } from "../app/focus-service.js";
 import { createPiSubagentsApp } from "../app/index.js";
+import { TaskAutomationService } from "../app/task-automation-service.js";
 import { TaskBoardService } from "../app/task-board-service.js";
+import { TaskExecutionService } from "../app/task-execution-service.js";
 import { WorktreeService } from "../app/worktree-service.js";
 import { DEFAULT_SUBAGENTS_SETTINGS } from "../domain/config.js";
 import { loadAgentMarkdownFiles, resolveAgentSourceDirs } from "./agent-files.js";
@@ -14,13 +16,15 @@ import { loadSubagentsSettings } from "./config-host.js";
 import { createPiDeliveryHost, installLeadMailbox } from "./delivery-host.js";
 import { registerModelTools } from "./model-tools.js";
 import { ProcessAgentExecutionBackend, resolveLauncherHint, resolveSessionLauncherHint } from "./process-backend.js";
-import { createSubagentRunStore } from "./registry-host.js";
+import { createSubagentRunStore, teamsArtifactDir } from "./registry-host.js";
 import { type SubagentsRpcWiring, wireSubagentsRpc } from "./rpc.js";
-import { createTeamTaskTools } from "./team-task-tools.js";
+import { summarizeRelevantTasks, TaskReminderCadence } from "./task-reminders.js";
+import { createTasksTools } from "./tasks-tools.js";
+import { eligibleTeammateNames, isTeammateMessageAvailable } from "./teammate-routing.js";
 import { createPiTeamStore } from "./teams-host.js";
 import { registerLeadSendMessageTool, registerSubagentTools } from "./tools.js";
 import { createPiTranscriptSource } from "./transcript-host.js";
-import { installSubagentsUi, type SubagentsUiHandle } from "./ui-host.js";
+import { installSubagentsUi, type SubagentsUiHandle, type TasksUiPort } from "./ui-host.js";
 import { createGitRunner, worktreeTmpRoot } from "./worktree-host.js";
 
 /** Parent extension. Children load only specialist tools and allowlisted presentation extensions. */
@@ -29,6 +33,7 @@ export default function (pi: ExtensionAPI): void {
 	const configCwd = process.cwd();
 	const agentDir = getAgentDir();
 	let latestCtx: ExtensionContext | undefined;
+	let currentTaskReminders = false;
 	const backend = new ProcessAgentExecutionBackend({
 		launcherHint: resolveLauncherHint(),
 		getParentExtensionPaths: () => [
@@ -67,27 +72,73 @@ export default function (pi: ExtensionAPI): void {
 	const transcripts = createPiTranscriptSource({ backends: [backend] });
 	let uiHandle: SubagentsUiHandle | undefined;
 	let board: TaskBoardService | undefined;
+	let taskExecution: TaskExecutionService | undefined;
+	let taskAutomation: TaskAutomationService | undefined;
+	let reminderCadence = new TaskReminderCadence();
 	let closeLeadMailbox: (() => void) | undefined;
 	let stopMentionRouting: (() => void) | undefined;
 	let rpc: SubagentsRpcWiring | undefined;
+	const getAvailableTeammateNames = () =>
+		eligibleTeammateNames(app.teams?.current?.members ?? [], (name) => app.manager.teammateStatus(name));
 	// No message renderer is registered: the teammate-notification customType
 	// plus its structured plain-text content IS the renderer contract exported
 	// for pi-style companions (docs/INTEGRATION.md); hosts without a renderer
 	// display the content verbatim.
-	registerAgentsCommand(pi, { manager: app.manager, openHub: () => uiHandle?.openHub() });
+	registerAgentsCommand(pi, {
+		manager: app.manager,
+		openHub: () => uiHandle?.openAgents(),
+		setInlineAgentsVisible: (visible) => uiHandle?.setInlineAgentsVisible(visible),
+	});
 	registerBackendCommand(pi, { backend });
 	registerSubagentTools(pi, app.manager, app.registry, app.delivery);
 	registerModelTools(pi);
 	pi.on("turn_end", () => app.delivery?.finishSpawnBatch());
+	pi.on("turn_start", () => {
+		if (currentTaskReminders) reminderCadence.turnStart();
+	});
+	pi.on("tool_result", (event) => {
+		if (event.toolName.startsWith("tasks_")) reminderCadence.taskToolUsed();
+	});
+	pi.on("context", (event) => {
+		if (!currentTaskReminders || !reminderCadence.consume()) return;
+		const summary = board ? summarizeRelevantTasks(board) : undefined;
+		if (!summary) return;
+		return {
+			messages: [
+				...event.messages,
+				{
+					role: "custom" as const,
+					customType: "task-reminder",
+					content: summary,
+					display: false,
+					timestamp: Date.now(),
+				},
+			],
+		};
+	});
 	registerLeadSendMessageTool(
 		pi,
 		() => app.mailbox,
-		() => app.teams?.current?.members.map((member) => member.name) ?? [],
+		getAvailableTeammateNames,
+		(name) => app.manager.teammateStatus(name),
 	);
-	for (const tool of createTeamTaskTools(() => board)) pi.registerTool(tool);
+	for (const tool of createTasksTools(
+		() => board,
+		() => taskExecution,
+	))
+		pi.registerTool(tool);
+	pi.registerCommand("tasks", {
+		description: "Open the Tasks view in Team Hub",
+		handler: async () => uiHandle?.openTasks(),
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
+		taskAutomation?.dispose();
+		taskAutomation = undefined;
+		taskExecution?.dispose();
+		taskExecution = undefined;
+		board?.dispose();
 		board = undefined;
 		rpc?.dispose();
 		rpc = wireSubagentsRpc({ events: pi.events, manager: app.manager });
@@ -97,30 +148,91 @@ export default function (pi: ExtensionAPI): void {
 		closeLeadMailbox = undefined;
 		stopMentionRouting = undefined;
 		const settings = await loadSubagentsSettings(configCwd);
+		currentTaskReminders = settings.tasks.reminders;
+		reminderCadence = new TaskReminderCadence();
 		app.updateSettings(settings);
 		// Env override (four launchers) wins over the settings key (auto|headless).
 		backend.setLauncherHint(resolveSessionLauncherHint(process.env, settings.backend));
 		await app.sessionStart();
 		const team = app.teams;
 		board = team ? new TaskBoardService({ teamDir: team.teamDir, self: "lead" }) : undefined;
+		taskExecution = board
+			? new TaskExecutionService({ board, manager: app.manager, artifactRoot: teamsArtifactDir(configCwd) })
+			: undefined;
+		taskAutomation =
+			board && taskExecution ? new TaskAutomationService(board, taskExecution, settings.tasks.autoCascade) : undefined;
 		if (app.mailbox)
 			closeLeadMailbox = installLeadMailbox(
 				pi,
 				app.mailbox,
 				(name) => app.teams?.current?.members.find((member) => member.name === name)?.color,
 			);
+		const tasks: TasksUiPort = {
+			snapshot: () => board?.list() ?? [],
+			subscribe: (listener) => {
+				const activeBoard = board;
+				if (!activeBoard) return () => {};
+				const unsubscribe = activeBoard.subscribe(() => listener());
+				const unwatch = activeBoard.watch(listener);
+				return () => {
+					unsubscribe();
+					unwatch();
+				};
+			},
+			create: (input) => {
+				if (!board) throw new Error("No active team");
+				return board.create(input);
+			},
+			update: (input) => {
+				if (!board) throw new Error("No active team");
+				return board.update(input);
+			},
+			cancel: (id) => {
+				if (!board) throw new Error("No active team");
+				return board.cancel({ id });
+			},
+			execute: (id, type) => {
+				if (!taskExecution) throw new Error("Task execution unavailable");
+				return taskExecution.execute(id, { actor: { name: "lead", coordinator: true }, type });
+			},
+			output: (id, wait) => {
+				if (!taskExecution) throw new Error("Task execution unavailable");
+				return taskExecution.output(id, {
+					actor: { name: "lead", coordinator: true },
+					...(wait !== undefined ? { wait } : {}),
+				});
+			},
+			stop: (id) => {
+				if (!taskExecution) throw new Error("Task execution unavailable");
+				return taskExecution.stop(id, { actor: { name: "lead", coordinator: true } });
+			},
+			executionTypes: () => app.registry.availableTypes,
+			colors: () =>
+				app.teams?.current?.members.map((member) => ({
+					name: member.name,
+					...(member.color ? { color: member.color } : {}),
+				})) ?? [],
+		};
 		uiHandle = installSubagentsUi(ctx, {
 			manager: app.manager,
 			focus: createAgentFocusPort({ manager: app.manager, transcripts }),
 			settings: () => app.manager.currentSettings,
 			transcripts,
+			tasks,
 		});
 		if (ctx.mode === "tui") {
 			const routing = {
-				names: () => app.manager.list().flatMap((run) => (run.teammateName && run.handle ? [run.teammateName] : [])),
+				names: getAvailableTeammateNames,
 				isMainEditorFocused: () => uiHandle?.isMainEditorFocused() ?? false,
-				send: (target: string, text: string) =>
-					app.mailbox?.send(target, text) ?? { delivered: false as const, error: "No active team" },
+				send: (target: string, text: string) => {
+					const status = app.manager.teammateStatus(target);
+					if (!isTeammateMessageAvailable(status))
+						return {
+							delivered: false as const,
+							error: status?.recoveryError ?? `Teammate @${target} is ${status?.state ?? "unavailable"}.`,
+						};
+					return app.mailbox?.send(target, text) ?? { delivered: false as const, error: "No active team" };
+				},
 			};
 			installAgentMentionAutocomplete(ctx, app.registry, routing);
 			stopMentionRouting = installTeammateMentionRouting(ctx, routing);
@@ -128,24 +240,30 @@ export default function (pi: ExtensionAPI): void {
 		rpc.announceReady();
 	});
 	pi.on("session_before_switch", async () => {
-		board = undefined;
 		closeLeadMailbox?.();
 		stopMentionRouting?.();
 		closeLeadMailbox = undefined;
 		stopMentionRouting = undefined;
 		app.delivery?.handleSessionSwitch();
+		currentTaskReminders = false;
+		taskAutomation?.dispose();
+		taskAutomation = undefined;
 		// Session-bound lifetime (ADR 0007 §1): switching sessions ends the
 		// owning session's team — tear its children down before the next
 		// session_start re-arms the manager.
 		try {
+			taskExecution?.freezeAdmissions();
 			await app.sessionShutdown();
+			taskExecution?.dispose();
+			taskExecution = undefined;
+			board?.dispose();
+			board = undefined;
 		} catch (error) {
 			console.warn(`[pi-teams] session teardown failed: ${error instanceof Error ? error.message : String(error)}`);
 			throw error;
 		}
 	});
 	pi.on("session_shutdown", async () => {
-		board = undefined;
 		closeLeadMailbox?.();
 		stopMentionRouting?.();
 		closeLeadMailbox = undefined;
@@ -154,7 +272,18 @@ export default function (pi: ExtensionAPI): void {
 		rpc = undefined;
 		uiHandle?.dispose();
 		uiHandle = undefined;
-		await app.sessionShutdown();
-		latestCtx = undefined;
+		currentTaskReminders = false;
+		taskAutomation?.dispose();
+		taskAutomation = undefined;
+		try {
+			taskExecution?.freezeAdmissions();
+			await app.sessionShutdown();
+		} finally {
+			taskExecution?.dispose();
+			taskExecution = undefined;
+			board?.dispose();
+			board = undefined;
+			latestCtx = undefined;
+		}
 	});
 }

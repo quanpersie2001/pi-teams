@@ -25,27 +25,44 @@ export interface ChildMailboxHandle {
 	close(): void;
 }
 
-function participantNames(teamDir: string): Set<string> {
+interface ParticipantAvailability {
+	state?: "idle" | "busy" | "released" | "retired";
+	availability?: "available" | "unavailable";
+	recoveryError?: string;
+}
+
+function participantAvailability(teamDir: string): Map<string, ParticipantAvailability> {
 	try {
 		const roster: unknown = JSON.parse(readFileSync(join(teamDir, "config.json"), "utf8"));
 		if (typeof roster !== "object" || roster === null || !Array.isArray((roster as { members?: unknown }).members))
-			return new Set();
+			return new Map();
 		const members = (roster as { members: unknown[] }).members;
-		return new Set([
-			"lead",
-			...members.flatMap((member) => {
-				if (typeof member !== "object" || member === null) return [];
-				const name = (member as { name?: unknown }).name;
-				return isMailboxAddress(name) && name !== "lead" ? [name] : [];
-			}),
-		]);
+		const participants = new Map<string, ParticipantAvailability>([["lead", {}]]);
+		for (const member of members) {
+			if (typeof member !== "object" || member === null) continue;
+			const entry = member as { name?: unknown; lifecycle?: unknown; availability?: unknown; recoveryError?: unknown };
+			if (!isMailboxAddress(entry.name) || entry.name === "lead") continue;
+			participants.set(entry.name, {
+				...(entry.lifecycle === "idle" ||
+				entry.lifecycle === "busy" ||
+				entry.lifecycle === "released" ||
+				entry.lifecycle === "retired"
+					? { state: entry.lifecycle }
+					: {}),
+				...(entry.availability === "available" || entry.availability === "unavailable"
+					? { availability: entry.availability }
+					: {}),
+				...(typeof entry.recoveryError === "string" ? { recoveryError: entry.recoveryError } : {}),
+			});
+		}
+		return participants;
 	} catch {
-		return new Set();
+		return new Map();
 	}
 }
 
-function result(text: string) {
-	return { content: [{ type: "text" as const, text }], details: undefined };
+function result(text: string, details?: Record<string, unknown>) {
+	return { content: [{ type: "text" as const, text }], details };
 }
 
 /** Watch/drain this participant's file mailbox after native bridge startup. */
@@ -121,8 +138,28 @@ export function createChildMailboxTool(service: MailboxService) {
 			message: Type.String({ description: "Message text" }),
 		}),
 		execute: async (_toolCallId: string, args: { target: string; message: string }) => {
-			if (!isMailboxAddress(args.target) || !participantNames(service.teamDir).has(args.target))
-				return result(`Unknown teammate: ${args.target}`);
+			if (!isMailboxAddress(args.target))
+				return result(`Unknown teammate: ${args.target}`, { target: args.target, queued: false });
+			const participant = participantAvailability(service.teamDir).get(args.target);
+			if (!participant) return result(`Unknown teammate: ${args.target}`, { target: args.target, queued: false });
+			if (
+				participant.state === "released" ||
+				participant.state === "retired" ||
+				participant.availability === "unavailable"
+			) {
+				const reason = participant.recoveryError ? `: ${participant.recoveryError}` : "";
+				const blockedAs =
+					participant.state === "released" || participant.state === "retired" ? participant.state : "unavailable";
+				return result(
+					`Message not sent: @${args.target} is ${blockedAs}${participant.state ? ` (state ${participant.state})` : ""}${reason}.`,
+					{
+						target: args.target,
+						state: participant.state,
+						availability: participant.availability,
+						queued: false,
+					},
+				);
+			}
 			const sent = service.send(args.target, args.message);
 			return result(sent.delivered ? `Message queued for @${args.target}.` : `Message not sent: ${sent.error}`);
 		},

@@ -44,6 +44,29 @@ function managerOf(runs: readonly AgentRun[]): { list(): AgentRun[] } {
 }
 
 describe("buildAgentListView", () => {
+	it("projects teammate lifecycle separately from a settled run outcome", () => {
+		const record = makeRun({ teammateName: "review-api", status: "completed" });
+		const view = buildAgentListView({
+			...managerOf([record]),
+			teammateStatus: () => ({ state: "retired" as const, availability: "available" as const }),
+		});
+		expect(view.rows[0]).toMatchObject({ status: "completed", teammateState: "retired" });
+		expect(view.rows[0]?.capabilities.resumable).toBe(false);
+	});
+
+	it("does not present an uncertain retained child as idle", () => {
+		const record = makeRun({
+			teammateName: "review-api",
+			status: "completed",
+			handle: { kind: "process", handle: "worker" },
+		});
+		const view = buildAgentListView({
+			...managerOf([record]),
+			teammateStatus: () => ({ state: "idle" as const, availability: "unavailable" as const }),
+		});
+		expect(view.rows[0]?.resourceState).toBe("cleanup-unconfirmed");
+	});
+
 	it("orders active runs by spawn order first, then finished runs newest-first", () => {
 		const early = makeRun({ id: "early", startedAt: 100, status: "running" });
 		const late = makeRun({ id: "late", startedAt: 200, status: "running" });

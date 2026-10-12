@@ -72,6 +72,28 @@ describe("MailboxService", () => {
 		expect(recipient.receive()).toMatchObject([{ text: "second" }]);
 	});
 
+	it("discards pending messages for only the named participant", async () => {
+		const { sender, recipient, teamDir } = services();
+		const other = new MailboxService({ teamDir, teamKey: "per-team-secret", self: "reviewer" });
+		sender.send("worker", "pending one");
+		sender.send("worker", "pending two");
+		sender.send("reviewer", "keep me");
+		await sender.discardPending("worker", "release");
+		expect(recipient.receive()).toEqual([]);
+		const archived = readdirSync(join(recipient.inboxDir, "archive"));
+		expect(archived).toHaveLength(2);
+		expect(archived.every((name) => name.includes("-release-"))).toBe(true);
+		expect(statSync(join(recipient.inboxDir, "archive")).mode & 0o777).toBe(0o700);
+		expect(other.receive().map((message) => message.text)).toEqual(["keep me"]);
+		await sender.discardPending("worker", "release");
+		expect(readdirSync(join(recipient.inboxDir, "archive"))).toHaveLength(2);
+	});
+
+	it("rejects invalid participant names when discarding", async () => {
+		const { sender } = services();
+		await expect(sender.discardPending("../outside")).rejects.toThrow("invalid mailbox participant address");
+	});
+
 	it("rejects invalid recipient addresses", () => {
 		const { sender } = services();
 		expect(sender.send("../outside", "hello")).toMatchObject({ delivered: false });

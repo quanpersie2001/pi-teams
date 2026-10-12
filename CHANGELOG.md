@@ -1,5 +1,21 @@
 # Changelog
 
+- Add an inline Tasks widget above the editor for pending/in-progress/in-review tasks, with terminal tasks retained in Hub history; keep the Agents panel below the editor and add session-only `/agents panel [show|hide|toggle]` visibility plus the `agentInlinePanel` startup default.
+
+## Unreleased
+
+### Features
+
+- Merge the `references/pi-tasks` workflow into session-scoped unified Tasks tools, with typed task requirements/context/outcomes and explicit execution-attempt lifecycle
+
+- Add named-teammate status, release and retirement controls; explicit continue/fresh context policy; fail-closed mailbox availability guards and per-teammate pending-message archiving on context replacement
+- Additive v3 RPC capabilities and teammate lifecycle operations; preserve existing run-ID status/release semantics
+
+### Documentation
+
+- Document unified Tasks Hub controls, v2 task schema normalization, opt-in cascade/reminder automation, and fail-closed board-lock recovery
+- Document teammate lifecycle states, recovery availability, context replacement, mailbox receipts and additive RPC compatibility
+
 ## [0.1.5] - 2026-10-10
 
 ### Bug Fixes

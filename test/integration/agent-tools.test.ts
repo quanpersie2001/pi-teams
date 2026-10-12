@@ -71,7 +71,7 @@ async function makeFixture(
 	// Load agent definitions (bundled defaults) so spawns can resolve types.
 	await app.sessionStart();
 	const registrations = registerSubagentTools(host.extensionApi, app.manager, app.registry, app.delivery);
-	expect(registrations.map((entry) => entry.skipped ?? false)).toEqual([false, false, false]);
+	expect(registrations.map((entry) => entry.skipped ?? false)).toEqual([false, false, false, false, false, false]);
 	const tools = new Map<string, ToolLike>();
 	for (const tool of host.registeredTools as ToolLike[]) tools.set(tool.name, tool);
 	return { host, backend, tools, app };
@@ -114,6 +114,11 @@ describe("tool registration", () => {
 			"Every NEW spawn MUST include all four required fields — subagent_type, description, name, and color",
 		);
 		expect(catalog).toContain("When the user asks to spawn subagents/teammates");
+		expect(catalog).toContain(
+			"omitted context continues an idle retained context and starts fresh for new/released identities",
+		);
+		expect(catalog).toContain("teammate_status");
+		expect(catalog).toContain("teammate_retire");
 		expect(agent?.promptSnippet).toContain("Spawn named, colored subagents");
 	});
 
@@ -136,9 +141,93 @@ describe("tool registration", () => {
 			{ name: "Agent", skipped: true },
 			{ name: "get_subagent_result" },
 			{ name: "steer_subagent" },
+			{ name: "teammate_status" },
+			{ name: "teammate_release" },
+			{ name: "teammate_retire" },
 		]);
 		const registeredNames = (host.registeredTools as ToolLike[]).map((tool) => tool.name);
-		expect(registeredNames).toEqual(["get_subagent_result", "steer_subagent"]);
+		expect(registeredNames).toEqual([
+			"get_subagent_result",
+			"steer_subagent",
+			"teammate_status",
+			"teammate_release",
+			"teammate_retire",
+		]);
+	});
+});
+
+describe("teammate lifecycle tools", () => {
+	it("returns structured status and an unknown-name recovery target", async () => {
+		const fixture = await makeFixture();
+		const tool = fixture.tools.get("teammate_status");
+		if (!tool) throw new Error("teammate_status not registered");
+		const unknown = await tool.execute(
+			"status",
+			{ name: "ghost" },
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		expect(textOf(unknown)).toBe("Unknown teammate: ghost");
+		expect(unknown.details).toMatchObject({ name: "ghost", found: false });
+		const status = {
+			name: "worker",
+			type: "explore",
+			color: "#47a3e8",
+			state: "idle",
+			availability: "available",
+			contextAvailable: true,
+			currentRunId: "run-live",
+			lastRunId: "run-last",
+		} as const;
+		vi.spyOn(fixture.app.manager, "teammateStatus").mockReturnValue(status);
+		const result = await tool.execute(
+			"status",
+			{ name: "worker" },
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		expect(textOf(result)).toContain("@worker: idle; available");
+		expect(result.details).toMatchObject(status);
+	});
+
+	it("reports structured release/retire failures and settled success without changing task claims", async () => {
+		const fixture = await makeFixture();
+		const release = fixture.tools.get("teammate_release");
+		const retire = fixture.tools.get("teammate_retire");
+		if (!release || !retire) throw new Error("lifecycle tools not registered");
+		vi.spyOn(fixture.app.manager, "releaseTeammate").mockRejectedValue(new Error("Cannot release busy teammate"));
+		const failed = await release.execute(
+			"release",
+			{ name: "worker" },
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		expect(textOf(failed)).toContain("Cannot release busy teammate");
+		expect(failed.details).toMatchObject({
+			action: "release",
+			changed: false,
+			recovery: expect.stringContaining("teammate_status"),
+		});
+		vi.spyOn(fixture.app.manager, "retireTeammate").mockResolvedValue(true);
+		vi.spyOn(fixture.app.manager, "teammateStatus").mockReturnValue({
+			name: "worker",
+			type: "explore",
+			state: "retired",
+			availability: "available",
+			contextAvailable: false,
+		});
+		const retired = await retire.execute(
+			"retire",
+			{ name: "worker" },
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		expect(textOf(retired)).toContain("is now retired");
+		expect(retired.details).toMatchObject({ state: "retired", changed: true });
 	});
 });
 
@@ -175,6 +264,35 @@ describe("Agent tool", () => {
 		}
 		expect(fixture.backend.admissions).toHaveLength(0);
 		expect(fixture.app.manager.list()).toHaveLength(0);
+	});
+
+	it("passes explicit fresh context policy through the model-facing Agent tool", async () => {
+		const fixture = await makeFixture();
+		const agent = fixture.tools.get("Agent");
+		if (!agent) throw new Error("Agent tool not registered");
+		const spawn = vi.spyOn(fixture.app.manager, "spawn").mockResolvedValue({
+			id: "run-fresh",
+			status: "running",
+			isBackground: true,
+			teammateName: "worker",
+		} as never);
+		const result = await agent.execute(
+			"fresh-context",
+			{
+				prompt: "new assignment",
+				description: "Fresh assignment",
+				subagent_type: "explore",
+				...NAMED,
+				context: "fresh",
+				run_in_background: true,
+			},
+			NO_SIGNAL,
+			undefined,
+			fixture.host.extensionContext,
+		);
+		expect(textOf(result)).toContain("run-fresh");
+		expect(spawn.mock.calls[0]?.[0]).toMatchObject({ name: "worker", context: "fresh" });
+		expect(agent.parameters?.properties?.context?.description).toContain("pending mailbox messages are archived");
 	});
 
 	it("renders the teammate's name and color in the launch call", async () => {
@@ -440,6 +558,7 @@ describe("cold resume tool", () => {
 		await firstLaunch;
 		fixture.backend.complete(original.id, "first result", "/tmp/sessions/first.jsonl");
 		await fixture.app.manager.whenSettled(original.id);
+		await fixture.app.manager.releaseTeammate("worker");
 		const agent = fixture.tools.get("Agent");
 		if (!agent) throw new Error("Agent tool not registered");
 		expect(agent.parameters).toMatchObject({ required: ["prompt"] });
@@ -626,7 +745,8 @@ describe("Agent tool time budgets", () => {
 		expect(text).toMatch(new RegExp(`Resume with Agent\\(resume: "${runId}"\\)`));
 		expect(result.details).toMatchObject({ agentId: runId, budgetExhausted: "timeout", budgetSeconds: 1 });
 
-		// Resume through the tool replays the frozen limit with fresh clocks.
+		// Cold transcript recovery requires releasing the retained teammate child first.
+		await fixture.app.manager.releaseTeammate("worker");
 		const resumed = await fixture.app.manager.resume(runId, "continue");
 		for (let turn = 0; turn < 32; turn += 1) await Promise.resolve();
 		expect(resumed.budgetTimeout).toBe(1);

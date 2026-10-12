@@ -1,8 +1,10 @@
 # ADR 0007: Session-bound agent teams with peer mailboxes and a shared task board
 
-- **Status:** Accepted
+- **Status:** Accepted (task-board decision amended/superseded by [ADR 0009](./0009-unified-session-tasks.md); remaining session-bound team decisions stand).
 - **Supersedes:** lifetime-independence guarantees in [ADR 0004](./0004-independent-process-runtime.md)
 - **Amends:** [ADR 0005](./0005-separate-task-and-agent-domains.md)
+
+> **Amendment:** ADR 0009 supersedes §4's namespaced coordination-only task model with unified session-scoped Tasks. This ADR remains historical for the original board decision; its other decisions remain in force.
 
 ## Context
 

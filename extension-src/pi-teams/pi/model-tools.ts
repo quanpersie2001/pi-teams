@@ -15,7 +15,7 @@ import { existingToolNames, type ToolRegistration } from "./tool-registration.js
 export const LIST_MODELS_TOOL_NAME = "list_models";
 
 export const LIST_MODELS_DESCRIPTION =
-	"Read-only: lists registered native Pi models as canonical provider/modelId with display names so a model can be resolved before spawning an Agent. Use the exact returned provider/modelId as Agent's `model`; an ambiguous bare name is a resolution error.";
+	"Read-only: searches the current Pi session's /models list as canonical provider/modelId with display names so a model can be selected before spawning an Agent. Use the exact returned provider/modelId as Agent's `model`; an ambiguous bare name is a resolution error.";
 
 function result(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
@@ -54,15 +54,13 @@ export function createModelTools(): ToolDefinition[] {
 				return new Text(`▸ list_models(${query})`, 0, 0);
 			},
 			renderResult: (result) => new Text(resultText(result), 0, 0),
-			execute: async (_id: string, args: { query?: string; limit?: number }) => {
-				const { total, rows } = await listNativeModels({
+			execute: async (_id: string, args: { query?: string; limit?: number }, _signal, _onUpdate, ctx) => {
+				const { total, rows } = listNativeModels(ctx.modelRegistry.getAvailable(), {
 					...(args.query ? { query: args.query } : {}),
 					...(args.limit ? { limit: args.limit } : {}),
 				});
 				if (rows.length === 0) {
-					return result(
-						args.query ? `No registered model matches "${args.query}".` : "No registered models are available.",
-					);
+					return result(args.query ? `No available model matches "${args.query}".` : "No models are available.");
 				}
 				const lines = rows.map((row) => `${row.ref} — ${row.name}`);
 				if (rows.length < total) lines.push(`${rows.length} of ${total} matching models shown`);

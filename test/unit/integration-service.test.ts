@@ -123,13 +123,53 @@ describe("IntegrationService ping", () => {
 		await request(fixture, "ping", { requestId: "p1", version: PROTOCOL_VERSION });
 		expect(fixture.replies).toHaveLength(1);
 		expect(fixture.replies[0]?.channel).toBe(subagentsRpcReplyChannel("ping", "p1"));
-		expect(dataOf(replyFor(fixture, "ping", "p1"))).toEqual({ version: 3 });
+		expect(dataOf(replyFor(fixture, "ping", "p1"))).toEqual({
+			version: 3,
+			capabilities: ["teammate_status", "teammate_release", "teammate_retire", "spawn_context"],
+		});
 	});
 
 	it("accepts a ping without a version field", async () => {
 		const fixture = await makeFixture();
 		await request(fixture, "ping", { requestId: "p2" });
-		expect(dataOf(replyFor(fixture, "ping", "p2"))).toEqual({ version: 3 });
+		expect(dataOf(replyFor(fixture, "ping", "p2"))).toMatchObject({
+			version: 3,
+			capabilities: expect.arrayContaining(["teammate_status", "teammate_retire"]),
+		});
+	});
+});
+
+describe("IntegrationService teammate lifecycle RPC", () => {
+	it("advertises and implements additive status/release/retire operations", async () => {
+		const fixture = await makeFixture();
+		expect(SUBAGENTS_RPC_OPS).toContain("teammate_status");
+		expect(SUBAGENTS_RPC_OPS).toContain("teammate_release");
+		expect(SUBAGENTS_RPC_OPS).toContain("teammate_retire");
+		await request(fixture, "teammate_status", { requestId: "ts1", name: "unknown" });
+		expect(replyFor(fixture, "teammate_status", "ts1")).toMatchObject({ success: true, data: null });
+		await request(fixture, "teammate_release", { requestId: "tr1", name: "unknown" });
+		expect(replyFor(fixture, "teammate_release", "tr1")).toMatchObject({
+			success: false,
+			error: expect.stringContaining("not found"),
+		});
+		await request(fixture, "teammate_retire", { requestId: "tt1", name: "unknown" });
+		expect(replyFor(fixture, "teammate_retire", "tt1")).toMatchObject({
+			success: false,
+			error: expect.stringContaining("not found"),
+		});
+		fixture.manager.releaseTeammate = async () => true;
+		fixture.manager.teammateStatus = () => ({
+			name: "already-retired",
+			type: "explore",
+			state: "retired",
+			availability: "available",
+			contextAvailable: false,
+		});
+		await request(fixture, "teammate_release", { requestId: "rel-retired", name: "already-retired" });
+		expect(replyFor(fixture, "teammate_release", "rel-retired")).toMatchObject({
+			success: true,
+			data: { name: "already-retired", state: "retired" },
+		});
 	});
 });
 
@@ -254,6 +294,45 @@ describe("IntegrationService spawn", () => {
 		});
 		expect(replyFor(fixture, "spawn", "s5")?.success).toBe(false);
 		expect(fixture.manager.list()).toHaveLength(0); // nothing was spawned
+	});
+
+	it("accepts additive named teammate options and applies explicit fresh context", async () => {
+		const fixture = await makeFixture();
+		await request(fixture, "spawn", {
+			requestId: "named-fresh",
+			type: "general-purpose",
+			prompt: "fresh teammate assignment",
+			options: { isBackground: true, name: "worker", color: "#47a3e8", context: "fresh" },
+		});
+		const spawned = dataOf(replyFor(fixture, "spawn", "named-fresh"));
+		const run = fixture.manager.get(String(spawned.id));
+		expect(run?.teammateName).toBe("worker");
+		expect(run?.teammateColor).toBe("#47a3e8");
+	});
+
+	it("rejects invalid or anonymous context policy options before allocation", async () => {
+		const fixture = await makeFixture();
+		await request(fixture, "spawn", {
+			requestId: "bad-context",
+			type: "general-purpose",
+			prompt: "bad context",
+			options: { context: "fork" },
+		});
+		expect(replyFor(fixture, "spawn", "bad-context")).toMatchObject({
+			success: false,
+			error: expect.stringContaining("context must"),
+		});
+		await request(fixture, "spawn", {
+			requestId: "anonymous-context",
+			type: "general-purpose",
+			prompt: "context without identity",
+			options: { context: "fresh" },
+		});
+		expect(replyFor(fixture, "spawn", "anonymous-context")).toMatchObject({
+			success: false,
+			error: expect.stringContaining("require options.name"),
+		});
+		expect(fixture.manager.list()).toHaveLength(0);
 	});
 
 	it("drops requests without a usable requestId without crashing", async () => {
@@ -417,7 +496,18 @@ describe("IntegrationService dispatch robustness", () => {
 	});
 
 	it("subscribes exactly the protocol channels and unsubscribes all on dispose", async () => {
-		expect(SUBAGENTS_RPC_OPS).toEqual(["ping", "spawn", "status", "steer", "stop", "resume", "release"]);
+		expect(SUBAGENTS_RPC_OPS).toEqual([
+			"ping",
+			"spawn",
+			"status",
+			"steer",
+			"stop",
+			"resume",
+			"release",
+			"teammate_status",
+			"teammate_release",
+			"teammate_retire",
+		]);
 		const active = new Set<(data: unknown) => void>();
 		const service = new IntegrationService(await makeFixture().then((f) => f.manager), {
 			events: {

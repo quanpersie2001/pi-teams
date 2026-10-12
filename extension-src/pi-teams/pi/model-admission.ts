@@ -65,16 +65,13 @@ async function refreshOffline(runtime: ModelRuntime): Promise<ModelRuntime> {
 	return runtime;
 }
 
-/**
- * List the native Pi models isolated children can see, so callers can disambiguate an ambiguous
- * `provider/modelId` request. Performs no auth checks.
- */
-export async function listNativeModels(
-	options: { agentDir?: string; query?: string; limit?: number } = {},
-): Promise<{ total: number; rows: Array<{ ref: string; name: string }> }> {
-	const runtime = await refreshOffline(await createIsolatedRuntime(options.agentDir ?? getAgentDir()));
+/** Filter the current Pi session's available model list, as shown in /models. */
+export function listNativeModels(
+	models: readonly NativeModel[],
+	options: { query?: string; limit?: number } = {},
+): { total: number; rows: Array<{ ref: string; name: string }> } {
 	const query = options.query?.trim().toLowerCase();
-	const rows = nativeModels(runtime)
+	const rows = models
 		.filter(
 			(model) =>
 				!query || canonicalModel(model).toLowerCase().includes(query) || model.name.toLowerCase().includes(query),

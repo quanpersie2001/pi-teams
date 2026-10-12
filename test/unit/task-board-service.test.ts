@@ -40,14 +40,15 @@ describe("TaskBoardService", () => {
 		const task = lead.create({ title: "Claim me" });
 		worker.update({ id: task.id, status: "in_progress" });
 		expect(() => lead.update({ id: task.id, status: "in_progress" })).toThrow(/owned by @worker/);
-		expect(() => lead.update({ id: task.id, status: "completed" })).toThrow(/owner/);
+		const peer = board("team-a", "peer");
+		expect(() => peer.update({ id: task.id, status: "completed" })).toThrow(/owner/);
 		worker.update({ id: task.id, status: "pending" });
 		lead.update({ id: task.id, status: "in_progress" });
 		lead.update({ id: task.id, status: "completed" });
 		expect(() => worker.update({ id: task.id, status: "in_progress" })).toThrow(/terminal/);
 
 		const contested = lead.create({ title: "Locked" });
-		const lock = join(lead.taskDir, `${contested.id}.lock`);
+		const lock = join(lead.taskDir, "board.lock");
 		mkdirSync(lock, { mode: 0o700 });
 		try {
 			expect(() => worker.update({ id: contested.id, status: "in_progress" })).toThrow(/conflict/);
@@ -122,7 +123,7 @@ describe("TaskBoardService", () => {
 		root = mkdtempSync(join(tmpdir(), "task-board-"));
 		const lead = board("team-a", "lead");
 		lead.create({ title: "No shortcuts" });
-		expect(() => lead.update({ id: "T1", status: "cancelled" })).toThrow(/team_task_cancel/);
+		expect(() => lead.update({ id: "T1", status: "cancelled" })).toThrow(/tasks_cancel/);
 		expect(lead.get("T1")).toMatchObject({ status: "pending" });
 	});
 
@@ -131,7 +132,7 @@ describe("TaskBoardService", () => {
 		const lead = board("team-a", "lead");
 		const mistaken = lead.create({ title: "Mistaken" });
 		expect(() => lead.update({ id: mistaken.id, status: "completed" })).toThrow(/claim it first/);
-		expect(() => lead.update({ id: mistaken.id, status: "pending" })).toThrow(/nothing to release/);
+		expect(() => lead.update({ id: mistaken.id, status: "pending" })).toThrow(/owner or lead coordinator can release/);
 		expect(lead.cancel({ id: mistaken.id })).toMatchObject({ status: "cancelled" });
 
 		const claimed = lead.create({ title: "Claimed then retired" });
@@ -178,7 +179,7 @@ describe("TaskBoardService", () => {
 		const task = previous.create({ title: "Owned in the previous session" });
 		previous.update({ id: task.id, status: "in_progress" });
 		let current: TaskBoardService | undefined = previous;
-		const update = createTeamTaskTools(() => current).find((tool) => tool.name === "team_task_update");
+		const update = createTeamTaskTools(() => current).find((tool) => tool.name === "tasks_update");
 		if (!update) throw new Error("Task update tool is unavailable");
 		current = board("current", "lead");
 		await expect(

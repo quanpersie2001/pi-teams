@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createAgentFocusPort } from "../../extension-src/pi-teams/app/focus-service.js";
 import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
+import type { TaskProjection } from "../../extension-src/pi-teams/domain/task-board.js";
 import type { AgentFocusPort } from "../../extension-src/pi-teams/domain/ui-view.js";
 import { hubRosterCapacity } from "../../extension-src/pi-teams/features/agent-panel/index.js";
 import { PANEL_PAGE_SIZE } from "../../extension-src/pi-teams/features/agent-panel/panel-keys.js";
@@ -19,7 +20,11 @@ import type { AgentViewOverlay } from "../../extension-src/pi-teams/features/age
 import { registerAgentsCommand } from "../../extension-src/pi-teams/pi/commands.js";
 import { createPiTeamStore } from "../../extension-src/pi-teams/pi/teams-host.js";
 import { createPiTranscriptSource } from "../../extension-src/pi-teams/pi/transcript-host.js";
-import { installSubagentsUi, type SubagentsUiHandle } from "../../extension-src/pi-teams/pi/ui-host.js";
+import {
+	installSubagentsUi,
+	type SubagentsUiHandle,
+	type TasksUiPort,
+} from "../../extension-src/pi-teams/pi/ui-host.js";
 import { FakeBackend } from "../helpers/fake-backend.js";
 import { FakePiHost } from "../helpers/fake-pi-host.js";
 
@@ -32,7 +37,7 @@ const PAGE_UP = "\x1b[5~";
 const PAGE_DOWN = "\x1b[6~";
 /**
  * Overlay terminal height for the Hub paging test. At 12 rows
- * hubRosterCapacity(12) is 2, deliberately different from the inline
+ * hubRosterCapacity(12) is 3, deliberately different from the inline
  * panel's PANEL_PAGE_SIZE (6).
  */
 const HUB_PAGING_ROWS = 12;
@@ -48,11 +53,13 @@ interface Fixture {
 async function makeFixture(
 	options: {
 		agentPanel?: boolean;
+		agentInlinePanel?: boolean;
 		initialEditor?: EditorFactory;
 		now?: () => number;
 		teamCwd?: string;
 		focus?: (base: AgentFocusPort) => AgentFocusPort;
 		overlayTerminal?: { rows: number; columns: number };
+		tasks?: TasksUiPort;
 	} = {},
 ): Promise<Fixture> {
 	const host = new FakePiHost({
@@ -70,6 +77,7 @@ async function makeFixture(
 		settings: sanitizeSettings({
 			backgroundByDefault: true,
 			...(options.agentPanel === false ? { agentPanel: false } : {}),
+			...(options.agentInlinePanel === false ? { agentInlinePanel: false } : {}),
 		}),
 		backends: [backend],
 		cwd: "/tmp/project",
@@ -97,6 +105,7 @@ async function makeFixture(
 			createAgentFocusPort({ manager: app.manager, transcripts }),
 		settings: () => app.manager.currentSettings,
 		transcripts,
+		...(options.tasks ? { tasks: options.tasks } : {}),
 		...(options.now ? { now: options.now } : {}),
 	});
 
@@ -109,7 +118,7 @@ async function makeFixture(
 		});
 		await vi.waitFor(() => expect(app.manager.get(record.id)?.status).toBe("running"));
 		ui.refresh();
-		if (options.agentPanel !== false) {
+		if (options.agentPanel !== false && options.agentInlinePanel !== false) {
 			await vi.waitFor(() => {
 				const factory = host.componentFactories.get("teams-agents");
 				const lines = factory?.({ requestRender() {} }, host.theme).render(100);
@@ -159,13 +168,234 @@ function mountMainEditor(
 }
 
 describe("inline UI installation", () => {
+	it("removes the Tasks widget when statuses become terminal while preserving Hub history", async () => {
+		const makeTask = (id: string, status: TaskProjection["status"]): TaskProjection => ({
+			id,
+			code: id.toUpperCase(),
+			title: `TITLE_${id}`,
+			status,
+			dependencies: [],
+			blockedBy: [],
+			requirementRevision: 1,
+			spec: {},
+			context: {},
+			attempts: [],
+			createdAt: 1,
+			updatedAt: 1,
+		});
+		let rows = [makeTask("active", "pending"), makeTask("done", "completed"), makeTask("cancel", "cancelled")];
+		let changed: (() => void) | undefined;
+		const port: TasksUiPort = {
+			snapshot: () => rows,
+			subscribe: (fn) => {
+				changed = fn;
+				return () => {
+					changed = undefined;
+				};
+			},
+			create: () => rows[0] ?? makeTask("active", "pending"),
+			update: () => rows[0] ?? makeTask("active", "pending"),
+			cancel: () => rows[0] ?? makeTask("active", "pending"),
+			execute: async () => ({ task: rows[0] ?? makeTask("active", "pending"), runId: "task-run" }),
+			output: async () => ({ taskId: "active" }),
+			stop: async () => false,
+			colors: () => [],
+			executionTypes: () => ["general-purpose"],
+		};
+		const fx = await makeFixture({ tasks: port });
+		const setWidget = vi.spyOn(fx.host.extensionContext.ui, "setWidget");
+		try {
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-tasks")).toBe(true));
+			const widget = () =>
+				fx.host.componentFactories
+					.get("teams-tasks")?.({ requestRender() {} }, fx.host.theme)
+					.render(100)
+					.join("\\n") ?? "";
+			expect(widget()).toContain("TITLE_active");
+			expect(widget()).toContain("● 1 tasks (1 open)");
+			expect(widget()).not.toContain("TITLE_done");
+			expect(widget()).not.toContain("TITLE_cancel");
+			fx.ui.openTasks();
+			const hub = await fx.host.waitForOverlayOpen();
+			const allText = () => hub.component?.render(100).join("\\n") ?? "";
+			expect(allText()).toContain("3 tasks");
+			expect(allText()).toContain("TITLE_done");
+			expect(allText()).toContain("TITLE_cancel");
+			fx.host.emitTerminalInput(DOWN);
+			fx.host.emitTerminalInput(ENTER);
+			const selectedTerminalDetails = allText();
+			expect(selectedTerminalDetails).toContain("TITLE_done");
+
+			rows = [makeTask("active", "in_progress"), makeTask("done", "completed"), makeTask("cancel", "cancelled")];
+			changed?.();
+			await vi.waitFor(() => expect(widget()).toContain("● 1 tasks (1 in progress)"));
+			expect(widget()).toContain("TITLE_active");
+			expect(widget()).not.toContain("TITLE_done");
+			expect(allText()).toContain("3 tasks");
+			expect(allText()).toContain("TITLE_done");
+			rows = [makeTask("active", "completed"), makeTask("done", "completed"), makeTask("cancel", "cancelled")];
+			changed?.();
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-tasks")).toBe(false));
+			expect(setWidget).toHaveBeenCalledWith("teams-tasks", undefined);
+			expect(allText()).toContain("3 tasks");
+			expect(allText()).toContain("TITLE_done");
+			expect(allText()).toContain("completed");
+			fx.host.emitTerminalInput(ENTER);
+			expect(allText()).toContain("TITLE_done");
+			expect(allText()).toContain("TITLE_cancel");
+		} finally {
+			setWidget.mockRestore();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("opens Tasks in the same task-only Hub and retains tab navigation", async () => {
+		const task: TaskProjection = {
+			id: "task-one",
+			code: "T1",
+			title: "TASK_ONLY_RENDER",
+			status: "pending",
+			dependencies: [],
+			blockedBy: [],
+			requirementRevision: 1,
+			spec: {},
+			context: {},
+			attempts: [],
+			createdAt: 1,
+			updatedAt: 1,
+		};
+		let listener: (() => void) | undefined;
+		let currentTask = task;
+		const updates: Array<{ id: string; status?: string }> = [];
+		const executions: string[] = [];
+		const port: TasksUiPort = {
+			snapshot: () => [currentTask],
+			subscribe: (fn) => {
+				listener = fn;
+				return () => {
+					listener = undefined;
+				};
+			},
+			create: () => currentTask,
+			update: (input) => {
+				updates.push(input);
+				if (input.status === "in_progress") currentTask = { ...currentTask, status: "in_progress", owner: "lead" };
+				return currentTask;
+			},
+			cancel: () => currentTask,
+			execute: async (_id, type) => {
+				executions.push(type);
+				return { task: currentTask, runId: "run-task" };
+			},
+			output: async () => ({ taskId: currentTask.id }),
+			stop: async () => false,
+			colors: () => [],
+			executionTypes: () => ["general-purpose"],
+		};
+		const fx = await makeFixture({ tasks: port });
+		const select = vi.spyOn(fx.host.extensionContext.ui, "select").mockResolvedValue("general-purpose");
+		try {
+			fx.ui.openTasks();
+			const hub = await fx.host.waitForOverlayOpen();
+			await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).toContain("TASK_ONLY_RENDER"));
+			expect(hub.component?.render(100).join("\n")).toContain("Team Hub ·");
+			fx.host.emitTerminalInput("\t");
+			expect(hub.component?.render(100).join("\n")).toContain("Team Hub (0)");
+			fx.host.emitTerminalInput("\t");
+			expect(hub.component?.render(100).join("\n")).toContain("TASK_ONLY_RENDER");
+			fx.host.emitTerminalInput("c");
+			await vi.waitFor(() => expect(updates).toEqual([{ id: "task-one", status: "in_progress" }]));
+			fx.host.emitTerminalInput("x");
+			await vi.waitFor(() => expect(executions).toEqual(["general-purpose"]));
+			expect(select).toHaveBeenCalledWith("Execute task with agent type", ["general-purpose"]);
+			select.mockResolvedValueOnce("cancelled");
+			fx.host.emitTerminalInput("f");
+			await vi.waitFor(() => expect(select).toHaveBeenCalledWith("Filter tasks", expect.any(Array)));
+			fx.host.emitTerminalInput("c");
+			expect(updates).toHaveLength(1);
+			fx.host.emitTerminalInput(ESC);
+			expect(fx.host.overlays.some((overlay) => !overlay.handle.hidden)).toBe(false);
+			expect(listener).toBeDefined();
+		} finally {
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+		expect(listener).toBeUndefined();
+	});
+	it("rejects a stale rich edit instead of overwriting a peer revision", async () => {
+		let current: TaskProjection = {
+			id: "stale-task",
+			code: "T7",
+			title: "Original title",
+			status: "pending",
+			dependencies: [],
+			blockedBy: [],
+			requirementRevision: 1,
+			spec: { scope: { paths: ["old.md"] } },
+			context: { background: "old context" },
+			attempts: [],
+			createdAt: 1,
+			updatedAt: 1,
+		};
+		const expected: number[] = [];
+		const port: TasksUiPort = {
+			snapshot: () => [current],
+			subscribe: () => () => {},
+			create: () => current,
+			update: (input) => {
+				expected.push(input.expectedRequirementRevision ?? -1);
+				if (input.expectedRequirementRevision !== current.requirementRevision)
+					throw new Error("Task revision is stale");
+				return current;
+			},
+			cancel: () => current,
+			execute: async () => ({ task: current, runId: "r" }),
+			output: async () => ({ taskId: current.id }),
+			stop: async () => false,
+			colors: () => [],
+			executionTypes: () => ["general-purpose"],
+		};
+		const fx = await makeFixture({ tasks: port });
+		const select = vi.spyOn(fx.host.extensionContext.ui, "select").mockResolvedValue("Unassigned");
+		const input = vi.spyOn(fx.host.extensionContext.ui, "input").mockImplementation(async (title, placeholder) => {
+			if (title === "Dependencies (task codes, comma-separated)")
+				current = {
+					...current,
+					requirementRevision: 2,
+					spec: { scope: { paths: ["peer.md"] } },
+					context: { background: "peer context" },
+				};
+			return placeholder ?? (title === "Task title" ? "Edited title" : "");
+		});
+		try {
+			fx.ui.openTasks();
+			const hub = await fx.host.waitForOverlayOpen();
+			await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).toContain("Original title"));
+			fx.host.emitTerminalInput("e");
+			await vi.waitFor(() => expect(input).toHaveBeenCalled());
+			await vi.waitFor(() => expect(expected).toEqual([1]));
+			await vi.waitFor(() =>
+				expect(fx.host.notifications).toContainEqual({ message: "Task revision is stale", type: "error" }),
+			);
+			expect(expected).toEqual([1]);
+			expect(current.spec.scope?.paths).toEqual(["peer.md"]);
+			expect(current.context.background).toBe("peer context");
+		} finally {
+			input.mockRestore();
+			select.mockRestore();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
 	it("names the empty overlay Team Hub", async () => {
 		const fx = await makeFixture();
 		try {
 			fx.ui.openHub();
 			const hub = await fx.host.waitForOverlayOpen();
 			expect(hub.component?.render(100)[0]).toContain("Team Hub");
-			expect(hub.component?.render(100).join("\n")).toContain("team (0)");
+			expect(hub.component?.render(100).join("\n")).toContain("Team Hub (0)");
 		} finally {
 			fx.ui.dispose();
 			await fx.app.sessionShutdown();
@@ -322,6 +552,321 @@ describe("inline UI installation", () => {
 			fx.ui.dispose();
 			await fx.app.sessionShutdown();
 			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("places Tasks above and Agents below the editor as independent widgets", async () => {
+		const task: TaskProjection = {
+			id: "inline-task",
+			code: "T9",
+			title: "TASK_WIDGET",
+			status: "pending",
+			dependencies: [],
+			blockedBy: [],
+			requirementRevision: 1,
+			spec: {},
+			context: {},
+			attempts: [],
+			createdAt: 1,
+			updatedAt: 1,
+		};
+		const tasks: TasksUiPort = {
+			snapshot: () => [task],
+			subscribe: () => () => {},
+			create: () => task,
+			update: () => task,
+			cancel: () => task,
+			execute: async () => ({ task, runId: "run-task" }),
+			output: async () => ({ taskId: task.id }),
+			stop: async () => false,
+			colors: () => [],
+			executionTypes: () => ["general-purpose"],
+		};
+		const fx = await makeFixture({ tasks });
+		try {
+			const agent = await fx.spawn("AGENT_WIDGET");
+			await vi.waitFor(() => expect(fx.host.widgets.get("teams-tasks")?.placement).toBe("aboveEditor"));
+			expect(fx.host.widgets.get("teams-agents")?.placement).toBe("belowEditor");
+			expect(
+				fx.host.componentFactories
+					.get("teams-tasks")?.({ requestRender() {} }, fx.host.theme)
+					.render(100)
+					.join("\\n"),
+			).toContain("TASK_WIDGET");
+			expect(
+				fx.host.componentFactories
+					.get("teams-agents")?.({ requestRender() {} }, fx.host.theme)
+					.render(100)
+					.join("\\n"),
+			).toContain("AGENT_WIDGET");
+			fx.backend.complete(agent, "done");
+			await fx.app.manager.waitForAll();
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(false));
+			expect(fx.host.widgets.has("teams-tasks")).toBe(true);
+			fx.ui.dispose();
+			expect(fx.host.widgets.has("teams-agents")).toBe(false);
+			expect(fx.host.widgets.has("teams-tasks")).toBe(false);
+		} finally {
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("agentInlinePanel=false hides Agents but retains Tasks and Hub access", async () => {
+		const task: TaskProjection = {
+			id: "inline-task",
+			code: "T9",
+			title: "TASK_STAYS",
+			status: "pending",
+			dependencies: [],
+			blockedBy: [],
+			requirementRevision: 1,
+			spec: {},
+			context: {},
+			attempts: [],
+			createdAt: 1,
+			updatedAt: 1,
+		};
+		const tasks: TasksUiPort = {
+			snapshot: () => [task],
+			subscribe: () => () => {},
+			create: () => task,
+			update: () => task,
+			cancel: () => task,
+			execute: async () => ({ task, runId: "run-task" }),
+			output: async () => ({ taskId: task.id }),
+			stop: async () => false,
+			colors: () => [],
+			executionTypes: () => ["general-purpose"],
+		};
+		const fx = await makeFixture({ agentInlinePanel: false, tasks });
+		let runId: string | undefined;
+		try {
+			runId = await fx.spawn("AGENTS_HIDDEN");
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-tasks")).toBe(true));
+			expect(fx.host.widgets.has("teams-agents")).toBe(false);
+			expect(fx.host.emitTerminalInput(DOWN)).toBe(false);
+			fx.ui.openHub();
+			const hub = await fx.host.waitForOverlayOpen();
+			expect(hub.component?.render(100).join("\\n")).toContain("AGENTS_HIDDEN");
+		} finally {
+			if (runId) fx.backend.complete(runId, "done");
+			await fx.app.manager.waitForAll();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("hide and show update the cached widget before a blocked transcript refresh resolves", async () => {
+		const fx = await makeFixture();
+		let id: string | undefined;
+		let releaseRead: (() => void) | undefined;
+		const gate = Promise.withResolvers<void>();
+		const readTranscript = fx.backend.readTranscript.bind(fx.backend);
+		try {
+			id = await fx.spawn("CACHED_WIDGET");
+			const blockedRead = vi.spyOn(fx.backend, "readTranscript").mockImplementation(async (handle) => {
+				releaseRead = () => gate.resolve();
+				await gate.promise;
+				return readTranscript(handle);
+			});
+			fx.ui.refresh();
+			await vi.waitFor(() => expect(releaseRead).toBeDefined());
+			fx.ui.setInlineAgentsVisible(false);
+			expect(fx.host.widgets.has("teams-agents")).toBe(false);
+			fx.ui.setInlineAgentsVisible(true);
+			expect(fx.host.widgets.get("teams-agents")?.placement).toBe("belowEditor");
+			expect(
+				fx.host.componentFactories
+					.get("teams-agents")?.({ requestRender() {} }, fx.host.theme)
+					.render(100)
+					.join("\\n"),
+			).toContain("CACHED_WIDGET");
+			blockedRead.mockRestore();
+		} finally {
+			releaseRead?.();
+			if (id) fx.backend.complete(id, "done");
+			await fx.app.manager.waitForAll();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("hiding inline Agents preserves a non-first Hub selection and focus", async () => {
+		const focused: string[] = [];
+		const fx = await makeFixture({
+			now: () => 100,
+			focus: (base) => ({
+				...base,
+				read: async (id) => {
+					focused.push(id);
+					return {
+						runId: id,
+						currentRunId: id,
+						items: [],
+						truncatedHead: false,
+						closed: false,
+						cwd: null,
+						capabilities: [],
+						model: null,
+						thinking: null,
+						context: null,
+					};
+				},
+			}),
+		});
+		const status = vi.spyOn(fx.host.extensionContext.ui, "setStatus");
+		const ids: string[] = [];
+		try {
+			ids.push(await fx.spawn("FIRST_HUB_ROW"));
+			ids.push(await fx.spawn("SECOND_HUB_ROW"));
+			fx.ui.openHub();
+			const hub = await fx.host.waitForOverlayOpen();
+			fx.host.emitTerminalInput(DOWN);
+			const before = hub.component?.render(100).join("\\n");
+			expect(before).toContain("SECOND_HUB_ROW");
+			expect(focused.at(-1)).toBe(ids[1]);
+			const priorStatus = status.mock.calls.at(-1);
+			fx.ui.setInlineAgentsVisible(false);
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(false));
+			expect(hub.component?.render(100).join("\\n")).toBe(before);
+			expect(focused.at(-1)).toBe(ids[1]);
+			expect(status.mock.calls.at(-1)).toEqual(priorStatus);
+		} finally {
+			for (const id of ids) fx.backend.complete(id, "done");
+			await fx.app.manager.waitForAll();
+			status.mockRestore();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("hiding inline Agents leaves a focused child transcript and runtime untouched", async () => {
+		const fx = await makeFixture();
+		let id: string | undefined;
+		try {
+			id = await fx.spawn("CHILD_STAYS_OPEN");
+			const opening = fx.host.waitForOverlayOpen();
+			fx.host.emitTerminalInput(DOWN);
+			fx.host.emitTerminalInput(DOWN);
+			fx.host.emitTerminalInput(ENTER);
+			const overlay = await opening;
+			const view = overlay.component as AgentViewOverlay;
+			view.editor.setText("KEEP_CHILD_DRAFT");
+			const stops = [...fx.backend.stops];
+			const disposed = [...fx.backend.disposedHandles];
+			const steers = [...fx.backend.steers];
+			const presentations = [...fx.host.workingIndicatorChanges];
+			fx.ui.setInlineAgentsVisible(false);
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(false));
+			expect(overlay.handle.hidden).toBe(false);
+			expect(view.editor.getText()).toBe("KEEP_CHILD_DRAFT");
+			expect(fx.app.manager.get(id)?.status).toBe("running");
+			expect(fx.backend.stops).toEqual(stops);
+			expect(fx.backend.disposedHandles).toEqual(disposed);
+			expect(fx.backend.steers).toEqual(steers);
+			expect(fx.host.workingIndicatorChanges).toEqual(presentations);
+		} finally {
+			if (id) fx.backend.complete(id, "done");
+			await fx.app.manager.waitForAll();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("hidden Agents leave Hub shortcuts usable and showing restores the prior rows", async () => {
+		const task: TaskProjection = {
+			id: "still-task",
+			code: "T2",
+			title: "TASK_STAYS",
+			status: "pending",
+			dependencies: [],
+			blockedBy: [],
+			requirementRevision: 1,
+			spec: {},
+			context: {},
+			attempts: [],
+			createdAt: 1,
+			updatedAt: 1,
+		};
+		const tasks: TasksUiPort = {
+			snapshot: () => [task],
+			subscribe: () => () => {},
+			create: () => task,
+			update: () => task,
+			cancel: () => task,
+			execute: async () => ({ task, runId: "task-run" }),
+			output: async () => ({ taskId: task.id }),
+			stop: async () => false,
+			colors: () => [],
+			executionTypes: () => ["general-purpose"],
+		};
+		const fx = await makeFixture({ tasks, now: () => 100 });
+		let id: string | undefined;
+		try {
+			id = await fx.spawn("RESTORE_AGENT_ROW");
+			const { editor } = mountMainEditor(fx);
+			const renderer = () =>
+				fx.host.componentFactories
+					.get("teams-agents")?.({ requestRender() {} }, fx.host.theme)
+					.render(100)
+					.join("\\n") ?? "";
+			const priorRows = renderer();
+			fx.ui.setInlineAgentsVisible(false);
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(false));
+			expect(fx.host.emitTerminalInput(DOWN)).toBe(false);
+			editor.setText("");
+			expect(fx.host.emitTerminalInput(LEFT)).toBe(false);
+			const leftLeftHub = fx.host.waitForNextOverlayOpen();
+			expect(fx.host.emitTerminalInput(LEFT)).toBe(true);
+			await leftLeftHub;
+			fx.host.emitTerminalInput(ESC);
+			const altGHub = fx.host.waitForNextOverlayOpen();
+			expect(fx.host.emitTerminalInput("\x1bg")).toBe(true);
+			await altGHub;
+			fx.host.emitTerminalInput(ESC);
+			fx.ui.openAgents();
+			const agentsHub = await fx.host.waitForOverlayOpen();
+			expect(agentsHub.component?.render(100).join("\\n")).toContain("RESTORE_AGENT_ROW");
+			fx.host.emitTerminalInput(ESC);
+			fx.ui.openTasks();
+			const tasksHub = await fx.host.waitForOverlayOpen();
+			expect(tasksHub.component?.render(100).join("\\n")).toContain("TASK_STAYS");
+			fx.host.emitTerminalInput(ESC);
+			fx.ui.setInlineAgentsVisible(true);
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(true));
+			expect(renderer()).toBe(priorRows);
+			expect(fx.host.widgets.has("teams-tasks")).toBe(true);
+		} finally {
+			if (id) fx.backend.complete(id, "done");
+			await fx.app.manager.waitForAll();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("a newly installed UI host starts from the configured inline-panel default", async () => {
+		const fx = await makeFixture();
+		let runId: string | undefined;
+		let ui = fx.ui;
+		try {
+			runId = await fx.spawn("NEW_HOST_DEFAULT");
+			ui.setInlineAgentsVisible(false);
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(false));
+			ui.dispose();
+			const transcripts = createPiTranscriptSource({ backends: [fx.backend] });
+			ui = installSubagentsUi(fx.host.extensionContext, {
+				manager: fx.app.manager,
+				focus: createAgentFocusPort({ manager: fx.app.manager, transcripts }),
+				settings: () => fx.app.manager.currentSettings,
+				transcripts,
+			});
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(true));
+		} finally {
+			if (runId) fx.backend.complete(runId, "done");
+			await fx.app.manager.waitForAll();
+			ui.dispose();
+			await fx.app.sessionShutdown();
 		}
 	});
 
@@ -580,16 +1125,14 @@ describe("keyboard table via onTerminalInput", () => {
 			fx.ui.openHub();
 			await fx.host.waitForOverlayOpen();
 
-			// One window down from main lands on rows[1], not the six-row clamp.
+			// Opening selects the first teammate; paging uses the rendered capacity.
+			expect(focused).toEqual([ids[0]]);
 			expect(fx.host.emitTerminalInput(PAGE_DOWN)).toBe(true);
-			expect(focused).toEqual([ids[1]]);
-			expect(focused).not.toContain(ids[2]);
-
-			// A second window clamps to the last row; one window back up returns to rows[0].
-			expect(fx.host.emitTerminalInput(PAGE_DOWN)).toBe(true);
-			expect(focused).toEqual([ids[1], ids[2]]);
+			expect(focused).toEqual([ids[0], ids[capacity]]);
+			expect(fx.host.emitTerminalInput(PAGE_DOWN)).toBe(true); // clamped at last
+			expect(focused).toEqual([ids[0], ids[capacity]]);
 			expect(fx.host.emitTerminalInput(PAGE_UP)).toBe(true);
-			expect(focused).toEqual([ids[1], ids[2], ids[0]]);
+			expect(focused).toEqual([ids[0], ids[capacity], ids[0]]);
 		} finally {
 			// Settle the runs first: session teardown otherwise waits its full grace.
 			for (const id of ids) fx.backend.complete(id, "done");

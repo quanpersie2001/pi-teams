@@ -74,6 +74,12 @@ export function buildAgentListView(
 	manager: {
 		list(): AgentRun[];
 		canAttachPane?(agentId: string): boolean;
+		teammateStatus?(name: string):
+			| {
+					state: NonNullable<AgentListRow["teammateState"]>;
+					availability: NonNullable<AgentListRow["teammateAvailability"]>;
+			  }
+			| undefined;
 	},
 	options: BuildAgentListViewOptions = {},
 ): AgentListView {
@@ -107,6 +113,14 @@ export function buildAgentListView(
 			attachable,
 			now,
 		});
+		const teammate = record.teammateName ? manager.teammateStatus?.(record.teammateName) : undefined;
+		if (teammate) {
+			row.teammateState = teammate.state;
+			row.teammateAvailability = teammate.availability;
+			if (teammate.availability === "unavailable" && record.handle !== undefined)
+				row.resourceState = "cleanup-unconfirmed";
+			if (teammate.state === "retired") row.capabilities.resumable = false;
+		}
 		if (isTerminalStatus(record.status)) finished.push(row);
 		else active.push(row);
 	}

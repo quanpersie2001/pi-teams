@@ -10,12 +10,59 @@ export function registerAgentsCommand(
 	deps: {
 		manager: AgentManager;
 		openHub: () => void;
+		setInlineAgentsVisible: (visible: boolean | "toggle") => void;
 	},
 ): void {
 	pi.registerCommand("agents", {
-		description: "Open the Team Hub; release <id> [--worktree] cleans settled resources",
+		description: "Open Team Hub; release runs or inspect/release/retire named teammates",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const words = args.trim().split(/\s+/);
+			if (words[0] === "panel") {
+				if (words.length > 2 || (words[1] !== undefined && !["show", "hide", "toggle"].includes(words[1]))) {
+					ctx.ui.notify("Usage: /agents panel [show|hide|toggle]", "error");
+					return;
+				}
+				const action = words[1] ?? "toggle";
+				deps.setInlineAgentsVisible(action === "toggle" ? "toggle" : action === "show");
+				ctx.ui.notify(
+					`Inline Agents panel ${action === "toggle" ? "toggled" : action === "hide" ? "hidden" : "shown"} for this session.`,
+					"info",
+				);
+				return;
+			}
+			if (words[0] === "teammate-status" || words[0] === "teammate-release" || words[0] === "teammate-retire") {
+				const [action, name, extra] = words;
+				if (!name || extra !== undefined) {
+					ctx.ui.notify(`Usage: /agents ${action} <teammate-name>`, "error");
+					return;
+				}
+				try {
+					if (action === "teammate-status") {
+						const status = deps.manager.teammateStatus(name);
+						ctx.ui.notify(
+							status
+								? `@${status.name}: ${status.state}; ${status.availability}; context ${status.contextAvailable ? "available" : "unavailable"}${status.currentRunId ? ` (live run ${status.currentRunId})` : ""}${status.lastRunId ? ` (last run ${status.lastRunId})` : ""}${status.recoveryError ? ` — ${status.recoveryError}` : ""}`
+								: `Unknown teammate: ${name}`,
+							status ? "info" : "error",
+						);
+						return;
+					}
+					const retired = action === "teammate-retire";
+					const changed = retired ? await deps.manager.retireTeammate(name) : await deps.manager.releaseTeammate(name);
+					const status = changed ? deps.manager.teammateStatus(name) : undefined;
+					ctx.ui.notify(
+						!changed
+							? `Unknown teammate: ${name}`
+							: status
+								? `Teammate @${name} is now ${status.state}. Task-board claims are unchanged.`
+								: `Lifecycle operation completed for @${name}, but current status is unavailable.`,
+						changed ? "info" : "error",
+					);
+				} catch (error) {
+					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				}
+				return;
+			}
 			if (words[0] === "release") {
 				if (!words[1] || words.length > 3 || (words[2] !== undefined && words[2] !== "--worktree")) {
 					ctx.ui.notify(
@@ -37,7 +84,10 @@ export function registerAgentsCommand(
 				return;
 			}
 			if (args.trim()) {
-				ctx.ui.notify("Usage: /agents [release <id> [--worktree]]", "error");
+				ctx.ui.notify(
+					"Usage: /agents [panel [show|hide|toggle] | release <id> [--worktree] | teammate-status <name> | teammate-release <name> | teammate-retire <name>]",
+					"error",
+				);
 				return;
 			}
 			deps.openHub();

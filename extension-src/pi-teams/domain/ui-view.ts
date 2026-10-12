@@ -49,6 +49,9 @@ export interface AgentListRow {
 	teammateName?: string;
 	/** Normalized #RRGGBB identity color, when supplied at creation. */
 	teammateColor?: string;
+	/** Teammate lifecycle is separate from this assignment's outcome. */
+	teammateState?: "idle" | "busy" | "released" | "retired";
+	teammateAvailability?: "available" | "unavailable";
 	description: string;
 	status: AgentRunStatus;
 	backend: "process";
