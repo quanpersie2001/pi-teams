@@ -1,13 +1,11 @@
 # Changelog
 
-- Add an inline Tasks widget above the editor for pending/in-progress/in-review tasks, with terminal tasks retained in Hub history; keep the Agents panel below the editor and add session-only `/agents panel [show|hide|toggle]` visibility plus the `agentInlinePanel` startup default.
-
 ## Unreleased
 
 ### Features
 
+- Add an inline Tasks widget above the editor for pending/in-progress/in-review tasks, with terminal tasks retained in Hub history; keep the Agents panel below the editor and add session-only `/agents panel [show|hide|toggle]` visibility plus the `agentInlinePanel` startup default.
 - Merge the `references/pi-tasks` workflow into session-scoped unified Tasks tools, with typed task requirements/context/outcomes and explicit execution-attempt lifecycle
-
 - Add named-teammate status, release and retirement controls; explicit continue/fresh context policy; fail-closed mailbox availability guards and per-teammate pending-message archiving on context replacement
 - Additive v3 RPC capabilities and teammate lifecycle operations; preserve existing run-ID status/release semantics
 
@@ -15,6 +13,35 @@
 
 - Document unified Tasks Hub controls, v2 task schema normalization, opt-in cascade/reminder automation, and fail-closed board-lock recovery
 - Document teammate lifecycle states, recovery availability, context replacement, mailbox receipts and additive RPC compatibility
+
+## [0.1.6] - 2026-10-10
+
+### Bug Fixes
+
+- *(model)* Apply strict admission to the launch re-check too
+- *(hub)* Size the roster from the terminal, not the inline panel
+- *(hub)* Page by the rendered window, not the panel page size
+
+### Documentation
+
+- Document team_task_edit/cancel and the send_message target rules
+- State the skill attribution scope
+
+### Features
+
+- *(model)* Reject ambiguous or unregistered invoked models
+
+### Miscellaneous Tasks
+
+- *(package)* Stop publishing the internal porting document
+
+### Refactor
+
+- Share the tool-registration guard
+
+### Testing
+
+- Close the audit coverage gaps
 
 ## [0.1.5] - 2026-10-10
 
