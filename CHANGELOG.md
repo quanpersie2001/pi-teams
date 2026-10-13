@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8] - 2026-10-13
+
+### Bug Fixes
+
+- Improve team and task hub rendering and mouse interaction
+- Satisfy hub lint and formatting checks
+
 ## [0.1.6] - 2026-10-10
 
 ### Bug Fixes
