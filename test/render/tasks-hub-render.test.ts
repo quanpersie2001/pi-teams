@@ -1,4 +1,4 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import type { TaskProjection } from "../../extension-src/pi-teams/domain/task-board.js";
 import type { AgentListRow } from "../../extension-src/pi-teams/domain/ui-view.js";
@@ -259,7 +259,14 @@ describe("unified tasks presentation", () => {
 		).join("\n");
 		expect(text).toContain("First line");
 		expect(text).toContain("Second line");
-		expect(renderTasksHub(data([running], { runs: [run("live", "running", 2048)], now: 5_000, detail: true }), fg, 60, 20).join("\n")).toContain("Run metrics");
+		expect(
+			renderTasksHub(
+				data([running], { runs: [run("live", "running", 2048)], now: 5_000, detail: true }),
+				fg,
+				60,
+				20,
+			).join("\n"),
+		).toContain("Run metrics");
 		const noRuntime = renderTasksHub(data([running]), fg, 100, 12).join("\n");
 		expect(noRuntime).not.toContain("\x1b[38;2;0;215;255m◉\x1b[39m");
 		const inline = renderInlineTasks([running], new Map(), fg, 100, [run("live", "running", 2048)], 5_000).join("\n");
@@ -312,7 +319,9 @@ describe("unified tasks presentation", () => {
 		expect(text).toContain("\x1b[38;2;232;121;249m@actual-worker\x1b[39m");
 		expect(text).toContain("\x1b[38;2;34;170;68m@planned-worker\x1b[39m");
 		expect(text).not.toContain("@past-worker");
-		const detail = renderTasksHub(data([completed, pending], { rosterColors: colors, detail: true }), fg, 120, 40).join("\n");
+		const detail = renderTasksHub(data([completed, pending], { rosterColors: colors, detail: true }), fg, 120, 40).join(
+			"\n",
+		);
 		expect(detail).toContain("Artifact: report.md");
 		expect(detail).toContain("Remaining issue: Follow up");
 		expect(detail).toContain("run-done");
@@ -337,7 +346,10 @@ describe("unified tasks presentation", () => {
 		component.handleMouse?.({ type: "wheel", wheelDelta: 1, x: 4, y: 4 } as never);
 		expect(wheel[1]?.slice(0, 2)).toEqual([1, "list"]);
 		const detailComponent = createTasksHubComponent(
-			tui, theme, () => data([task()], { detail: true }), undefined,
+			tui,
+			theme,
+			() => data([task()], { detail: true }),
+			undefined,
 			(delta, region, max) => wheel.push([delta, region, max]),
 		);
 		detailComponent.render(60);
@@ -349,7 +361,12 @@ describe("unified tasks presentation", () => {
 		const tasks = Array.from({ length: 20 }, (_, index) => task({ id: `task-${index}`, code: `T${index}` }));
 		const selected: string[] = [];
 		const tui = { terminal: { rows: 12, columns: 80 } } as never;
-		const component = createTasksHubComponent(tui, theme, () => data(tasks), (id) => selected.push(id));
+		const component = createTasksHubComponent(
+			tui,
+			theme,
+			() => data(tasks),
+			(id) => selected.push(id),
+		);
 		component.render(80);
 		const event = (y: number) => ({ type: "click", button: "left", x: 3, y }) as never;
 		component.handleMouse?.(event(1)); // Search
@@ -357,7 +374,12 @@ describe("unified tasks presentation", () => {
 		component.handleMouse?.(event(10)); // Footer
 		component.handleMouse?.(event(11)); // Bottom border
 		expect(selected).toEqual(["task-7"]);
-		const scrolled = createTasksHubComponent(tui, theme, () => data(tasks, { selection: "task-16" }), (id) => selected.push(id));
+		const scrolled = createTasksHubComponent(
+			tui,
+			theme,
+			() => data(tasks, { selection: "task-16" }),
+			(id) => selected.push(id),
+		);
 		scrolled.render(80);
 		scrolled.handleMouse?.(event(1)); // Search is scrolled away; first visible task is T8.
 		expect(selected.at(-1)).toBe("task-8");
@@ -365,12 +387,13 @@ describe("unified tasks presentation", () => {
 
 	it("renders structured detail sections with Markdown formatting", () => {
 		const selected = task({
-			description: "Summary **bold** and multiline\ntext.\n\n| Field | Value |\n| --- | --- |\n| Kind | Markdown |\n\n```ts\nconst ready = true;\n```",
+			description:
+				"Summary **bold** and multiline\ntext.\n\n| Field | Value |\n| --- | --- |\n| Kind | Markdown |\n\n```ts\nconst ready = true;\n```",
 			spec: { acceptanceCriteria: ["First", "Second"], expectedOutput: "A report" },
 			outcome: { summary: "Done", verification: [{ check: "typecheck", outcome: "passed", evidence: "clean" }] },
 		});
 		const text = renderTasksHub(data([selected], { detail: true }), fg, 80, 60).join("\n");
-		const plain = text.replace(/\x1b\[[0-9;]*m/g, "");
+		const plain = stripTerminalSequences(text);
 		expect(plain).toContain("Acceptance criteria");
 		expect(plain).toContain("First");
 		expect(plain).toContain("┌");

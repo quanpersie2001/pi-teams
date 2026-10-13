@@ -100,9 +100,14 @@ export function dispatchPanelKey(
 }
 
 /** Stable Hub order: active rows first, retained idle resources last; retired teammates are history only. */
-export function hubRows<T extends PanelRowLike & { resourceState: string; teammateState?: string }>(rows: readonly T[]): T[] {
+export function hubRows<T extends PanelRowLike & { resourceState: string; teammateState?: string }>(
+	rows: readonly T[],
+): T[] {
 	const visible = rows.filter((row) => row.teammateState !== "retired");
-	return [...visible.filter((row) => row.resourceState !== "idle"), ...visible.filter((row) => row.resourceState === "idle")];
+	return [
+		...visible.filter((row) => row.resourceState !== "idle"),
+		...visible.filter((row) => row.resourceState === "idle"),
+	];
 }
 
 /** Hub navigation never visits the implicit Main row used by the inline panel. */

@@ -270,7 +270,16 @@ describe("inline UI installation", () => {
 		const updates: Array<{ id: string; status?: string }> = [];
 		const executions: string[] = [];
 		const port: TasksUiPort = {
-			snapshot: () => [currentTask, { ...currentTask, id: "task-two", code: "T2", title: "SECOND_TASK", description: `${"details line\n".repeat(40)}tail marker` }],
+			snapshot: () => [
+				currentTask,
+				{
+					...currentTask,
+					id: "task-two",
+					code: "T2",
+					title: "SECOND_TASK",
+					description: `${"details line\n".repeat(40)}tail marker`,
+				},
+			],
 			subscribe: (fn) => {
 				listener = fn;
 				return () => {
@@ -300,11 +309,24 @@ describe("inline UI installation", () => {
 			const hub = await fx.host.waitForOverlayOpen();
 			await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).toContain("TASK_ONLY_RENDER"));
 			expect(hub.component?.render(100).join("\n")).toContain("Team Hub ·");
-			const mouse = hub.component as Component & { handleMouse?: (event: unknown) => { handled?: boolean } | undefined };
-			const wheel = (x: number, y = 3, delta = 1) => mouse.handleMouse?.({
-				type: "wheel", button: "none", x, y, screenX: x, screenY: y, width: 100, height: 24,
-				shift: false, alt: false, ctrl: false, wheelDelta: delta,
-			});
+			const mouse = hub.component as Component & {
+				handleMouse?: (event: unknown) => { handled?: boolean } | undefined;
+			};
+			const wheel = (x: number, y = 3, delta = 1) =>
+				mouse.handleMouse?.({
+					type: "wheel",
+					button: "none",
+					x,
+					y,
+					screenX: x,
+					screenY: y,
+					width: 100,
+					height: 24,
+					shift: false,
+					alt: false,
+					ctrl: false,
+					wheelDelta: delta,
+				});
 			fx.host.emitTerminalInput("\t");
 			fx.host.emitTerminalInput("\t");
 			await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).toContain("TASK_ONLY_RENDER"));
@@ -341,21 +363,37 @@ describe("inline UI installation", () => {
 		expect(listener).toBeUndefined();
 	});
 	it("normalizes task selection and clamps preview keyboard scrolling across filters", async () => {
-		const makeTask = (id: string, code: string, title: string, description: string, status: TaskProjection["status"] = "pending"): TaskProjection => ({
-			id, code, title, description, status, dependencies: [], blockedBy: [], requirementRevision: 1,
-			spec: {}, context: {}, attempts: [], createdAt: 1, updatedAt: 1,
+		const makeTask = (
+			id: string,
+			code: string,
+			title: string,
+			description: string,
+			status: TaskProjection["status"] = "pending",
+		): TaskProjection => ({
+			id,
+			code,
+			title,
+			description,
+			status,
+			dependencies: [],
+			blockedBy: [],
+			requirementRevision: 1,
+			spec: {},
+			context: {},
+			attempts: [],
+			createdAt: 1,
+			updatedAt: 1,
 		});
-		let tasks = [
-			makeTask("a", "T1", "LONG_TASK", `${"A detail line\n".repeat(40)}A end`),
-			makeTask("b", "T2", "FILTERED_TASK", `${"B detail line\n".repeat(40)}B end`, "completed"),
-		];
+		const firstTask = makeTask("a", "T1", "LONG_TASK", `${"A detail line\n".repeat(40)}A end`);
+		const secondTask = makeTask("b", "T2", "FILTERED_TASK", `${"B detail line\n".repeat(40)}B end`, "completed");
+		let tasks = [firstTask, secondTask];
 		const port: TasksUiPort = {
 			snapshot: () => tasks,
 			subscribe: () => () => {},
-			create: () => tasks[0]!,
-			update: () => tasks[0]!,
-			cancel: () => tasks[0]!,
-			execute: async () => ({ task: tasks[0]!, runId: "run" }),
+			create: () => firstTask,
+			update: () => firstTask,
+			cancel: () => firstTask,
+			execute: async () => ({ task: firstTask, runId: "run" }),
 			output: async () => ({}),
 			stop: async () => false,
 			colors: () => [],
@@ -367,7 +405,21 @@ describe("inline UI installation", () => {
 			fx.ui.openTasks();
 			const hub = await fx.host.waitForOverlayOpen();
 			const mouse = hub.component as Component & { handleMouse?: (event: unknown) => unknown };
-			for (let i = 0; i < 40; i++) mouse.handleMouse?.({ type: "wheel", button: "none", x: 95, y: 3, screenX: 95, screenY: 3, width: 100, height: 12, shift: false, alt: false, ctrl: false, wheelDelta: 1 });
+			for (let i = 0; i < 40; i++)
+				mouse.handleMouse?.({
+					type: "wheel",
+					button: "none",
+					x: 95,
+					y: 3,
+					screenX: 95,
+					screenY: 3,
+					width: 100,
+					height: 12,
+					shift: false,
+					alt: false,
+					ctrl: false,
+					wheelDelta: 1,
+				});
 			fx.host.emitTerminalInput("f");
 			await vi.waitFor(() => expect(hub.component?.render(100).join("\n")).toContain("FILTERED_TASK"));
 			const filtered = hub.component?.render(100).join("\n") ?? "";
@@ -382,7 +434,7 @@ describe("inline UI installation", () => {
 			const oneStepBack = hub.component?.render(100).join("\n") ?? "";
 			expect(oneStepBack).not.toBe(atEnd);
 			expect(oneStepBack).toContain("B detail line");
-			tasks = [{ ...tasks[1]!, description: "short refreshed body" }];
+			tasks = [{ ...secondTask, description: "short refreshed body" }];
 			fx.host.emitTerminalInput("f");
 			await vi.waitFor(() => expect(select).toHaveBeenCalled());
 			const refreshed = hub.component?.render(100).join("\n") ?? "";

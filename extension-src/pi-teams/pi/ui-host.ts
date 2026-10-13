@@ -390,7 +390,14 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	}
 
 	function normalizeTaskSelection(): void {
-		const visible = visibleTasks({ tasks: taskRows, selection: taskSelection, filter: taskFilter, query: taskQuery, detail: taskDetail, rosterColors: taskColorIndex });
+		const visible = visibleTasks({
+			tasks: taskRows,
+			selection: taskSelection,
+			filter: taskFilter,
+			query: taskQuery,
+			detail: taskDetail,
+			rosterColors: taskColorIndex,
+		});
 		if (!visible.some((task) => task.id === taskSelection)) taskSelection = visible[0]?.id ?? null;
 	}
 
@@ -576,7 +583,10 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		};
 		const scroll = (delta: number) => {
 			if (!taskSelection) return;
-			taskDetailScroll.set(taskSelection, Math.max(0, Math.min(taskDetailScrollLimit, (taskDetailScroll.get(taskSelection) ?? 0) + delta)));
+			taskDetailScroll.set(
+				taskSelection,
+				Math.max(0, Math.min(taskDetailScrollLimit, (taskDetailScroll.get(taskSelection) ?? 0) + delta)),
+			);
 			requestRender();
 		};
 		if (matchesKey(data, "up")) {
@@ -930,8 +940,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 					);
 					const component: Component = {
 						render: (width) => (hubTab === "tasks" ? tasksComponent.render(width) : agentComponent.render(width)),
-						handleMouse: (event) =>
-							(hubTab === "tasks" ? tasksComponent : agentComponent).handleMouse?.(event),
+						handleMouse: (event) => (hubTab === "tasks" ? tasksComponent : agentComponent).handleMouse?.(event),
 						invalidate: () => {
 							agentComponent.invalidate();
 							tasksComponent.invalidate();

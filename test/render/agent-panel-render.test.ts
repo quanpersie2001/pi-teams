@@ -59,7 +59,11 @@ describe("team hub rendering", () => {
 		const active = row({ id: "active", teammateName: "peer" });
 		const source = view([retired, active]);
 		const result = renderAgentHub(
-			{ view: source, selection: "retired", stopArmedFor: null, focus: null }, fg, 100, 20, NOW,
+			{ view: source, selection: "retired", stopArmedFor: null, focus: null },
+			fg,
+			100,
+			20,
+			NOW,
 		);
 		expect(result.lines[0]).toContain("Team Hub (1)");
 		expect(result.lines.join("\\n")).not.toContain("old-peer");

@@ -41,53 +41,6 @@ const statusGlyph = (task: TaskProjection, fg: ThemeFg, runs: readonly AgentList
 	return task.blockedBy.length ? rgb("#f59e0b", "◌") : fg("text", "○");
 };
 
-function wrapAnsi(text: string, width: number): string[] {
-	if (width < 1) return [""];
-	const tokens: string[] = [];
-	for (let i = 0; i < text.length; ) {
-		if (text[i] === "\x1b" && text[i + 1] === "[") {
-			const end = text.indexOf("m", i + 2);
-			if (end >= 0) {
-				tokens.push(text.slice(i, end + 1));
-				i = end + 1;
-				continue;
-			}
-		}
-		const codePoint = text.codePointAt(i);
-		if (codePoint === undefined) break;
-		const char = String.fromCodePoint(codePoint);
-		tokens.push(char);
-		i += char.length;
-	}
-	const lines: string[] = [];
-	let line = "";
-	let used = 0;
-	let color = "";
-	for (const token of tokens) {
-		if (token === "\n") {
-			lines.push(`${line}${color ? "\x1b[39m" : ""}`);
-			line = color;
-			used = 0;
-			continue;
-		}
-		if (token.startsWith("\x1b[")) {
-			line += token;
-			color = token === "\x1b[39m" ? "" : token;
-			continue;
-		}
-		const tokenWidth = visibleWidth(token);
-		if (used > 0 && used + tokenWidth > width) {
-			lines.push(`${line}${color ? "\x1b[39m" : ""}`);
-			line = color;
-			used = 0;
-		}
-		line += token;
-		used += tokenWidth;
-	}
-	if (line || lines.length === 0) lines.push(line);
-	return lines;
-}
-
 export function taskHeader(tasks: readonly TaskProjection[]): string {
 	const counts = [
 		[tasks.filter((t) => t.status === "completed").length, "done"],
@@ -139,7 +92,10 @@ function identity(name: string | undefined, colors: ReadonlyMap<string, string>,
 	return `\x1b[38;2;${Number.parseInt(color.slice(1, 3), 16)};${Number.parseInt(color.slice(3, 5), 16)};${Number.parseInt(color.slice(5, 7), 16)}m@${name}\x1b[39m`;
 }
 
-export function tasksHubListWindow(data: TasksHubData, height: number): { start: number; bodyEnd: number; taskIdsByLine: Array<string | null> } {
+export function tasksHubListWindow(
+	data: TasksHubData,
+	height: number,
+): { start: number; bodyEnd: number; taskIdsByLine: Array<string | null> } {
 	const tasks = visibleTasks(data);
 	const selected = tasks.find((task) => task.id === data.selection) ?? tasks[0];
 	const bodyEnd = Math.max(0, Math.floor(height) - 3);
@@ -148,12 +104,18 @@ export function tasksHubListWindow(data: TasksHubData, height: number): { start:
 	const start = Math.max(0, Math.min(tasks.length + 1 - rowLines, selectedRow - rowLines + 1));
 	const taskIdsByLine = Array.from({ length: bodyEnd }, (_, line) => {
 		const listIndex = start + line;
-		return listIndex > 0 ? tasks[listIndex - 1]?.id ?? null : null;
+		return listIndex > 0 ? (tasks[listIndex - 1]?.id ?? null) : null;
 	});
 	return { start, bodyEnd, taskIdsByLine };
 }
 
-export function renderTasksHub(data: TasksHubData, fg: ThemeFg, width: number, height: number, onDetailScrollLimit?: (taskId: string | null, max: number, normalizedOffset: number) => void): string[] {
+export function renderTasksHub(
+	data: TasksHubData,
+	fg: ThemeFg,
+	width: number,
+	height: number,
+	onDetailScrollLimit?: (taskId: string | null, max: number, normalizedOffset: number) => void,
+): string[] {
 	const w = Math.max(0, Math.floor(width));
 	const h = Math.max(0, Math.floor(height));
 	if (!w || !h) return [];
@@ -198,7 +160,8 @@ export function renderTasksHub(data: TasksHubData, fg: ThemeFg, width: number, h
 		if (selected.description) details.push(selected.description);
 		if (selected.spec.acceptanceCriteria?.length)
 			details.push("## Acceptance criteria", ...selected.spec.acceptanceCriteria.map((x) => `- ${x}`));
-		if (selected.spec.scope?.paths?.length) details.push(`## Scope\n${selected.spec.scope.paths.map((x) => `- ${x}`).join("\n")}`);
+		if (selected.spec.scope?.paths?.length)
+			details.push(`## Scope\n${selected.spec.scope.paths.map((x) => `- ${x}`).join("\n")}`);
 		if (selected.spec.scope?.outOfScope?.length)
 			details.push(`## Out of scope\n${selected.spec.scope.outOfScope.map((x) => `- ${x}`).join("\n")}`);
 		if (selected.spec.expectedOutput) details.push(`## Expected output\n${selected.spec.expectedOutput}`);
@@ -209,7 +172,8 @@ export function renderTasksHub(data: TasksHubData, fg: ThemeFg, width: number, h
 			details.push(`## Decisions\n${selected.context.decisions.map((x) => `- ${x}`).join("\n")}`);
 		for (const reference of selected.context.references ?? [])
 			details.push(`- **${reference.kind}:** ${reference.target}${reference.note ? ` — ${reference.note}` : ""}`);
-		if (selected.dependencies.length) details.push(`## Dependencies\n${selected.dependencies.map((x) => `- ${x}`).join("\n")}`);
+		if (selected.dependencies.length)
+			details.push(`## Dependencies\n${selected.dependencies.map((x) => `- ${x}`).join("\n")}`);
 		const taskRefs = new Set([selected.id, ...(selected.code ? [selected.code] : [])]);
 		const dependents = data.tasks.filter(
 			(task) => task.id !== selected.id && task.dependencies.some((dependency) => taskRefs.has(dependency)),
@@ -226,11 +190,17 @@ export function renderTasksHub(data: TasksHubData, fg: ThemeFg, width: number, h
 		if (selected.outcome?.artifacts?.length)
 			details.push(`## Artifacts\n${selected.outcome.artifacts.map((x) => `- Artifact: ${x}`).join("\n")}`);
 		if (selected.outcome?.remainingIssues?.length)
-			details.push(`## Remaining issues\n${selected.outcome.remainingIssues.map((x) => `- ${fg("warning", `Remaining issue: ${x}`)}`).join("\n")}`);
+			details.push(
+				`## Remaining issues\n${selected.outcome.remainingIssues.map((x) => `- ${fg("warning", `Remaining issue: ${x}`)}`).join("\n")}`,
+			);
 		if (selected.outcome?.verification?.length)
-			details.push(`## Verification\n${selected.outcome.verification.map((check) => `- ${check.outcome === "passed" ? fg("success", "✓") : check.outcome === "failed" ? fg("error", "!") : fg("muted", "○")} **${check.outcome}:** ${check.check}${check.evidence ? ` — ${check.evidence}` : ""}`).join("\n")}`);
+			details.push(
+				`## Verification\n${selected.outcome.verification.map((check) => `- ${check.outcome === "passed" ? fg("success", "✓") : check.outcome === "failed" ? fg("error", "!") : fg("muted", "○")} **${check.outcome}:** ${check.check}${check.evidence ? ` — ${check.evidence}` : ""}`).join("\n")}`,
+			);
 		if (selected.attempts.length)
-			details.push(`## Attempts\n${selected.attempts.map((attempt) => `- ${attempt.status === "failed" ? fg("error", "!") : attempt.status === "completed" ? fg("success", "✓") : fg("muted", "·")} **${attempt.status}**${attempt.teammateName ? ` ${identity(attempt.teammateName, data.rosterColors, fg)}` : ""} · ${attempt.runId}${attempt.error ? `: ${fg("error", attempt.error)}` : ""}${attempt.resultFile ? ` · result ${attempt.resultFile}` : ""}${attempt.partialResult ? ` ${attempt.partialResult}` : ""}`).join("\n")}`);
+			details.push(
+				`## Attempts\n${selected.attempts.map((attempt) => `- ${attempt.status === "failed" ? fg("error", "!") : attempt.status === "completed" ? fg("success", "✓") : fg("muted", "·")} **${attempt.status}**${attempt.teammateName ? ` ${identity(attempt.teammateName, data.rosterColors, fg)}` : ""} · ${attempt.runId}${attempt.error ? `: ${fg("error", attempt.error)}` : ""}${attempt.resultFile ? ` · result ${attempt.resultFile}` : ""}${attempt.partialResult ? ` ${attempt.partialResult}` : ""}`).join("\n")}`,
+			);
 	} else details.push(` ${fg("muted", "No tasks match this filter.")}`);
 	const detailMarkdown = new Markdown(details.join("\n\n"), 0, 0, resolveMarkdownTheme());
 	let wrappedDetails: string[];
@@ -372,10 +342,12 @@ export function createTasksHubComponent(
 			const data = getData();
 			renderedWidth = width;
 			renderedHeight = _tui.terminal.rows;
-			return data ? renderTasksHub(data, fg, width, renderedHeight, (id, max, offset) => {
-				renderedMaxDetailScroll = max;
-				onDetailScrollLimit?.(id, max, offset);
-			}) : [];
+			return data
+				? renderTasksHub(data, fg, width, renderedHeight, (id, max, offset) => {
+						renderedMaxDetailScroll = max;
+						onDetailScrollLimit?.(id, max, offset);
+					})
+				: [];
 		},
 		invalidate() {},
 	};
