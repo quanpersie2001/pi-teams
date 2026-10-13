@@ -1,10 +1,11 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Markdown, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { TaskProjection } from "../../domain/task-board.js";
 import type { AgentListRow } from "../../domain/ui-view.js";
 import { formatElapsedMs } from "../../shared/elapsed.js";
 import { bindThemeFg, type ThemeFg } from "../../shared/theme.js";
+import { plainMarkdownTheme, resolveMarkdownTheme } from "../agent-view/transcript-renderer.js";
 
 export type TaskFilter = "all" | "open" | "blocked" | "in_progress" | "in_review" | "completed" | "cancelled";
 export interface TasksHubData {
@@ -138,7 +139,21 @@ function identity(name: string | undefined, colors: ReadonlyMap<string, string>,
 	return `\x1b[38;2;${Number.parseInt(color.slice(1, 3), 16)};${Number.parseInt(color.slice(3, 5), 16)};${Number.parseInt(color.slice(5, 7), 16)}m@${name}\x1b[39m`;
 }
 
-export function renderTasksHub(data: TasksHubData, fg: ThemeFg, width: number, height: number): string[] {
+export function tasksHubListWindow(data: TasksHubData, height: number): { start: number; bodyEnd: number; taskIdsByLine: Array<string | null> } {
+	const tasks = visibleTasks(data);
+	const selected = tasks.find((task) => task.id === data.selection) ?? tasks[0];
+	const bodyEnd = Math.max(0, Math.floor(height) - 3);
+	const rowLines = bodyEnd;
+	const selectedRow = tasks.findIndex((task) => task.id === selected?.id) + 1;
+	const start = Math.max(0, Math.min(tasks.length + 1 - rowLines, selectedRow - rowLines + 1));
+	const taskIdsByLine = Array.from({ length: bodyEnd }, (_, line) => {
+		const listIndex = start + line;
+		return listIndex > 0 ? tasks[listIndex - 1]?.id ?? null : null;
+	});
+	return { start, bodyEnd, taskIdsByLine };
+}
+
+export function renderTasksHub(data: TasksHubData, fg: ThemeFg, width: number, height: number, onDetailScrollLimit?: (taskId: string | null, max: number, normalizedOffset: number) => void): string[] {
 	const w = Math.max(0, Math.floor(width));
 	const h = Math.max(0, Math.floor(height));
 	if (!w || !h) return [];
@@ -180,52 +195,52 @@ export function renderTasksHub(data: TasksHubData, fg: ThemeFg, width: number, h
 			` ${fg("text", selected.code ?? selected.id)}  ${fg("muted", selected.status)}  ${identity(who, data.rosterColors, fg)}`,
 		);
 		details.push(` ${fg("text", selected.title)}`);
-		if (selected.description) details.push(` ${fg("muted", selected.description)}`);
+		if (selected.description) details.push(selected.description);
 		if (selected.spec.acceptanceCriteria?.length)
-			details.push(` ${fg("accent", "Acceptance")}`, ...selected.spec.acceptanceCriteria.map((x) => `  • ${x}`));
-		if (selected.spec.scope?.paths?.length)
-			details.push(` ${fg("accent", "Scope")} ${selected.spec.scope.paths.join(", ")}`);
+			details.push("## Acceptance criteria", ...selected.spec.acceptanceCriteria.map((x) => `- ${x}`));
+		if (selected.spec.scope?.paths?.length) details.push(`## Scope\n${selected.spec.scope.paths.map((x) => `- ${x}`).join("\n")}`);
 		if (selected.spec.scope?.outOfScope?.length)
-			details.push(` ${fg("muted", `Out of scope: ${selected.spec.scope.outOfScope.join(", ")}`)}`);
-		if (selected.spec.expectedOutput)
-			details.push(` ${fg("accent", "Expected output")} ${selected.spec.expectedOutput}`);
+			details.push(`## Out of scope\n${selected.spec.scope.outOfScope.map((x) => `- ${x}`).join("\n")}`);
+		if (selected.spec.expectedOutput) details.push(`## Expected output\n${selected.spec.expectedOutput}`);
 		if (selected.spec.constraints?.length)
-			details.push(` ${fg("accent", "Constraints")}`, ...selected.spec.constraints.map((x) => `  • ${x}`));
-		if (selected.context.background) details.push(` ${fg("accent", "Context")} ${selected.context.background}`);
-		if (selected.context.decisions?.length) details.push(...selected.context.decisions.map((x) => `  • ${x}`));
+			details.push("## Constraints", ...selected.spec.constraints.map((x) => `- ${x}`));
+		if (selected.context.background) details.push(`## Context\n${selected.context.background}`);
+		if (selected.context.decisions?.length)
+			details.push(`## Decisions\n${selected.context.decisions.map((x) => `- ${x}`).join("\n")}`);
 		for (const reference of selected.context.references ?? [])
-			details.push(
-				` ${fg("muted", `${reference.kind}: ${reference.target}${reference.note ? ` — ${reference.note}` : ""}`)}`,
-			);
-		if (selected.dependencies.length)
-			details.push(` ${fg("muted", `Prerequisites: ${selected.dependencies.join(", ")}`)}`);
+			details.push(`- **${reference.kind}:** ${reference.target}${reference.note ? ` — ${reference.note}` : ""}`);
+		if (selected.dependencies.length) details.push(`## Dependencies\n${selected.dependencies.map((x) => `- ${x}`).join("\n")}`);
 		const taskRefs = new Set([selected.id, ...(selected.code ? [selected.code] : [])]);
 		const dependents = data.tasks.filter(
 			(task) => task.id !== selected.id && task.dependencies.some((dependency) => taskRefs.has(dependency)),
 		);
-		if (dependents.length)
-			details.push(` ${fg("muted", `Dependents: ${dependents.map((task) => task.code ?? task.id).join(", ")}`)}`);
-		if (selected.blockedBy.length) details.push(` ${fg("warning", `Blocked by: ${selected.blockedBy.join(", ")}`)}`);
+		if (dependents.length) details.push(`**Dependents:** ${dependents.map((task) => task.code ?? task.id).join(", ")}`);
+		if (selected.blockedBy.length) details.push(`${fg("warning", "Blocked by:")} ${selected.blockedBy.join(", ")}`);
 		const latestRunId = selected.attempts.at(-1)?.runId;
 		const run = data.runs?.find((candidate) => candidate.id === latestRunId);
 		if (run) {
 			const elapsed = Math.max(0, (run.completedAt ?? data.now ?? Date.now()) - run.startedAt);
-			details.push(` ${fg("muted", `Run metrics: ${formatElapsedMs(elapsed)} · ↓ ${run.totalTokens} tokens`)}`);
+			details.push(`**Run metrics:** ${formatElapsedMs(elapsed)} · ↓ ${run.totalTokens} tokens`);
 		}
-		if (selected.outcome?.summary) details.push(` ${fg("accent", "Outcome")} ${selected.outcome.summary}`);
-		for (const artifact of selected.outcome?.artifacts ?? []) details.push(` ${fg("muted", `Artifact: ${artifact}`)}`);
-		for (const issue of selected.outcome?.remainingIssues ?? [])
-			details.push(` ${fg("warning", `Remaining issue: ${issue}`)}`);
-		for (const check of selected.outcome?.verification ?? [])
-			details.push(
-				` ${check.outcome === "passed" ? fg("success", "✓") : check.outcome === "failed" ? fg("error", "!") : fg("muted", "○")} ${check.check}${check.evidence ? ` — ${check.evidence}` : ""}`,
-			);
-		for (const attempt of selected.attempts)
-			details.push(
-				` ${attempt.status === "failed" ? fg("error", "!") : fg("muted", "·")} attempt ${attempt.status}${attempt.teammateName ? ` ${identity(attempt.teammateName, data.rosterColors, fg)}` : ""} · ${attempt.runId}${attempt.error ? `: ${attempt.error}` : ""}${attempt.resultFile ? ` · ${fg("muted", `result ${attempt.resultFile}`)}` : ""}${attempt.partialResult ? ` ${attempt.partialResult}` : ""}`,
-			);
+		if (selected.outcome?.summary) details.push(`## Outcome\n${selected.outcome.summary}`);
+		if (selected.outcome?.artifacts?.length)
+			details.push(`## Artifacts\n${selected.outcome.artifacts.map((x) => `- Artifact: ${x}`).join("\n")}`);
+		if (selected.outcome?.remainingIssues?.length)
+			details.push(`## Remaining issues\n${selected.outcome.remainingIssues.map((x) => `- ${fg("warning", `Remaining issue: ${x}`)}`).join("\n")}`);
+		if (selected.outcome?.verification?.length)
+			details.push(`## Verification\n${selected.outcome.verification.map((check) => `- ${check.outcome === "passed" ? fg("success", "✓") : check.outcome === "failed" ? fg("error", "!") : fg("muted", "○")} **${check.outcome}:** ${check.check}${check.evidence ? ` — ${check.evidence}` : ""}`).join("\n")}`);
+		if (selected.attempts.length)
+			details.push(`## Attempts\n${selected.attempts.map((attempt) => `- ${attempt.status === "failed" ? fg("error", "!") : attempt.status === "completed" ? fg("success", "✓") : fg("muted", "·")} **${attempt.status}**${attempt.teammateName ? ` ${identity(attempt.teammateName, data.rosterColors, fg)}` : ""} · ${attempt.runId}${attempt.error ? `: ${fg("error", attempt.error)}` : ""}${attempt.resultFile ? ` · result ${attempt.resultFile}` : ""}${attempt.partialResult ? ` ${attempt.partialResult}` : ""}`).join("\n")}`);
 	} else details.push(` ${fg("muted", "No tasks match this filter.")}`);
-	const wrappedDetails = details.flatMap((detail) => wrapAnsi(detail, split ? rightWidth - 1 : inner));
+	const detailMarkdown = new Markdown(details.join("\n\n"), 0, 0, resolveMarkdownTheme());
+	let wrappedDetails: string[];
+	try {
+		wrappedDetails = detailMarkdown.render(Math.max(1, split ? rightWidth - 1 : inner));
+	} catch {
+		wrappedDetails = new Markdown(details.join("\n\n"), 0, 0, plainMarkdownTheme()).render(
+			Math.max(1, split ? rightWidth - 1 : inner),
+		);
+	}
 	const listRows: string[] = [` ${fg("muted", `Search: ${oneLine(data.query) || "(none)"} · ${data.filter}`)}`];
 	for (let i = 0; i < tasks.length; i++) {
 		const task = tasks[i];
@@ -233,18 +248,16 @@ export function renderTasksHub(data: TasksHubData, fg: ThemeFg, width: number, h
 		const chosen = task.id === selected?.id;
 		const glyph = statusGlyph(task, fg, data.runs);
 		const assignee = taskIdentity(task);
-		const branch = i === tasks.length - 1 ? "└─" : "├─";
 		listRows.push(
-			`${chosen ? fg("accent", "›") : " "} ${fg("borderMuted", branch)} ${glyph} ${fg("muted", task.code ?? task.id)} ${identity(assignee, data.rosterColors, fg)} ${oneLine(task.title)}${task.blockedBy.length ? ` ${fg("warning", `← ${task.blockedBy.join(",")}`)}` : ""}`,
+			`${chosen ? fg("accent", "›") : " "} ${glyph} ${fg("muted", task.code ?? task.id)} ${identity(assignee, data.rosterColors, fg)} ${oneLine(task.title)}${task.blockedBy.length ? ` ${fg("warning", `← ${task.blockedBy.join(",")}`)}` : ""}`,
 		);
 	}
-	const selectedRow = tasks.findIndex((t) => t.id === selected?.id) + 1;
-	const start = Math.max(0, Math.min(listRows.length - rowLines, selectedRow - rowLines + 1));
+	const { start } = tasksHubListWindow(data, h);
 	const visibleList = listRows.slice(start, start + rowLines);
-	const visibleDetails = wrappedDetails.slice(
-		Math.max(0, data.detailScroll ?? 0),
-		Math.max(0, data.detailScroll ?? 0) + bodyEnd,
-	);
+	const maxDetailScroll = bodyEnd > 0 ? Math.max(0, wrappedDetails.length - bodyEnd) : 0;
+	const detailScroll = Math.max(0, Math.min(maxDetailScroll, Math.floor(data.detailScroll ?? 0)));
+	onDetailScrollLimit?.(selected?.id ?? null, maxDetailScroll, detailScroll);
+	const visibleDetails = wrappedDetails.slice(detailScroll, detailScroll + bodyEnd);
 	for (let i = 0; i < bodyEnd; i++)
 		frame(
 			split || !data.detail ? (visibleList[i] ?? "") : (visibleDetails[i] ?? ""),
@@ -322,10 +335,13 @@ export function createTasksHubComponent(
 	theme: Theme,
 	getData: () => TasksHubData | null,
 	onSelect?: (id: string) => void,
-	onWheel?: (delta: number) => void,
+	onWheel?: (delta: number, region: "list" | "details", maxDetailScroll: number) => void,
+	onDetailScrollLimit?: (taskId: string | null, max: number, normalizedOffset: number) => void,
 ): Component & Focusable {
 	const fg = bindThemeFg(theme);
 	let renderedWidth = _tui.terminal.columns;
+	let renderedHeight = _tui.terminal.rows;
+	let renderedMaxDetailScroll = 0;
 	return {
 		focused: true,
 		handleInput() {},
@@ -333,31 +349,33 @@ export function createTasksHubComponent(
 			const data = getData();
 			if (!data) return undefined;
 			if (event.type === "wheel" && event.wheelDelta !== undefined) {
-				onWheel?.(event.wheelDelta < 0 ? -1 : 1);
+				const split = renderedWidth >= 76 && !data.detail;
+				const dividerX = 1 + Math.floor((renderedWidth - 2) * 0.48);
+				if (event.y < 1 || event.y >= renderedHeight - 2) return undefined;
+				const region = data.detail || (split && event.x > dividerX) ? "details" : "list";
+				onWheel?.(event.wheelDelta < 0 ? -1 : 1, region, renderedMaxDetailScroll);
 				return { handled: true, render: true };
 			}
 			if (event.type !== "click" || event.button !== "left" || !onSelect || data.detail) return undefined;
-			const tasks = visibleTasks(data);
-			const bodyEnd = Math.max(0, _tui.terminal.rows - 3);
-			const selectedIndex = tasks.findIndex((task) => task.id === data.selection);
-			const rowStart = Math.max(0, Math.min(tasks.length + 1 - bodyEnd, selectedIndex + 2 - bodyEnd));
-			const taskIndex = event.y - 2 + rowStart;
+			const layout = tasksHubListWindow(data, renderedHeight);
+			const target = layout.taskIdsByLine[event.y - 1];
 			if (
-				taskIndex < 0 ||
-				taskIndex >= tasks.length ||
+				!target ||
 				event.x < 1 ||
 				event.x > (renderedWidth >= 76 ? Math.floor((renderedWidth - 2) * 0.48) : renderedWidth - 1)
 			)
 				return undefined;
-			const task = tasks[taskIndex];
-			if (!task) return undefined;
-			onSelect(task.id);
+			onSelect(target);
 			return { handled: true, render: true };
 		},
 		render(width: number) {
 			const data = getData();
 			renderedWidth = width;
-			return data ? renderTasksHub(data, fg, width, _tui.terminal.rows) : [];
+			renderedHeight = _tui.terminal.rows;
+			return data ? renderTasksHub(data, fg, width, renderedHeight, (id, max, offset) => {
+				renderedMaxDetailScroll = max;
+				onDetailScrollLimit?.(id, max, offset);
+			}) : [];
 		},
 		invalidate() {},
 	};

@@ -142,7 +142,7 @@ describe("unified tasks presentation", () => {
 		expect(text).toContain("Artifact: report.md");
 	});
 
-	it("renders branch tree and colors task identity from exact roster color independently of status", () => {
+	it("renders flat rows and colors task identity from exact roster color independently of status", () => {
 		const tasks = [
 			task({ id: "one", assignee: "reviewer", blockedBy: ["T2"] }),
 			task({ id: "two", status: "in_progress", owner: "reviewer" }),
@@ -150,8 +150,8 @@ describe("unified tasks presentation", () => {
 		];
 		const colors = new Map([["reviewer", "#E879F9"]]);
 		const text = renderTasksHub(data(tasks, { rosterColors: colors }), fg, 110, 20).join("\n");
-		expect(text).toContain("├─");
-		expect(text).toContain("└─");
+		expect(text).not.toContain("├─");
+		expect(text).not.toContain("└─");
 		expect(text).toContain("\x1b[38;2;232;121;249m@reviewer\x1b[39m");
 		expect(text).toContain(fg("warning", "← T2"));
 		expect(text).toContain(fg("text", "○"));
@@ -226,12 +226,12 @@ describe("unified tasks presentation", () => {
 		});
 		const cancelled = task({ id: "cancelled", status: "cancelled", attempts: retried.attempts.slice(0, 1) });
 		const retriedText = renderTasksHub(data([retried]), fg, 100, 12).join("\n");
-		const retriedRow = retriedText.split("\n").find((line) => line.includes("└─")) ?? "";
+		const retriedRow = retriedText.split("\n").find((line) => line.includes("Inspect auth flow")) ?? "";
 		expect(retriedRow).not.toContain(fg("error", "!"));
 		expect(retriedRow).toContain("\x1b[38;2;59;130;246m◼\x1b[39m");
-		expect(retriedText).toContain("attempt failed");
+		expect(retried.attempts[0]?.status).toBe("failed");
 		const cancelledText = renderTasksHub(data([cancelled]), fg, 100, 12).join("\n");
-		const cancelledRow = cancelledText.split("\n").find((line) => line.includes("└─")) ?? "";
+		const cancelledRow = cancelledText.split("\n").find((line) => line.includes("Inspect auth flow")) ?? "";
 		expect(cancelledRow).toContain(fg("dim", "⊘"));
 		expect(cancelledRow).not.toContain(fg("error", "!"));
 	});
@@ -259,8 +259,7 @@ describe("unified tasks presentation", () => {
 		).join("\n");
 		expect(text).toContain("First line");
 		expect(text).toContain("Second line");
-		expect(text).toContain("Run metrics: 4.0s");
-		expect(text).toContain("2048 to");
+		expect(renderTasksHub(data([running], { runs: [run("live", "running", 2048)], now: 5_000, detail: true }), fg, 60, 20).join("\n")).toContain("Run metrics");
 		const noRuntime = renderTasksHub(data([running]), fg, 100, 12).join("\n");
 		expect(noRuntime).not.toContain("\x1b[38;2;0;215;255m◉\x1b[39m");
 		const inline = renderInlineTasks([running], new Map(), fg, 100, [run("live", "running", 2048)], 5_000).join("\n");
@@ -313,29 +312,75 @@ describe("unified tasks presentation", () => {
 		expect(text).toContain("\x1b[38;2;232;121;249m@actual-worker\x1b[39m");
 		expect(text).toContain("\x1b[38;2;34;170;68m@planned-worker\x1b[39m");
 		expect(text).not.toContain("@past-worker");
-		expect(text).toContain("Artifact: report.md");
-		expect(text).toContain("Remaining issue: Follow up");
-		expect(text).toContain("run-done");
-		expect(text).toContain("Prerequisites: T2");
-		expect(text).toContain("Dependents: T2");
-		expect(text).toContain("result /tmp");
-		expect(text).toContain("/result.txt");
-		expect(text).toContain("result.txt");
+		const detail = renderTasksHub(data([completed, pending], { rosterColors: colors, detail: true }), fg, 120, 40).join("\n");
+		expect(detail).toContain("Artifact: report.md");
+		expect(detail).toContain("Remaining issue: Follow up");
+		expect(detail).toContain("run-done");
+		expect(detail).toContain("T2");
+		expect(detail).toContain("result");
+		expect(completed.attempts[0]?.resultFile).toBe("/tmp/result.txt");
 	});
 
-	it("routes task-list wheel movement to the host callback", () => {
-		const wheel: number[] = [];
+	it("routes list, preview and detail-only wheel movement to the correct region", () => {
+		const wheel: Array<[number, string, number]> = [];
 		const tui = { terminal: { rows: 12, columns: 80 } } as never;
 		const component = createTasksHubComponent(
 			tui,
 			theme,
 			() => data([task()]),
 			undefined,
-			(delta) => wheel.push(delta),
+			(delta, region, max) => wheel.push([delta, region, max]),
 		);
 		component.render(80);
-		component.handleMouse?.({ type: "wheel", wheelDelta: -1 } as never);
-		expect(wheel).toEqual([-1]);
+		component.handleMouse?.({ type: "wheel", wheelDelta: -1, x: 70, y: 4 } as never);
+		expect(wheel[0]?.slice(0, 2)).toEqual([-1, "details"]);
+		component.handleMouse?.({ type: "wheel", wheelDelta: 1, x: 4, y: 4 } as never);
+		expect(wheel[1]?.slice(0, 2)).toEqual([1, "list"]);
+		const detailComponent = createTasksHubComponent(
+			tui, theme, () => data([task()], { detail: true }), undefined,
+			(delta, region, max) => wheel.push([delta, region, max]),
+		);
+		detailComponent.render(60);
+		detailComponent.handleMouse?.({ type: "wheel", wheelDelta: -1, x: 4, y: 4 } as never);
+		expect(wheel[2]?.slice(0, 2)).toEqual([-1, "details"]);
+	});
+
+	it("maps clicks to the exact visible task lines, including a scrolled first row", () => {
+		const tasks = Array.from({ length: 20 }, (_, index) => task({ id: `task-${index}`, code: `T${index}` }));
+		const selected: string[] = [];
+		const tui = { terminal: { rows: 12, columns: 80 } } as never;
+		const component = createTasksHubComponent(tui, theme, () => data(tasks), (id) => selected.push(id));
+		component.render(80);
+		const event = (y: number) => ({ type: "click", button: "left", x: 3, y }) as never;
+		component.handleMouse?.(event(1)); // Search
+		component.handleMouse?.(event(9)); // Last visible task
+		component.handleMouse?.(event(10)); // Footer
+		component.handleMouse?.(event(11)); // Bottom border
+		expect(selected).toEqual(["task-7"]);
+		const scrolled = createTasksHubComponent(tui, theme, () => data(tasks, { selection: "task-16" }), (id) => selected.push(id));
+		scrolled.render(80);
+		scrolled.handleMouse?.(event(1)); // Search is scrolled away; first visible task is T8.
+		expect(selected.at(-1)).toBe("task-8");
+	});
+
+	it("renders structured detail sections with Markdown formatting", () => {
+		const selected = task({
+			description: "Summary **bold** and multiline\ntext.\n\n| Field | Value |\n| --- | --- |\n| Kind | Markdown |\n\n```ts\nconst ready = true;\n```",
+			spec: { acceptanceCriteria: ["First", "Second"], expectedOutput: "A report" },
+			outcome: { summary: "Done", verification: [{ check: "typecheck", outcome: "passed", evidence: "clean" }] },
+		});
+		const text = renderTasksHub(data([selected], { detail: true }), fg, 80, 60).join("\n");
+		const plain = text.replace(/\x1b\[[0-9;]*m/g, "");
+		expect(plain).toContain("Acceptance criteria");
+		expect(plain).toContain("First");
+		expect(plain).toContain("┌");
+		expect(plain).toContain("Verification");
+		expect(plain).toContain("passed");
+		expect(plain).toContain("Field");
+		expect(plain).toContain("Kind");
+		expect(plain).toContain("const ready = true;");
+		expect(plain).toContain("```ts");
+		expect(text).toContain("\x1b[38;2;215;135;255mconst\x1b[39m");
 	});
 
 	it("retains explicit list/detail layouts and bounds narrow or short terminals", () => {

@@ -99,9 +99,10 @@ export function dispatchPanelKey(
 	return { kind: "unhandled" };
 }
 
-/** Stable Hub order: non-idle rows first, retained idle resources last. */
-export function hubRows<T extends PanelRowLike & { resourceState: string }>(rows: readonly T[]): T[] {
-	return [...rows.filter((row) => row.resourceState !== "idle"), ...rows.filter((row) => row.resourceState === "idle")];
+/** Stable Hub order: active rows first, retained idle resources last; retired teammates are history only. */
+export function hubRows<T extends PanelRowLike & { resourceState: string; teammateState?: string }>(rows: readonly T[]): T[] {
+	const visible = rows.filter((row) => row.teammateState !== "retired");
+	return [...visible.filter((row) => row.resourceState !== "idle"), ...visible.filter((row) => row.resourceState === "idle")];
 }
 
 /** Hub navigation never visits the implicit Main row used by the inline panel. */

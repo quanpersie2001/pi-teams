@@ -275,7 +275,7 @@ export function renderAgentHub(
 		if (!run) continue;
 		if (run.resourceState === "idle" && !idleDivider) {
 			const label = `─ Idle (${idleCount}) `;
-			roster.set(y++, fg("borderMuted", label + "─".repeat(Math.max(0, rosterWidth - visibleWidth(label)))));
+			roster.set(y++, fg("accent", label + "─".repeat(Math.max(0, rosterWidth - visibleWidth(label)))));
 			idleDivider = true;
 		}
 		const label = run.teammateName ? `@${run.teammateName}` : run.type;
@@ -364,6 +364,7 @@ export function createAgentHubComponent(
 ): Component & Focusable {
 	const fg = bindThemeFg(theme);
 	let renderedWidth = tui.terminal.columns;
+	let renderedHeight = tui.terminal.rows;
 	return {
 		focused: true,
 		handleInput: onInput,
@@ -378,7 +379,7 @@ export function createAgentHubComponent(
 			const data = getData();
 			if (!data) return undefined;
 			// Recompute mapping after selection/lifecycle changes, even before the next paint.
-			const target = renderAgentHub(data, fg, renderedWidth, tui.terminal.rows, getNow()).targets.get(event.y);
+			const target = renderAgentHub(data, fg, renderedWidth, renderedHeight, getNow()).targets.get(event.y);
 			if (!target) return undefined;
 			if (data.view.rows.find((row) => row.id === target)?.capabilities.viewable) onFocus(target);
 			else return undefined;
@@ -388,7 +389,8 @@ export function createAgentHubComponent(
 			const data = getData();
 			if (!data) return [];
 			renderedWidth = width;
-			const result = renderAgentHub(data, fg, width, tui.terminal.rows, getNow());
+			renderedHeight = tui.terminal.rows;
+			const result = renderAgentHub(data, fg, width, renderedHeight, getNow());
 			return result.lines;
 		},
 		invalidate() {},

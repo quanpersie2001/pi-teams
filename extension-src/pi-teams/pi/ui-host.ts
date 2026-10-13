@@ -146,6 +146,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	let taskQuery = "";
 	let taskDetail = false;
 	const taskDetailScroll = new Map<string, number>();
+	let taskDetailScrollLimit = 0;
 	let taskError: string | null = null;
 	let taskUnsubscribe: (() => void) | undefined;
 	let hubFocus: AgentFocusSnapshot | null = null;
@@ -388,7 +389,13 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		openView(runId);
 	}
 
+	function normalizeTaskSelection(): void {
+		const visible = visibleTasks({ tasks: taskRows, selection: taskSelection, filter: taskFilter, query: taskQuery, detail: taskDetail, rosterColors: taskColorIndex });
+		if (!visible.some((task) => task.id === taskSelection)) taskSelection = visible[0]?.id ?? null;
+	}
+
 	function getTasksHubData(): TasksHubData {
+		normalizeTaskSelection();
 		return {
 			tasks: taskRows,
 			selection: taskSelection,
@@ -410,7 +417,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			taskColorIndex = new Map(
 				(options.tasks.colors() ?? []).flatMap((item) => (item.color ? [[item.name, item.color] as const] : [])),
 			);
-			if (!taskRows.some((task) => task.id === taskSelection)) taskSelection = taskRows[0]?.id ?? null;
+			normalizeTaskSelection();
 			if (enabled() && inlineTasks(taskRows).length > 0) installTaskWidget();
 			else if (taskWidgetRegistered) removeWidgets(TASK_WIDGET_KEY);
 		} catch (error) {
@@ -569,7 +576,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		};
 		const scroll = (delta: number) => {
 			if (!taskSelection) return;
-			taskDetailScroll.set(taskSelection, Math.max(0, (taskDetailScroll.get(taskSelection) ?? 0) + delta));
+			taskDetailScroll.set(taskSelection, Math.max(0, Math.min(taskDetailScrollLimit, (taskDetailScroll.get(taskSelection) ?? 0) + delta)));
 			requestRender();
 		};
 		if (matchesKey(data, "up")) {
@@ -611,6 +618,8 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		if (matchesKey(data, "/")) {
 			const value = await ctx.ui.input("Search tasks", taskQuery);
 			if (value !== undefined) taskQuery = value;
+			normalizeTaskSelection();
+			taskDetailScrollLimit = 0;
 			requestRender();
 			return;
 		}
@@ -625,6 +634,8 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 				"cancelled",
 			]);
 			if (selected) taskFilter = selected as TaskFilter;
+			normalizeTaskSelection();
+			taskDetailScrollLimit = 0;
 			refreshTasks();
 			return;
 		}
@@ -900,9 +911,11 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 							taskSelection = id;
 							requestRender();
 						},
-						(delta) => {
-							if (taskDetail && taskSelection) {
-								taskDetailScroll.set(taskSelection, Math.max(0, (taskDetailScroll.get(taskSelection) ?? 0) + delta));
+						(delta, region, maxDetailScroll) => {
+							if (region === "details" && taskSelection) {
+								taskDetailScrollLimit = maxDetailScroll;
+								const current = taskDetailScroll.get(taskSelection) ?? 0;
+								taskDetailScroll.set(taskSelection, Math.max(0, Math.min(maxDetailScroll, current + delta)));
 							} else {
 								const visible = visibleTasks(getTasksHubData());
 								const index = visible.findIndex((task) => task.id === taskSelection);
@@ -910,9 +923,15 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 							}
 							requestRender();
 						},
+						(id, max, offset) => {
+							taskDetailScrollLimit = max;
+							if (id) taskDetailScroll.set(id, offset);
+						},
 					);
 					const component: Component = {
 						render: (width) => (hubTab === "tasks" ? tasksComponent.render(width) : agentComponent.render(width)),
+						handleMouse: (event) =>
+							(hubTab === "tasks" ? tasksComponent : agentComponent).handleMouse?.(event),
 						invalidate: () => {
 							agentComponent.invalidate();
 							tasksComponent.invalidate();
