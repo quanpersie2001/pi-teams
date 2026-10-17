@@ -9,7 +9,7 @@
 
 - [Architecture](./ARCHITECTURE.md): layers, independent child processes, resource ownership and recovery.
 - [Configuration](./CONFIGURATION.md): agent definitions, settings, precedence and model admission.
-- [Integration](./INTEGRATION.md): public events RPC (including additive teammate status/release/retire), lifecycle, delivery and peer mailbox semantics.
+- [Integration](./INTEGRATION.md): public events RPC (including teammate status/release and in-progress shutdown), lifecycle, delivery and peer mailbox semantics.
 - [Agents UI](./ui/AGENT-PANEL-AND-VIEW.md): Main/child navigation, composers, transcript controls and terminal layout.
 - [Create-agent skill](../skills/create-agent/SKILL.md): author a focused specialist with supported Markdown fields and an exact `Agent` invocation.
 

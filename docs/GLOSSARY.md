@@ -27,18 +27,18 @@ Canonical vocabulary for docs, ADRs, tools and UI copy. One entity, four layers 
 
 - **Specialist type** — definition name; selects the role at spawn (`subagent_type`).
 - **Teammate name** — the team-unique address: mailbox path segment, `send_message` target, `@name` composer mention, board actor. Not the definition name. Role/name/color are fixed for the identity.
-- **Teammate lifecycle state** — `idle | busy | released | retired`; busy includes queued work. State describes the retained teammate lifecycle, not the run-result status.
+- **Teammate lifecycle state** — current stable states include `idle | busy | released`; busy includes queued work. State describes the retained teammate lifecycle, not the run-result status. Shutdown is an operation that removes membership, not a retained state.
 - **Teammate availability** — `available | unavailable` plus optional `recoveryError`, separate from lifecycle state. Legacy roster entries without availability are treated as available. `contextAvailable` is true only when idle, backend/handle are verified by runtime ownership checks, and there is no runtime/roster unavailability; it is not a process-liveness poll/proof.
 - **Continue context** — named-teammate assignment reusing an idle retained child/session. With omitted policy it is the default only when idle context exists; explicit `continue` without one fails.
 - **Fresh context** — default for a new/released teammate without a retained child, or an explicit replacement of a verified-idle child with a new session under the same identity; pending mailbox messages for that teammate are archived with a reset reason, not replayed.
 - **Live run id** (`currentRunId`) — runtime-owned current execution for a teammate; absent after release. Distinct from `lastRunId`, which identifies the latest assignment artifact and may persist after release.
-- **Cold resume** — persisted transcript recovery into a new run after explicit release of a retained teammate context; retired identities cannot be resumed/reassigned. Distinct from live context continuation.
+- **Cold resume** — persisted transcript recovery into a new run after explicit release of a retained teammate context. Distinct from live context continuation.
 - **Queued mailbox receipt** — confirmation that a signed message file was enqueued, not that native injection/delivery completed.
 - **Run id** — `AgentRun` identifier (`Task-7`); `get_subagent_result`/resume key.
 
 ## Verbs
 
-- **Spawn** — admit and launch a run. **Steer** — mid-run guidance to a child. **Settle** — reach the native terminal state (`agent_settled` owns settlement). **Release teammate** — dispose a settled teammate's retained live context and archive its pending mailbox messages with a reset reason; does not change board claims. **Retire teammate** — release plus prevent future implicit reuse. **Teardown** — session-end shutdown of all children (graceful + preserve, ADR 0007). **Cold resume** — reopen a settled run's persisted JSONL in a new child; an artifact action, never re-adoption.
+- **Spawn** — admit and launch a run. **Steer** — mid-run guidance to a child. **Settle** — reach the native terminal state (`agent_settled` owns settlement). **Stop** — end an assignment while retaining teammate membership. **Release teammate** — dispose of a settled teammate's retained live context while preserving membership and identity; does not change board claims. **Shutdown teammate** — stop/cancel work, verify cleanup, then remove live membership; preserve run history/transcripts and do not imply task completion. **Session shutdown** — teardown children when the owning session ends. **Cold resume** — reopen a settled run's persisted JSONL in a new child; an artifact action, never re-adoption.
 
 ## Legacy terms
 

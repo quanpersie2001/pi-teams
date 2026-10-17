@@ -1,0 +1,570 @@
+import { createPublicKey, randomUUID } from "node:crypto";
+import { link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import type { PeerRegistry } from "../app/peer-discovery-service.js";
+import type { PeerMailbox, PeerMessageBinding } from "../app/peer-messaging-service.js";
+import type { PeerAddress, PeerReceipt } from "../domain/peer.js";
+import { type PeerAdvertisement, validatePeerAdvertisement } from "../domain/peer.js";
+import { PEER_LIMITS, type PeerMessage, peerMessageFingerprint, validatePeerMessage } from "../domain/peer-message.js";
+
+const TERMINAL = new Set<PeerReceipt>(["delivered", "refused", "expired"]);
+const CLAIM_STALE_MS = 5 * 60_000;
+
+/** Per-user durable registry/inbox. Windows use requires a real host ACL verifier. */
+export class LocalPeerHost implements PeerRegistry, PeerMailbox {
+	private lastPruneAt = 0;
+	constructor(
+		private root: string,
+		private readonly verifyWindowsStorage?: (path: string) => Promise<boolean>,
+	) {}
+	private async ready(dir: string): Promise<void> {
+		await mkdir(this.root, { recursive: true, mode: 0o700 });
+		const canonicalRoot = await realpath(this.root),
+			requestedRoot = resolve(this.root);
+		const macAlias =
+			process.platform === "darwin" && canonicalRoot === requestedRoot.replace(/^\/(var|tmp)(?=\/)/, "/private/$1");
+		if (
+			process.platform === "win32"
+				? canonicalRoot.toLowerCase() !== requestedRoot.toLowerCase()
+				: canonicalRoot !== requestedRoot && !macAlias
+		)
+			throw new Error("Peer storage root must not traverse symlink ancestors");
+		this.root = canonicalRoot;
+		const rootStat = await lstat(this.root);
+		if (!rootStat.isDirectory() || rootStat.isSymbolicLink())
+			throw new Error("Peer storage root must be a directory, not a symlink");
+		if (process.platform === "win32") {
+			if (!this.verifyWindowsStorage || !(await this.verifyWindowsStorage(this.root)))
+				throw new Error("Windows peer storage requires a successful per-user ACL verifier");
+		} else if (
+			(typeof process.getuid === "function" && rootStat.uid !== process.getuid()) ||
+			(rootStat.mode & 0o077) !== 0
+		) {
+			throw new Error("Peer storage root must be current-user-owned and private (mode 0700)");
+		}
+		await mkdir(dir, { recursive: true, mode: 0o700 });
+		const s = await lstat(dir);
+		if (!s.isDirectory() || s.isSymbolicLink()) throw new Error("Peer storage directory must not be a symlink");
+		if (process.platform === "win32") {
+			if (!this.verifyWindowsStorage || !(await this.verifyWindowsStorage(dir)))
+				throw new Error("Windows peer storage ACL verification failed");
+		} else if ((typeof process.getuid === "function" && s.uid !== process.getuid()) || (s.mode & 0o077) !== 0) {
+			throw new Error("Peer storage directory must be current-user-owned and private");
+		}
+	}
+	async publish(ad: PeerAdvertisement): Promise<void> {
+		if (!validatePeerAdvertisement(ad)) throw new Error("Invalid peer advertisement");
+		try {
+			if (createPublicKey(ad.identityPublicKey).asymmetricKeyType !== "ed25519") throw new Error();
+		} catch {
+			throw new Error("Peer advertisement must contain a valid Ed25519 SPKI public key");
+		}
+		if (process.platform === "win32" ? ad.endpoint.kind !== "named_pipe" : ad.endpoint.kind !== "unix")
+			throw new Error("Peer advertisement endpoint kind does not match this host platform");
+		const dir = join(this.root, "registry");
+		await this.ready(dir);
+		const file = join(dir, `${safe(ad.peerSessionId)}-${safe(ad.runtimeId)}.json`),
+			temp = `${file}.${randomUUID()}.tmp`;
+		await writeFile(temp, JSON.stringify(ad), { mode: 0o600, flag: "wx" });
+		await rename(temp, file);
+	}
+	async list(projectId: string): Promise<PeerAdvertisement[]> {
+		const dir = join(this.root, "registry");
+		await this.ready(dir);
+		const out: PeerAdvertisement[] = [];
+		for (const f of await readdir(dir)) {
+			if (!f.endsWith(".json")) continue;
+			try {
+				const v: unknown = JSON.parse(await readFile(join(dir, f), "utf8"));
+				if (validatePeerAdvertisement(v) && v.projectId === projectId) out.push(v);
+			} catch {
+				/* Corrupt registration is invisible. */
+			}
+		}
+		return out;
+	}
+	async remove(ad: PeerAdvertisement): Promise<void> {
+		await rm(join(this.root, "registry", `${safe(ad.peerSessionId)}-${safe(ad.runtimeId)}.json`), { force: true });
+	}
+	private async bind(message: PeerMessage): Promise<"new" | "duplicate" | "conflict"> {
+		const dir = join(this.root, "bindings");
+		await this.ready(dir);
+		const record = {
+			sender: message.sender,
+			fingerprint: peerMessageFingerprint(message),
+			expiresAt: message.expiresAt,
+			updatedAt: Date.now(),
+		};
+		const file = join(dir, `${safe(message.messageId)}.json`),
+			temp = `${file}.${randomUUID()}.tmp`;
+		try {
+			await writeFile(temp, JSON.stringify(record), { flag: "wx", mode: 0o600 });
+			await link(temp, file);
+			return "new";
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+			const existing = await this.getBinding(message.messageId);
+			return existing?.fingerprint === record.fingerprint &&
+				existing.sender.peerSessionId === record.sender.peerSessionId &&
+				existing.sender.runtimeId === record.sender.runtimeId
+				? "duplicate"
+				: "conflict";
+		} finally {
+			await rm(temp, { force: true });
+		}
+	}
+	async acceptIngress(message: PeerMessage): Promise<{
+		status: "queued" | "held" | "delivered" | "refused" | "expired" | "unavailable" | "conflict" | "rate_limited";
+	}> {
+		const now = Date.now();
+		if (now - this.lastPruneAt > 60_000) {
+			this.lastPruneAt = now;
+			await this.prune(now);
+		}
+		return this.withQuotaLock(async () => {
+			const fingerprint = peerMessageFingerprint(message),
+				prior = await this.getBinding(message.messageId);
+			if (
+				prior &&
+				(prior.fingerprint !== fingerprint ||
+					prior.sender.peerSessionId !== message.sender.peerSessionId ||
+					prior.sender.runtimeId !== message.sender.runtimeId)
+			)
+				return { status: "conflict" };
+			const terminal = await this.receiptState(message.messageId);
+			if (terminal === "delivered" || terminal === "refused" || terminal === "expired") {
+				if (!prior && (await this.terminalFingerprint(message.messageId)) !== fingerprint)
+					return { status: "conflict" };
+				return { status: terminal };
+			}
+			if (terminal === "held") return { status: "held" };
+			if (!prior && terminal) return { status: "conflict" };
+			const rateDir = join(this.root, "rates");
+			await this.ready(rateDir);
+			const rateFile = join(rateDir, `${safe(message.sender.peerSessionId)}-${safe(message.sender.runtimeId)}.json`);
+			if (
+				!(await exists(rateFile)) &&
+				(await safeReadDir(rateDir)).filter((f) => f.endsWith(".json")).length >= PEER_LIMITS.metadataRecords
+			)
+				return { status: "unavailable" };
+			let times: number[] = [];
+			try {
+				const v = JSON.parse(await readFile(rateFile, "utf8")) as { times?: unknown };
+				if (Array.isArray(v.times))
+					times = v.times.filter(
+						(n): n is number => typeof n === "number" && Date.now() - n < PEER_LIMITS.rateWindowMs,
+					);
+			} catch {}
+			if (times.length >= PEER_LIMITS.rateCount) return { status: "rate_limited" };
+			times.push(Date.now());
+			const rateTemp = `${rateFile}.${randomUUID()}.tmp`;
+			await writeFile(rateTemp, JSON.stringify({ times }), { flag: "wx", mode: 0o600 });
+			await rename(rateTemp, rateFile);
+			const bindingsDir = join(this.root, "bindings");
+			if (
+				!prior &&
+				(await safeReadDir(bindingsDir)).filter((f) => f.endsWith(".json")).length >= PEER_LIMITS.metadataRecords
+			)
+				return { status: "unavailable" };
+			const dir = join(this.root, "inbox", safe(message.recipient.peerSessionId), safe(message.recipient.runtimeId));
+			await this.ready(dir);
+			const target = join(dir, `${safe(message.messageId)}.json`);
+			if (!(await exists(target)) && (await this.pendingCount(message.recipient)) >= PEER_LIMITS.pending)
+				return { status: "unavailable" };
+			if (!prior && (await this.bind(message)) === "conflict") return { status: "conflict" };
+			if (!(await exists(target))) {
+				const temp = `${target}.${randomUUID()}.tmp`;
+				await writeFile(temp, JSON.stringify(message), { flag: "wx", mode: 0o600 });
+				try {
+					await link(temp, target);
+				} catch (e) {
+					if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+				} finally {
+					await rm(temp, { force: true });
+				}
+			}
+			return { status: await this.setReceiptUnlocked(message.messageId, "queued", fingerprint) };
+		});
+	}
+	async getBinding(messageId: string): Promise<PeerMessageBinding | undefined> {
+		const record = await this.readBindingRecord(messageId);
+		return record ? { sender: record.sender, fingerprint: record.fingerprint } : undefined;
+	}
+	private async readBindingRecord(
+		messageId: string,
+	): Promise<{ sender: PeerAddress; fingerprint: string; expiresAt: number } | undefined> {
+		try {
+			const v: unknown = JSON.parse(await readFile(join(this.root, "bindings", `${safe(messageId)}.json`), "utf8"));
+			if (!v || typeof v !== "object") return undefined;
+			const x = v as { sender?: Partial<PeerAddress>; fingerprint?: unknown; expiresAt?: unknown };
+			if (
+				typeof x.fingerprint !== "string" ||
+				typeof x.sender?.peerSessionId !== "string" ||
+				typeof x.sender.runtimeId !== "string" ||
+				typeof x.expiresAt !== "number"
+			)
+				return undefined;
+			return {
+				sender: { peerSessionId: x.sender.peerSessionId, runtimeId: x.sender.runtimeId },
+				fingerprint: x.fingerprint,
+				expiresAt: x.expiresAt,
+			};
+		} catch {
+			return undefined;
+		}
+	}
+	async claim(messageId: string): Promise<(() => Promise<void>) | undefined> {
+		const dir = join(this.root, "claims");
+		await this.ready(dir);
+		const file = join(dir, `${safe(messageId)}.lock`);
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				const token = randomUUID();
+				const handle = await open(file, "wx", 0o600);
+				await handle.writeFile(JSON.stringify({ token, pid: process.pid, at: Date.now() }));
+				await handle.close();
+				return async () => {
+					try {
+						const current = JSON.parse(await readFile(file, "utf8")) as { token?: unknown };
+						if (current.token === token) await rm(file, { force: true });
+					} catch {}
+				};
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+				try {
+					const info = await stat(file);
+					if (Date.now() - info.mtimeMs > CLAIM_STALE_MS) {
+						let pid: number | undefined;
+						try {
+							const value = JSON.parse(await readFile(file, "utf8")) as { pid?: unknown };
+							if (typeof value.pid === "number") pid = value.pid;
+						} catch {}
+						if (pid === undefined || !pidIsAlive(pid)) {
+							await rm(file, { force: true });
+							continue;
+						}
+					}
+				} catch {
+					continue;
+				}
+				return undefined;
+			}
+		}
+		return undefined;
+	}
+	async receiptState(messageId: string): Promise<PeerReceipt | undefined> {
+		const dir = join(this.root, "receipts"),
+			id = safe(messageId);
+		try {
+			const v = JSON.parse(await readFile(join(dir, `${id}.terminal.json`), "utf8")) as { receipt?: unknown };
+			if (v.receipt === "delivered" || v.receipt === "refused" || v.receipt === "expired") return v.receipt;
+		} catch {}
+		for (const r of ["held", "queued"] as const) if (await exists(join(dir, `${id}.${r}.json`))) return r;
+		return undefined;
+	}
+	private async terminalFingerprint(messageId: string): Promise<string | undefined> {
+		try {
+			const record = JSON.parse(
+				await readFile(join(this.root, "receipts", `${safe(messageId)}.terminal.json`), "utf8"),
+			) as { fingerprint?: unknown };
+			return typeof record.fingerprint === "string" ? record.fingerprint : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	async setReceipt(messageId: string, receipt: PeerReceipt, fingerprint?: string): Promise<PeerReceipt> {
+		return this.withQuotaLock(() => this.setReceiptUnlocked(messageId, receipt, fingerprint));
+	}
+	private async setReceiptUnlocked(
+		messageId: string,
+		receipt: PeerReceipt,
+		fingerprint?: string,
+	): Promise<PeerReceipt> {
+		const dir = join(this.root, "receipts");
+		await this.ready(dir);
+		const id = safe(messageId);
+		if (receipt === "unavailable") return (await this.receiptState(id)) ?? "unavailable";
+		const current = await this.receiptState(id);
+		if (
+			!(await exists(join(dir, `${id}.queued.json`))) &&
+			!(await exists(join(dir, `${id}.held.json`))) &&
+			!(await exists(join(dir, `${id}.terminal.json`))) &&
+			(await safeReadDir(dir)).filter((f) => f.endsWith(".json")).length >= PEER_LIMITS.metadataRecords
+		)
+			throw new Error("Peer receipt retention capacity reached; prune before accepting more messages");
+		if (current && (TERMINAL.has(current) || receipt === "queued" || (current === "held" && receipt === "held")))
+			return current;
+		if (fingerprint) {
+			const binding = await this.getBinding(id);
+			if (binding && binding.fingerprint !== fingerprint)
+				throw new Error("Receipt fingerprint conflicts with immutable message binding");
+		}
+		const terminal = TERMINAL.has(receipt),
+			file = join(dir, `${id}.${terminal ? "terminal" : receipt}.json`);
+		try {
+			const binding = await this.readBindingRecord(id);
+			await writeFile(
+				file,
+				JSON.stringify({ receipt, fingerprint, expiresAt: binding?.expiresAt, updatedAt: Date.now() }),
+				{
+					flag: "wx",
+					mode: 0o600,
+				},
+			);
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+		}
+		return (await this.receiptState(id)) ?? receipt;
+	}
+	async holdMessage(message: PeerMessage): Promise<boolean> {
+		return this.withQuotaLock(async () => {
+			const target = join(this.root, "held", `${safe(message.messageId)}.json`);
+			await this.ready(dirname(target));
+			const inboxFile = join(
+				this.root,
+				"inbox",
+				safe(message.recipient.peerSessionId),
+				safe(message.recipient.runtimeId),
+				`${safe(message.messageId)}.json`,
+			);
+			if (
+				!(await exists(target)) &&
+				!(await exists(inboxFile)) &&
+				(await this.pendingCount(message.recipient)) >= PEER_LIMITS.pending
+			)
+				return false;
+			const temp = `${target}.${randomUUID()}.tmp`;
+			await writeFile(temp, JSON.stringify(message), { flag: "wx", mode: 0o600 });
+			try {
+				await link(temp, target);
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+			} finally {
+				await rm(temp, { force: true });
+			}
+			await this.removeFromInbox(message.messageId, message.recipient);
+			return true;
+		});
+	}
+	private async pendingCount(recipient: PeerAddress): Promise<number> {
+		let count = 0;
+		const inbox = join(this.root, "inbox", safe(recipient.peerSessionId), safe(recipient.runtimeId));
+		for (const file of await safeReadDir(inbox)) {
+			if (!file.endsWith(".json")) continue;
+			const path = join(inbox, file);
+			try {
+				const m: unknown = JSON.parse(await readFile(path, "utf8"));
+				if (validatePeerMessage(m) && m.expiresAt > Date.now()) count++;
+				else {
+					if (validatePeerMessage(m)) await this.setReceiptUnlocked(m.messageId, "expired", peerMessageFingerprint(m));
+					await rm(path, { force: true });
+				}
+			} catch {
+				await rm(path, { force: true });
+			}
+		}
+		const held = join(this.root, "held");
+		try {
+			for (const f of await readdir(held)) {
+				if (!f.endsWith(".json")) continue;
+				try {
+					const m: unknown = JSON.parse(await readFile(join(held, f), "utf8"));
+					if (
+						validatePeerMessage(m) &&
+						m.recipient.peerSessionId === recipient.peerSessionId &&
+						m.recipient.runtimeId === recipient.runtimeId
+					) {
+						if (m.expiresAt > Date.now()) count++;
+						else {
+							await this.setReceiptUnlocked(m.messageId, "expired", peerMessageFingerprint(m));
+							await rm(join(held, f), { force: true });
+						}
+					}
+				} catch {}
+			}
+		} catch {}
+		return count;
+	}
+	private async withQuotaLock<T>(fn: () => Promise<T>): Promise<T> {
+		const dir = join(this.root, "locks");
+		await this.ready(dir);
+		const lock = join(dir, "quota.lock");
+		let token = "";
+		for (;;) {
+			try {
+				token = randomUUID();
+				const h = await open(lock, "wx", 0o600);
+				await h.writeFile(JSON.stringify({ token, pid: process.pid }));
+				await h.close();
+				break;
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+				try {
+					const s = await stat(lock);
+					if (Date.now() - s.mtimeMs > 30_000) {
+						let pid: number | undefined;
+						try {
+							const value = JSON.parse(await readFile(lock, "utf8")) as { pid?: unknown };
+							if (typeof value.pid === "number") pid = value.pid;
+						} catch {}
+						if (pid === undefined || !pidIsAlive(pid)) await rm(lock, { force: true });
+					}
+				} catch {}
+				await new Promise((r) => setTimeout(r, 5));
+			}
+		}
+		try {
+			return await fn();
+		} finally {
+			try {
+				const current = JSON.parse(await readFile(lock, "utf8")) as { token?: unknown };
+				if (current.token === token) await rm(lock, { force: true });
+			} catch {}
+		}
+	}
+	async removeFromInbox(messageId: string, recipient: PeerAddress): Promise<void> {
+		await rm(
+			join(this.root, "inbox", safe(recipient.peerSessionId), safe(recipient.runtimeId), `${safe(messageId)}.json`),
+			{ force: true },
+		);
+	}
+	async pending(address: PeerAddress): Promise<PeerMessage[]> {
+		const dir = join(this.root, "inbox", safe(address.peerSessionId), safe(address.runtimeId));
+		await this.ready(dir);
+		const out: PeerMessage[] = [];
+		for (const f of await readdir(dir)) {
+			if (!f.endsWith(".json")) continue;
+			try {
+				const v: unknown = JSON.parse(await readFile(join(dir, f), "utf8"));
+				if (validatePeerMessage(v) && v.expiresAt > Date.now()) out.push(v);
+				else {
+					if (validatePeerMessage(v)) await this.setReceipt(v.messageId, "expired", peerMessageFingerprint(v));
+					await rm(join(dir, f), { force: true });
+				}
+			} catch {
+				await rm(join(dir, f), { force: true });
+			}
+		}
+		return out;
+	}
+	async getHeld(messageId: string): Promise<PeerMessage | undefined> {
+		try {
+			const v: unknown = JSON.parse(await readFile(join(this.root, "held", `${safe(messageId)}.json`), "utf8"));
+			return validatePeerMessage(v) ? v : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	async listHeld(): Promise<PeerMessage[]> {
+		const dir = join(this.root, "held");
+		await this.ready(dir);
+		const out: PeerMessage[] = [];
+		for (const f of await readdir(dir)) {
+			if (!f.endsWith(".json")) continue;
+			const id = f.slice(0, -5),
+				m = await this.getHeld(id);
+			if (!m) {
+				await rm(join(dir, f), { force: true });
+				continue;
+			}
+			if (m.expiresAt <= Date.now()) {
+				await this.setReceipt(id, "expired", peerMessageFingerprint(m));
+				await this.removeHeld(id);
+				await this.removeFromInbox(id, m.recipient);
+				continue;
+			}
+			out.push(m);
+		}
+		return out;
+	}
+	async removeHeld(messageId: string): Promise<void> {
+		await rm(join(this.root, "held", `${safe(messageId)}.json`), { force: true });
+	}
+	private async pruneClaims(now: number): Promise<void> {
+		const dir = join(this.root, "claims");
+		for (const file of await safeReadDir(dir)) {
+			if (!file.endsWith(".lock")) continue;
+			const path = join(dir, file);
+			try {
+				const info = await stat(path);
+				if (now - info.mtimeMs <= CLAIM_STALE_MS) continue;
+				let pid: number | undefined;
+				try {
+					const value = JSON.parse(await readFile(path, "utf8")) as { pid?: unknown };
+					if (typeof value.pid === "number") pid = value.pid;
+				} catch {}
+				if (pid === undefined || !pidIsAlive(pid)) await rm(path, { force: true });
+			} catch {}
+		}
+	}
+	async prune(now = Date.now()): Promise<void> {
+		await this.listHeld();
+		for (const sub of await safeReadDir(join(this.root, "inbox")))
+			for (const runtime of await safeReadDir(join(this.root, "inbox", sub))) {
+				const dir = join(this.root, "inbox", sub, runtime);
+				for (const f of await safeReadDir(dir)) {
+					try {
+						const m: unknown = JSON.parse(await readFile(join(dir, f), "utf8"));
+						if (validatePeerMessage(m) && m.expiresAt <= now) {
+							await this.setReceipt(m.messageId, "expired", peerMessageFingerprint(m));
+							await rm(join(dir, f), { force: true });
+						}
+					} catch {
+						await rm(join(dir, f), { force: true });
+					}
+				}
+			}
+		await this.pruneClaims(now);
+		for (const category of ["bindings", "receipts", "rates", "authenticated", "seen"] as const) {
+			const dir = join(this.root, category);
+			for (const f of await safeReadDir(dir)) {
+				try {
+					const path = join(dir, f),
+						s = await stat(path);
+					if (category === "bindings" || (category === "receipts" && f.endsWith(".terminal.json"))) {
+						const record = JSON.parse(await readFile(path, "utf8")) as { expiresAt?: unknown };
+						if (typeof record.expiresAt === "number") {
+							if (now > record.expiresAt + PEER_LIMITS.retentionMs) await rm(path, { force: true });
+						} else if (now - s.mtimeMs > PEER_LIMITS.retentionMs) await rm(path, { force: true });
+					} else if (now - s.mtimeMs > PEER_LIMITS.retentionMs) await rm(path, { force: true });
+				} catch {
+					try {
+						const path = join(dir, f);
+						if (now - (await stat(path)).mtimeMs > PEER_LIMITS.retentionMs) await rm(path, { force: true });
+					} catch {}
+				}
+			}
+		}
+	}
+}
+function safe(value: string): string {
+	if (!/^[\w.-]{1,128}$/.test(value)) throw new Error("Invalid peer identifier");
+	return value;
+}
+function pidIsAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+async function exists(path: string): Promise<boolean> {
+	try {
+		await lstat(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+async function safeReadDir(path: string): Promise<string[]> {
+	try {
+		return await readdir(path);
+	} catch {
+		return [];
+	}
+}
+/** Host must serialize injections through Pi's turn queue and set expandPromptTemplates:false. */
+export interface SafePeerSdkAdapter {
+	inject(text: string, state: "idle" | "busy"): Promise<void>;
+}

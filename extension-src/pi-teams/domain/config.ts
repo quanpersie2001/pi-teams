@@ -7,9 +7,11 @@
 import { MAX_BUDGET_SECONDS } from "./time-policy.js";
 
 export type TasksAutomationSettings = { autoCascade: boolean; reminders: boolean };
+export type PeerSettings = { enabled: boolean; scope: "project" | "all"; policy: "hold" | "accept" | "refuse" };
 
 export type SubagentsSettings = {
 	tasks: TasksAutomationSettings;
+	peers: PeerSettings;
 	maxConcurrent: number;
 	defaultMaxTurns: number;
 	graceTurns: number;
@@ -34,6 +36,7 @@ export const MAX_MAX_CONCURRENT = 1024;
 
 export const DEFAULT_SUBAGENTS_SETTINGS: Readonly<SubagentsSettings> = {
 	tasks: { autoCascade: false, reminders: false },
+	peers: { enabled: false, scope: "project", policy: "hold" },
 	maxConcurrent: 4,
 	defaultMaxTurns: 30,
 	graceTurns: 3,
@@ -113,7 +116,13 @@ function budgetOrZero(value: unknown): number {
 export function sanitizeSettings(raw: unknown): SubagentsSettings {
 	const source = toRecord(raw);
 	const tasks = toRecord(source.tasks);
+	const peers = toRecord(source.peers);
 	return {
+		peers: {
+			enabled: boolOr(peers.enabled, DEFAULT_SUBAGENTS_SETTINGS.peers.enabled),
+			scope: peers.scope === "all" ? "all" : "project",
+			policy: peers.policy === "accept" || peers.policy === "refuse" ? peers.policy : "hold",
+		},
 		tasks: {
 			autoCascade: boolOr(tasks.autoCascade, DEFAULT_SUBAGENTS_SETTINGS.tasks.autoCascade),
 			reminders: boolOr(tasks.reminders, DEFAULT_SUBAGENTS_SETTINGS.tasks.reminders),

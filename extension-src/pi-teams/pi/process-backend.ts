@@ -359,6 +359,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 						teamDir: input.team.teamDir,
 						teamKey: input.team.teamKey,
 						teammateName: input.team.teammateName,
+						...(input.team.membershipId !== undefined ? { membershipId: input.team.membershipId } : {}),
 						...(input.team.teammateColor !== undefined ? { teammateColor: input.team.teammateColor } : {}),
 					}
 				: {}),

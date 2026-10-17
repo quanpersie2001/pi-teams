@@ -51,6 +51,7 @@ export interface AgentListRow {
 	teammateColor?: string;
 	/** Teammate lifecycle is separate from this assignment's outcome. */
 	teammateState?: "idle" | "busy" | "released" | "retired";
+	teammateOperation?: "shutting_down";
 	teammateAvailability?: "available" | "unavailable";
 	description: string;
 	status: AgentRunStatus;

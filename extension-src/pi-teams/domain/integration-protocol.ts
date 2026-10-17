@@ -21,6 +21,7 @@ export interface AgentRunSnapshot {
 	description: string;
 	/** Teammate address this run was spawned under; additive optional (protocol v3 unchanged). */
 	teammateName?: string;
+	membershipId?: string;
 	teammateColor?: string;
 	status: AgentRunStatus;
 	backend: "process";
@@ -65,6 +66,7 @@ export function toRunSnapshot(run: AgentRun): AgentRunSnapshot {
 		delivery: run.delivery,
 	};
 	if (run.teammateName !== undefined) snapshot.teammateName = run.teammateName;
+	if (run.membershipId !== undefined) snapshot.membershipId = run.membershipId;
 	if (run.teammateColor !== undefined) snapshot.teammateColor = run.teammateColor;
 	if (run.model !== undefined) snapshot.model = run.model;
 	if (run.modelFallback !== undefined) snapshot.modelFallback = run.modelFallback;
@@ -98,6 +100,7 @@ export interface AgentLifecycleEvent {
 	status: AgentRunStatus;
 	/** Teammate address this run was spawned under; additive optional (protocol v3 unchanged). */
 	teammateName?: string;
+	membershipId?: string;
 	teammateColor?: string;
 	model?: string;
 	modelFallback?: string;
@@ -141,7 +144,7 @@ export type SubagentsRpcOp =
 	| "release"
 	| "teammate_status"
 	| "teammate_release"
-	| "teammate_retire";
+	| "teammate_shutdown";
 
 export const SUBAGENTS_RPC_OPS: readonly SubagentsRpcOp[] = [
 	"ping",
@@ -153,7 +156,7 @@ export const SUBAGENTS_RPC_OPS: readonly SubagentsRpcOp[] = [
 	"release",
 	"teammate_status",
 	"teammate_release",
-	"teammate_retire",
+	"teammate_shutdown",
 ];
 
 /** Request channel for an RPC operation. */

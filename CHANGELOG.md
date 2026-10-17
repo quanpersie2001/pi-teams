@@ -113,3 +113,7 @@
 
 - Pi-subagents → pi-teams (ADR 0008)
 
+
+## Unreleased
+
+- Integrate membership shutdown with verified cleanup/task reconciliation and expose peer discovery, send, activity, and receiver-controlled inbound policy in the Pi host. Peer support is opt-in; Unix transport is process-tested. Native independent Pi-session/TUI behavior and Windows ACL verification remain unverified.

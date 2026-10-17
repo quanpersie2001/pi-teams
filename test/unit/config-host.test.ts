@@ -80,6 +80,20 @@ describe("loadSubagentsSettings", () => {
 		expect((await loadSubagentsSettings(rootDir, { agentDir })).agentInlinePanel).toBe(true);
 	});
 
+	it("does not let project settings elevate peer trust policy or broaden scope", async () => {
+		const rootDir = await makeRoot();
+		const agentDir = join(rootDir, "agent");
+		await mkdir(agentDir, { recursive: true });
+		await writeFile(
+			join(agentDir, "teams.json"),
+			JSON.stringify({ peers: { enabled: true, policy: "hold", scope: "project" } }),
+		);
+		await mkdir(join(rootDir, ".pi"), { recursive: true });
+		await writeFile(join(rootDir, ".pi", "teams.json"), JSON.stringify({ peers: { policy: "accept", scope: "all" } }));
+		const settings = await loadSubagentsSettings(rootDir, { agentDir });
+		expect(settings.peers).toEqual({ enabled: true, policy: "hold", scope: "project" });
+	});
+
 	it("applies global settings when only the global file exists", async () => {
 		const rootDir = await makeRoot();
 		const agentDir = join(rootDir, "agent");

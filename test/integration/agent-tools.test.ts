@@ -118,7 +118,8 @@ describe("tool registration", () => {
 			"omitted context continues an idle retained context and starts fresh for new/released identities",
 		);
 		expect(catalog).toContain("teammate_status");
-		expect(catalog).toContain("teammate_retire");
+		expect(catalog).toContain("teammate_shutdown");
+		expect(catalog).not.toContain("teammate_retire");
 		expect(agent?.promptSnippet).toContain("Spawn named, colored subagents");
 	});
 
@@ -143,7 +144,7 @@ describe("tool registration", () => {
 			{ name: "steer_subagent" },
 			{ name: "teammate_status" },
 			{ name: "teammate_release" },
-			{ name: "teammate_retire" },
+			{ name: "teammate_shutdown" },
 		]);
 		const registeredNames = (host.registeredTools as ToolLike[]).map((tool) => tool.name);
 		expect(registeredNames).toEqual([
@@ -151,7 +152,7 @@ describe("tool registration", () => {
 			"steer_subagent",
 			"teammate_status",
 			"teammate_release",
-			"teammate_retire",
+			"teammate_shutdown",
 		]);
 	});
 });
@@ -192,11 +193,11 @@ describe("teammate lifecycle tools", () => {
 		expect(result.details).toMatchObject(status);
 	});
 
-	it("reports structured release/retire failures and settled success without changing task claims", async () => {
+	it("reports structured release/shutdown failures and successful membership removal", async () => {
 		const fixture = await makeFixture();
 		const release = fixture.tools.get("teammate_release");
-		const retire = fixture.tools.get("teammate_retire");
-		if (!release || !retire) throw new Error("lifecycle tools not registered");
+		const shutdown = fixture.tools.get("teammate_shutdown");
+		if (!release || !shutdown) throw new Error("lifecycle tools not registered");
 		vi.spyOn(fixture.app.manager, "releaseTeammate").mockRejectedValue(new Error("Cannot release busy teammate"));
 		const failed = await release.execute(
 			"release",
@@ -211,23 +212,16 @@ describe("teammate lifecycle tools", () => {
 			changed: false,
 			recovery: expect.stringContaining("teammate_status"),
 		});
-		vi.spyOn(fixture.app.manager, "retireTeammate").mockResolvedValue(true);
-		vi.spyOn(fixture.app.manager, "teammateStatus").mockReturnValue({
-			name: "worker",
-			type: "explore",
-			state: "retired",
-			availability: "available",
-			contextAvailable: false,
-		});
-		const retired = await retire.execute(
-			"retire",
+		vi.spyOn(fixture.app.manager, "shutdownTeammate").mockResolvedValue(true);
+		const retired = await shutdown.execute(
+			"shutdown",
 			{ name: "worker" },
 			NO_SIGNAL,
 			undefined,
 			fixture.host.extensionContext,
 		);
-		expect(textOf(retired)).toContain("is now retired");
-		expect(retired.details).toMatchObject({ state: "retired", changed: true });
+		expect(textOf(retired)).toContain("was shut down and removed");
+		expect(retired.details).toMatchObject({ name: "worker", changed: true });
 	});
 });
 

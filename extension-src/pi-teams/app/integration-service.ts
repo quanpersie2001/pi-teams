@@ -147,9 +147,9 @@ export class IntegrationService {
 				case "teammate_status":
 					return { requestId, envelope: this.handleTeammateStatus(raw) };
 				case "teammate_release":
-					return { requestId, envelope: await this.handleTeammateLifecycle(raw, "release") };
-				case "teammate_retire":
-					return { requestId, envelope: await this.handleTeammateLifecycle(raw, "retire") };
+					return { requestId, envelope: await this.handleTeammateLifecycle(raw) };
+				case "teammate_shutdown":
+					return { requestId, envelope: await this.handleTeammateShutdown(raw) };
 				default:
 					return { requestId, envelope: rpcError(`unknown operation "${op}"`) };
 			}
@@ -166,7 +166,7 @@ export class IntegrationService {
 		});
 		return rpcSuccess({
 			version: PROTOCOL_VERSION,
-			capabilities: ["teammate_status", "teammate_release", "teammate_retire", "spawn_context"],
+			capabilities: ["teammate_status", "teammate_release", "teammate_shutdown", "spawn_context"],
 		});
 	}
 
@@ -215,15 +215,20 @@ export class IntegrationService {
 		return rpcSuccess(status ?? null);
 	}
 
-	private async handleTeammateLifecycle(raw: unknown, action: "release" | "retire"): Promise<RpcReply<TeammateStatus>> {
+	private async handleTeammateLifecycle(raw: unknown): Promise<RpcReply<TeammateStatus>> {
 		const payload = parseRequest(raw, (p) => requireString(p, "name"));
 		const name = payload.name as string;
-		const changed =
-			action === "release" ? await this.manager.releaseTeammate(name) : await this.manager.retireTeammate(name);
-		if (!changed) throw new Error(`Teammate "@${name}" was not found.`);
+		if (!(await this.manager.releaseTeammate(name))) throw new Error(`Teammate "@${name}" was not found.`);
 		const status = this.manager.teammateStatus(name);
 		if (!status) throw new Error(`Lifecycle operation completed for "@${name}", but current status is unavailable.`);
 		return rpcSuccess(status);
+	}
+
+	private async handleTeammateShutdown(raw: unknown): Promise<RpcReply<{ name: string; shutdown: true }>> {
+		const payload = parseRequest(raw, (p) => requireString(p, "name"));
+		const name = payload.name as string;
+		if (!(await this.manager.shutdownTeammate(name))) throw new Error(`Teammate "@${name}" was not found.`);
+		return rpcSuccess({ name, shutdown: true });
 	}
 
 	private handleStatus(raw: unknown): RpcReply<AgentRunSnapshot | null> {

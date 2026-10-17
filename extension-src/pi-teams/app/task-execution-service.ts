@@ -45,13 +45,19 @@ export class TaskExecutionService {
 		{ timer: ReturnType<typeof setTimeout>; resolve: (active: boolean) => void; admission: boolean }
 	>();
 	private readonly settling = new Set<string>();
+	private readonly shutdownEpoch = new Map<string, number>();
 	private readonly unsubscribe: () => void;
+	private readonly unsubscribeShutdownReconciler: () => void;
 	private disposed = false;
 	private acceptingExecutions = true;
 	constructor(options: TaskExecutionServiceOptions) {
 		this.board = options.board;
 		this.manager = options.manager;
 		this.artifactRoot = options.artifactRoot;
+		this.unsubscribeShutdownReconciler =
+			this.manager.registerTaskShutdownReconciler?.((name, membershipId, phase) =>
+				this.reconcileTeammateShutdown(name, membershipId, phase),
+			) ?? (() => {});
 		this.unsubscribe = this.manager.subscribe((event) => this.onLifecycle(event));
 		this.reconcileKnownRuns();
 	}
@@ -90,13 +96,15 @@ export class TaskExecutionService {
 		const name = input.name ?? (!coordinator ? input.actor.name : defaultName);
 		if (!coordinator && name !== input.actor.name)
 			throw new Error("Only the coordinator may assign task execution to another teammate");
+		const admissionEpoch = this.shutdownEpoch.get(name) ?? 0;
 		const reservationId = `reservation-${randomUUID()}`;
 		let reservation: ReturnType<TaskBoardService["reserveExecution"]>;
 		try {
 			reservation = await this.retryBoardWrite(
 				reservationId,
 				() => {
-					if (!this.acceptingExecutions) throw new TaskExecutionCancelledError();
+					if (!this.acceptingExecutions || (this.shutdownEpoch.get(name) ?? 0) !== admissionEpoch)
+						throw new TaskExecutionCancelledError();
 					return this.board.reserveExecution(
 						task.id,
 						reservationId,
@@ -115,15 +123,21 @@ export class TaskExecutionService {
 			if (/Task board conflict/.test(message)) throw new TaskExecutionReservationConflictError({ cause: error });
 			throw error;
 		}
+		if (this.manager.teammateMembershipId(name) !== undefined)
+			this.board.bindOwnerMembership(task.id, this.manager.teammateMembershipId(name));
 		if (
 			this.disposed ||
 			!this.acceptingExecutions ||
+			(this.shutdownEpoch.get(name) ?? 0) !== admissionEpoch ||
 			input.signal?.aborted ||
 			(input.expectedRequirementRevision !== undefined &&
 				reservation.task.requirementRevision !== input.expectedRequirementRevision)
 		) {
 			const cancelled =
-				this.disposed || !this.acceptingExecutions || input.signal?.aborted
+				this.disposed ||
+				!this.acceptingExecutions ||
+				(this.shutdownEpoch.get(name) ?? 0) !== admissionEpoch ||
+				input.signal?.aborted
 					? new TaskExecutionCancelledError()
 					: new TaskExecutionPlanChangedError();
 			await this.retryBoardWrite(reservationId, () =>
@@ -147,7 +161,10 @@ export class TaskExecutionService {
 			const run = await this.manager.spawn(request);
 			spawnedRunId = run.id;
 			this.active.set(run.id, { taskId: task.id, reservationId, actor: name });
-			await this.retryBoardWrite(reservationId, () => this.board.bindAttempt(task.id, reservationId, run.id));
+			if (run.membershipId !== undefined) this.board.bindOwnerMembership(task.id, run.membershipId);
+			await this.retryBoardWrite(reservationId, () =>
+				this.board.bindAttempt(task.id, reservationId, run.id, run.membershipId),
+			);
 			const settled = this.manager.get(run.id);
 			if (settled && !["queued", "starting", "running"].includes(settled.status))
 				await this.settleFromRun(task.id, reservationId, settled);
@@ -172,6 +189,70 @@ export class TaskExecutionService {
 			throw error;
 		}
 	}
+	async reconcileTeammateShutdown(
+		name: string,
+		_membershipId?: string,
+		phase: "fence" | "reconcile" = "reconcile",
+	): Promise<void> {
+		if (phase === "fence") {
+			this.shutdownEpoch.set(name, (this.shutdownEpoch.get(name) ?? 0) + 1);
+			return;
+		}
+		// Lifecycle events settle durable attempts asynchronously; do not release claims before those writes finish.
+		for (let pass = 0; pass < 100; pass++) {
+			const settlingRuns = [...this.settling].filter((runId) => this.active.get(runId)?.actor === name);
+			if (settlingRuns.length === 0) break;
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		const unresolved = [...this.active.entries()].find(([, execution]) => execution.actor === name);
+		if (unresolved)
+			throw new Error(`Task attempt for @${name} could not be durably settled; claim retained for recovery.`);
+		// A reservation can predate manager admission and have no active run mapping yet.
+		// Fence increments its admission epoch; join its rollback before inspecting claims.
+		for (let pass = 0; pass < 160; pass++) {
+			const hasUnboundAttempt = this.board
+				.list()
+				.some(
+					(task) =>
+						task.owner === name &&
+						(_membershipId === undefined || task.ownerMembershipId === _membershipId) &&
+						task.attempts.some((attempt) => attempt.status === "running") &&
+						!task.attempts.some((attempt) => attempt.status === "running" && this.active.has(attempt.runId)),
+				);
+			if (!hasUnboundAttempt) break;
+			if (pass === 159)
+				throw new Error(
+					`Task reservation for @${name} did not roll back after shutdown admission fencing; claim retained.`,
+				);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		for (const task of this.board.list()) {
+			const activeClaim = task.status === "in_progress" || task.status === "in_review";
+			let ownsClaim = task.owner === name && activeClaim && task.ownerMembershipId === _membershipId;
+			if (task.owner === name && activeClaim && task.ownerMembershipId === undefined) {
+				const attemptProvesMembership =
+					_membershipId !== undefined &&
+					task.attempts.some((attempt) => attempt.teammateName === name && attempt.membershipId === _membershipId);
+				if (!attemptProvesMembership)
+					throw new Error(
+						`Legacy task claim ${task.code ?? task.id} for @${name} has no verifiable membership owner; shutdown is fenced for recovery.`,
+					);
+				this.board.bindOwnerMembership(task.id, _membershipId);
+				ownsClaim = true;
+			}
+			const terminal = task.status === "completed" || task.status === "cancelled";
+			const invalidatesPlan = !terminal && task.executionPlan?.name === name;
+			if (!ownsClaim && !invalidatesPlan) continue;
+			if (task.attempts.some((attempt) => attempt.status === "running"))
+				throw new Error(`Task ${task.code ?? task.id} still has an active attempt; claim retained.`);
+			this.board.update({
+				id: task.id,
+				...(ownsClaim ? { status: "pending" as const } : {}),
+				...(invalidatesPlan ? { executionPlan: null } : {}),
+			});
+		}
+	}
+
 	async output(
 		id: string,
 		input: { actor: TaskActor; wait?: boolean; signal?: AbortSignal },
@@ -224,6 +305,7 @@ export class TaskExecutionService {
 		if (this.disposed) return;
 		this.acceptingExecutions = false;
 		this.disposed = true;
+		this.unsubscribeShutdownReconciler();
 		this.unsubscribe();
 		for (const pending of this.retryTimers.values()) {
 			clearTimeout(pending.timer);

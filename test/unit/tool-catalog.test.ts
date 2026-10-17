@@ -50,7 +50,7 @@ describe("subagent tool registration", () => {
 			{ name: "steer_subagent" },
 			{ name: "teammate_status" },
 			{ name: "teammate_release" },
-			{ name: "teammate_retire" },
+			{ name: "teammate_shutdown" },
 		]);
 		expect(registered).toEqual([
 			"Agent",
@@ -58,7 +58,7 @@ describe("subagent tool registration", () => {
 			"steer_subagent",
 			"teammate_status",
 			"teammate_release",
-			"teammate_retire",
+			"teammate_shutdown",
 		]);
 	});
 
@@ -71,9 +71,9 @@ describe("subagent tool registration", () => {
 			{ name: "steer_subagent" },
 			{ name: "teammate_status" },
 			{ name: "teammate_release" },
-			{ name: "teammate_retire" },
+			{ name: "teammate_shutdown" },
 		]);
-		expect(registered).toEqual(["steer_subagent", "teammate_status", "teammate_release", "teammate_retire"]);
+		expect(registered).toEqual(["steer_subagent", "teammate_status", "teammate_release", "teammate_shutdown"]);
 	});
 });
 

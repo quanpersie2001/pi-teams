@@ -199,6 +199,7 @@ describe("task execution bridge", () => {
 			},
 			get: () => undefined,
 			getHistoricalRun: () => undefined,
+			teammateMembershipId: () => undefined,
 			spawn,
 			stop: async () => true,
 			getResult: async (id: string) => `output ${id}`,
@@ -420,6 +421,7 @@ describe("task execution bridge", () => {
 				listeners.add(fn);
 				return () => listeners.delete(fn);
 			},
+			teammateMembershipId: () => undefined,
 		};
 		const service = new TaskExecutionService({ board: b, manager: manager as never });
 		expect(b.get(task.id)?.attempts[0]).toMatchObject({ runId: "run-known", status: "stopped", settledAt: 99 });

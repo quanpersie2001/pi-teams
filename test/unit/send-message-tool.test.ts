@@ -59,6 +59,7 @@ function leadTool(
 				state: "idle" | "busy" | "released" | "retired";
 				availability: "available" | "unavailable";
 				recoveryError?: string;
+				operation?: "shutting_down";
 		  }
 		| undefined,
 ): SendTool {
@@ -70,7 +71,10 @@ function leadTool(
 function teammateTool(
 	self: string,
 	members: readonly string[],
-	states: Record<string, { lifecycle?: string; availability?: string; recoveryError?: string }> = {},
+	states: Record<
+		string,
+		{ lifecycle?: string; availability?: string; recoveryError?: string; operation?: { kind: string } }
+	> = {},
 ): SendTool {
 	const service = new MailboxService({ teamDir: root, teamKey: TEAM_KEY, self });
 	writeFileSync(
@@ -131,6 +135,16 @@ describe("lead send_message", () => {
 		expect(new MailboxService({ teamDir: root, teamKey: TEAM_KEY, self: "worker" }).receive()).toEqual([]);
 	});
 
+	it("refuses a teammate whose shutdown operation is persisted", async () => {
+		const lead = new MailboxService({ teamDir: root, teamKey: TEAM_KEY, self: "lead" });
+		const tool = leadTool(
+			() => lead,
+			["worker"],
+			() => ({ state: "busy", availability: "available", operation: "shutting_down" }),
+		);
+		expect(await send(tool, "worker", "hello")).toContain("is unavailable");
+	});
+
 	it("still queues for busy teammates because messages wait for their active turn", async () => {
 		const lead = new MailboxService({ teamDir: root, teamKey: TEAM_KEY, self: "lead" });
 		const tool = leadTool(
@@ -164,6 +178,11 @@ describe("teammate send_message", () => {
 	it("refuses an address absent from the roster file", async () => {
 		const tool = teammateTool("worker", ["worker", "reviewer"]);
 		expect(await send(tool, "ghost", "hello")).toBe("Unknown teammate: ghost");
+	});
+
+	it("child sender refuses recipients fenced for shutdown", async () => {
+		const tool = teammateTool("worker", ["worker", "reviewer"], { reviewer: { operation: { kind: "shutdown" } } });
+		expect(await send(tool, "reviewer", "late message")).toContain("Message not sent");
 	});
 
 	it("rejects released, retired and explicitly unavailable roster members", async () => {

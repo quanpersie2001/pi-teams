@@ -26,7 +26,7 @@ interface ReleaseCall {
 	cleanupWorktree: boolean | undefined;
 }
 interface TeammateCall {
-	action: "release" | "retire";
+	action: "release" | "shutdown";
 	name: string;
 }
 
@@ -47,8 +47,7 @@ function stubManager(released = true): AgentManager & { calls: ReleaseCall[]; te
 			return {
 				name,
 				type: "explore",
-				state:
-					action === "retire" ? ("retired" as const) : action === "release" ? ("released" as const) : ("idle" as const),
+				state: action === "release" ? ("released" as const) : ("idle" as const),
 				availability: "available" as const,
 				contextAvailable: false,
 				lastRunId: "run-1",
@@ -58,8 +57,8 @@ function stubManager(released = true): AgentManager & { calls: ReleaseCall[]; te
 			teammateCalls.push({ action: "release", name });
 			return released;
 		},
-		async retireTeammate(name: string) {
-			teammateCalls.push({ action: "retire", name });
+		async shutdownTeammate(name: string) {
+			teammateCalls.push({ action: "shutdown", name });
 			return released;
 		},
 	};
@@ -195,7 +194,7 @@ describe("/agents command", () => {
 		}
 	});
 
-	it("supports teammate status, settled release and retirement without changing run cleanup semantics", async () => {
+	it("supports teammate status, settled release and shutdown without changing run cleanup semantics", async () => {
 		const { handler, manager } = setup();
 		const { ctx, notifications } = commandContext();
 		await handler("teammate-status worker", ctx);
@@ -203,11 +202,11 @@ describe("/agents command", () => {
 		await handler("teammate-release worker", ctx);
 		expect(notifications.at(-1)?.message).toContain("is now released");
 		expect(notifications.at(-1)?.message).toContain("Task-board claims are unchanged");
-		await handler("teammate-retire worker", ctx);
-		expect(notifications.at(-1)?.message).toContain("is now retired");
+		await handler("teammate-shutdown worker", ctx);
+		expect(notifications.at(-1)?.message).toContain("was shut down and removed");
 		expect(manager.teammateCalls).toEqual([
 			{ action: "release", name: "worker" },
-			{ action: "retire", name: "worker" },
+			{ action: "shutdown", name: "worker" },
 		]);
 	});
 

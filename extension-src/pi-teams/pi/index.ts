@@ -15,6 +15,8 @@ import { registerAgentsCommand, registerBackendCommand } from "./commands.js";
 import { loadSubagentsSettings } from "./config-host.js";
 import { createPiDeliveryHost, installLeadMailbox } from "./delivery-host.js";
 import { registerModelTools } from "./model-tools.js";
+import { type PeerRuntimeHandle, startPeerRuntime } from "./peer-runtime.js";
+import { registerPeerTools, reviewHeldMessages } from "./peer-tools.js";
 import { ProcessAgentExecutionBackend, resolveLauncherHint, resolveSessionLauncherHint } from "./process-backend.js";
 import { createSubagentRunStore, teamsArtifactDir } from "./registry-host.js";
 import { type SubagentsRpcWiring, wireSubagentsRpc } from "./rpc.js";
@@ -33,7 +35,23 @@ export default function (pi: ExtensionAPI): void {
 	const configCwd = process.cwd();
 	const agentDir = getAgentDir();
 	let latestCtx: ExtensionContext | undefined;
+	let peerRuntime: PeerRuntimeHandle | undefined;
 	let currentTaskReminders = false;
+	registerPeerTools(pi, () => peerRuntime);
+	pi.registerCommand("peer-inbox", {
+		description: "Review held independent-peer messages",
+		handler: async (_args, ctx) => {
+			if (!peerRuntime) {
+				ctx.ui.notify("Peer capability is disabled or unavailable.", "error");
+				return;
+			}
+			try {
+				await reviewHeldMessages(ctx, peerRuntime.messaging);
+			} catch (error) {
+				ctx.ui.notify(`Peer inbox failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		},
+	});
 	const backend = new ProcessAgentExecutionBackend({
 		launcherHint: resolveLauncherHint(),
 		getParentExtensionPaths: () => [
@@ -147,8 +165,20 @@ export default function (pi: ExtensionAPI): void {
 		stopMentionRouting?.();
 		closeLeadMailbox = undefined;
 		stopMentionRouting = undefined;
+		await peerRuntime?.dispose();
+		peerRuntime = undefined;
 		const settings = await loadSubagentsSettings(configCwd);
 		currentTaskReminders = settings.tasks.reminders;
+		peerRuntime = await startPeerRuntime({
+			pi,
+			ctx,
+			root: agentDir,
+			enabled: settings.peers.enabled,
+			scope: settings.peers.scope,
+			policy: settings.peers.policy,
+			onError: (error) =>
+				console.warn(`[pi-teams] peer runtime unavailable: ${error instanceof Error ? error.message : String(error)}`),
+		});
 		reminderCadence = new TaskReminderCadence();
 		app.updateSettings(settings);
 		// Env override (four launchers) wins over the settings key (auto|headless).
@@ -231,7 +261,12 @@ export default function (pi: ExtensionAPI): void {
 							delivered: false as const,
 							error: status?.recoveryError ?? `Teammate @${target} is ${status?.state ?? "unavailable"}.`,
 						};
-					return app.mailbox?.send(target, text) ?? { delivered: false as const, error: "No active team" };
+					return (
+						app.mailbox?.send(target, text, status?.membershipId) ?? {
+							delivered: false as const,
+							error: "No active team",
+						}
+					);
 				},
 			};
 			installAgentMentionAutocomplete(ctx, app.registry, routing);
@@ -240,6 +275,8 @@ export default function (pi: ExtensionAPI): void {
 		rpc.announceReady();
 	});
 	pi.on("session_before_switch", async () => {
+		await peerRuntime?.dispose();
+		peerRuntime = undefined;
 		closeLeadMailbox?.();
 		stopMentionRouting?.();
 		closeLeadMailbox = undefined;
@@ -264,6 +301,8 @@ export default function (pi: ExtensionAPI): void {
 		}
 	});
 	pi.on("session_shutdown", async () => {
+		await peerRuntime?.dispose();
+		peerRuntime = undefined;
 		closeLeadMailbox?.();
 		stopMentionRouting?.();
 		closeLeadMailbox = undefined;

@@ -86,6 +86,11 @@ async function settle(flushTurns = 32): Promise<void> {
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function waitFor(predicate: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 100 && !predicate(); attempt += 1) await delay(10);
+	expect(predicate()).toBe(true);
+}
+
 async function spawnBackground(manager: AgentManager, request: Record<string, unknown> = {}): Promise<string> {
 	const record = await manager.spawn({
 		type: "general-purpose",
@@ -187,11 +192,11 @@ describe("DeliveryService", () => {
 		await settle(20);
 		fixture.backend.complete(ids[0] ?? "missing", "first");
 		fixture.backend.complete(ids[1] ?? "missing", "second");
-		await delay(50);
+		await waitFor(() => fixture.notifications.length === 1);
 		expect(fixture.notifications).toHaveLength(1);
 		expect(fixture.notifications[0]?.others).toHaveLength(1);
 		fixture.backend.complete(ids[2] ?? "missing", "late");
-		await delay(40);
+		await waitFor(() => fixture.notifications.length === 2);
 		expect(fixture.notifications).toHaveLength(2);
 		expect(fixture.notifications[1]?.agentId).toBe(ids[2]);
 		fixture.service.dispose();

@@ -78,6 +78,7 @@ export function buildAgentListView(
 			| {
 					state: NonNullable<AgentListRow["teammateState"]>;
 					availability: NonNullable<AgentListRow["teammateAvailability"]>;
+					operation?: NonNullable<AgentListRow["teammateOperation"]>;
 			  }
 			| undefined;
 	},
@@ -116,6 +117,7 @@ export function buildAgentListView(
 		const teammate = record.teammateName ? manager.teammateStatus?.(record.teammateName) : undefined;
 		if (teammate) {
 			row.teammateState = teammate.state;
+			if (teammate.operation !== undefined) row.teammateOperation = teammate.operation;
 			row.teammateAvailability = teammate.availability;
 			if (teammate.availability === "unavailable" && record.handle !== undefined)
 				row.resourceState = "cleanup-unconfirmed";

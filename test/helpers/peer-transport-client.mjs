@@ -1,0 +1,11 @@
+import { connect } from 'node:net';
+import { sign } from 'node:crypto';
+const [socketPath, encodedPem, serializedMessage, nonce = 'subprocess-nonce-0001'] = process.argv.slice(2);
+const privatePem = Buffer.from(encodedPem, 'base64').toString('utf8');
+const message = JSON.parse(serializedMessage), sentAt = Date.now();
+const payload = Buffer.from(JSON.stringify({ version: 1, message, sentAt, nonce }));
+const frame = JSON.stringify({ version: 1, message, sentAt, nonce, signature: sign(null, payload, privatePem).toString('base64') }) + '\n';
+const socket = connect(socketPath); let data = '';
+socket.on('connect', () => socket.write(frame));
+socket.on('data', chunk => { data += chunk.toString(); if (data.includes('\n')) { const response = JSON.parse(data.trim()); if (!response.ok) { console.error(response.error); process.exitCode = 1; } else process.stdout.write(JSON.stringify(response)); socket.end(); } });
+socket.on('error', error => { console.error(error.message); process.exitCode = 2; });

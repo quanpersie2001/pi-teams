@@ -41,6 +41,8 @@ export interface AgentRun {
 	status: AgentRunStatus;
 	/** Teammate address this run was spawned under (ADR 0007 §2); unset for anonymous runs. */
 	teammateName?: string;
+	/** Exact roster incarnation bound at admission; legacy runs may omit it. */
+	membershipId?: string;
 	/** Teammate identity color, normalized to lowercase #RRGGBB. */
 	teammateColor?: string;
 

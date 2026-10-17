@@ -125,7 +125,7 @@ describe("IntegrationService ping", () => {
 		expect(fixture.replies[0]?.channel).toBe(subagentsRpcReplyChannel("ping", "p1"));
 		expect(dataOf(replyFor(fixture, "ping", "p1"))).toEqual({
 			version: 3,
-			capabilities: ["teammate_status", "teammate_release", "teammate_retire", "spawn_context"],
+			capabilities: ["teammate_status", "teammate_release", "teammate_shutdown", "spawn_context"],
 		});
 	});
 
@@ -134,17 +134,17 @@ describe("IntegrationService ping", () => {
 		await request(fixture, "ping", { requestId: "p2" });
 		expect(dataOf(replyFor(fixture, "ping", "p2"))).toMatchObject({
 			version: 3,
-			capabilities: expect.arrayContaining(["teammate_status", "teammate_retire"]),
+			capabilities: expect.arrayContaining(["teammate_status", "teammate_shutdown"]),
 		});
 	});
 });
 
 describe("IntegrationService teammate lifecycle RPC", () => {
-	it("advertises and implements additive status/release/retire operations", async () => {
+	it("advertises and implements additive status/release/shutdown operations", async () => {
 		const fixture = await makeFixture();
 		expect(SUBAGENTS_RPC_OPS).toContain("teammate_status");
 		expect(SUBAGENTS_RPC_OPS).toContain("teammate_release");
-		expect(SUBAGENTS_RPC_OPS).toContain("teammate_retire");
+		expect(SUBAGENTS_RPC_OPS).toContain("teammate_shutdown");
 		await request(fixture, "teammate_status", { requestId: "ts1", name: "unknown" });
 		expect(replyFor(fixture, "teammate_status", "ts1")).toMatchObject({ success: true, data: null });
 		await request(fixture, "teammate_release", { requestId: "tr1", name: "unknown" });
@@ -152,23 +152,16 @@ describe("IntegrationService teammate lifecycle RPC", () => {
 			success: false,
 			error: expect.stringContaining("not found"),
 		});
-		await request(fixture, "teammate_retire", { requestId: "tt1", name: "unknown" });
-		expect(replyFor(fixture, "teammate_retire", "tt1")).toMatchObject({
+		await request(fixture, "teammate_shutdown", { requestId: "tt1", name: "unknown" });
+		expect(replyFor(fixture, "teammate_shutdown", "tt1")).toMatchObject({
 			success: false,
 			error: expect.stringContaining("not found"),
 		});
-		fixture.manager.releaseTeammate = async () => true;
-		fixture.manager.teammateStatus = () => ({
-			name: "already-retired",
-			type: "explore",
-			state: "retired",
-			availability: "available",
-			contextAvailable: false,
-		});
-		await request(fixture, "teammate_release", { requestId: "rel-retired", name: "already-retired" });
-		expect(replyFor(fixture, "teammate_release", "rel-retired")).toMatchObject({
+		fixture.manager.shutdownTeammate = async () => true;
+		await request(fixture, "teammate_shutdown", { requestId: "tsd1", name: "worker" });
+		expect(replyFor(fixture, "teammate_shutdown", "tsd1")).toMatchObject({
 			success: true,
-			data: { name: "already-retired", state: "retired" },
+			data: { name: "worker", shutdown: true },
 		});
 	});
 });
@@ -506,7 +499,7 @@ describe("IntegrationService dispatch robustness", () => {
 			"release",
 			"teammate_status",
 			"teammate_release",
-			"teammate_retire",
+			"teammate_shutdown",
 		]);
 		const active = new Set<(data: unknown) => void>();
 		const service = new IntegrationService(await makeFixture().then((f) => f.manager), {

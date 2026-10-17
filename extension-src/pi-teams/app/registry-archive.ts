@@ -66,7 +66,10 @@ export async function archiveRegistryRuns(
 			delete history.handle;
 			if (cleanupError) {
 				history.recoveryError = [entry.recoveryError, cleanupError].filter(Boolean).join("; ");
-				deps.warn(`run "${entry.id}" retained its saved outcome with a startup cleanup error: ${cleanupError}`);
+				kept.push({ ...entry, recoveryError: history.recoveryError });
+				deps.warn(`run "${entry.id}" retained its saved outcome and cleanup receipt: ${cleanupError}`);
+				if (deps.rememberAgents) deps.recordCompleted({ ...history, completedAt: entry.completedAt ?? deps.now() });
+				continue;
 			}
 			if (!deps.rememberAgents) kept.push(history);
 			else deps.recordCompleted({ ...history, completedAt: entry.completedAt ?? deps.now() });
@@ -80,7 +83,9 @@ export async function archiveRegistryRuns(
 			recoveryError += "; verified disposal was unavailable because the process identity is missing";
 		const history = { ...entry };
 		delete history.handle;
-		deps.recordCompleted({ ...history, status: "stopped", completedAt: deps.now(), recoveryError });
+		const completedAt = deps.now();
+		if (cleanupError && entry.handle) kept.push({ ...entry, status: "stopped", completedAt, recoveryError });
+		deps.recordCompleted({ ...history, status: "stopped", completedAt, recoveryError });
 		deps.warn(`run "${entry.id}" archived stopped at startup: ${recoveryError}`);
 	}
 	deps.persist(kept);

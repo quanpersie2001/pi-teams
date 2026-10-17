@@ -134,7 +134,7 @@ export class TaskBoardService {
 				input.executionPlan !== undefined;
 			if (requirementsChanged && task.attempts.some((attempt) => attempt.status === "running"))
 				throw new Error("Cannot edit task requirements while an execution is active");
-			if (requirementsChanged && task.status !== "pending")
+			if (requirementsChanged && task.status !== "pending" && input.status !== "pending")
 				throw new Error(`Only pending tasks can be edited: ${this.label(task)} is ${task.status}`);
 			if (input.outcome !== undefined) {
 				if (task.owner !== this.self && this.self !== "lead")
@@ -205,10 +205,11 @@ export class TaskBoardService {
 		if (status === "pending") {
 			if (task.attempts.some((attempt) => attempt.status === "running"))
 				throw new Error("Cannot release a task while an execution is active");
-			if (task.status !== "in_progress" || (task.owner !== this.self && this.self !== "lead"))
+			if (!["in_progress", "in_review"].includes(task.status) || (task.owner !== this.self && this.self !== "lead"))
 				throw new Error("Only the current owner or lead coordinator can release a claim");
 			task.status = status;
 			delete task.owner;
+			delete task.ownerMembershipId;
 			return;
 		}
 		if (status === "in_review") {
@@ -235,6 +236,7 @@ export class TaskBoardService {
 			task.outcome = clone(outcome ?? task.outcome ?? {});
 			task.status = status;
 			delete task.owner;
+			delete task.ownerMembershipId;
 			return;
 		}
 		if (status === "cancelled") throw new Error("Task cancellation requires tasks_cancel");
@@ -321,6 +323,18 @@ export class TaskBoardService {
 			}
 		};
 	}
+	bindOwnerMembership(id: string, membershipId: string | undefined): TaskProjection {
+		return this.withBoardLock(() => {
+			const task = this.require(id);
+			if (task.status !== "in_progress" && task.status !== "in_review")
+				throw new Error("Task owner membership requires an active claim");
+			if (membershipId !== undefined) task.ownerMembershipId = membershipId;
+			task.updatedAt = this.now();
+			this.write(task);
+			return this.project(task);
+		});
+	}
+
 	reserveAttempt(id: string, runId: string): TaskAttempt {
 		return this.withBoardLock(() => {
 			const t = this.require(id);
@@ -339,7 +353,7 @@ export class TaskBoardService {
 	): {
 		attempt: TaskAttempt;
 		task: TaskProjection;
-		previous: { status: "pending" | "in_progress"; owner?: string };
+		previous: { status: "pending" | "in_progress"; owner?: string; ownerMembershipId?: string };
 	} {
 		return this.withBoardLock(() => {
 			const task = this.require(id);
@@ -352,6 +366,7 @@ export class TaskBoardService {
 			const previous = {
 				status: task.status === "pending" ? ("pending" as const) : ("in_progress" as const),
 				...(task.owner !== undefined ? { owner: task.owner } : {}),
+				...(task.ownerMembershipId !== undefined ? { ownerMembershipId: task.ownerMembershipId } : {}),
 			};
 			if (task.status === "pending") {
 				const blockers = this.blockedBy(task);
@@ -397,7 +412,7 @@ export class TaskBoardService {
 		id: string,
 		reservationId: string,
 		error: string,
-		previous: { status: "pending" | "in_progress"; owner?: string },
+		previous: { status: "pending" | "in_progress"; owner?: string; ownerMembershipId?: string },
 	): TaskProjection {
 		return this.withBoardLock(() => {
 			const task = this.require(id);
@@ -407,18 +422,21 @@ export class TaskBoardService {
 			task.status = previous.status;
 			if (previous.owner !== undefined) task.owner = previous.owner;
 			else delete task.owner;
+			if (previous.ownerMembershipId !== undefined) task.ownerMembershipId = previous.ownerMembershipId;
+			else delete task.ownerMembershipId;
 			task.updatedAt = this.now();
 			this.write(task);
 			this.emit({ type: "updated", id: task.id, task: this.project(task) });
 			return this.project(task);
 		});
 	}
-	bindAttempt(id: string, reservationId: string, runId: string): TaskProjection {
+	bindAttempt(id: string, reservationId: string, runId: string, membershipId?: string): TaskProjection {
 		return this.withBoardLock(() => {
 			const t = this.require(id);
 			const a = t.attempts.find((x) => x.reservationId === reservationId);
 			if (a?.status !== "running") throw new Error("Task execution reservation is no longer active");
 			a.runId = runId;
+			if (membershipId !== undefined) a.membershipId = membershipId;
 			t.updatedAt = this.now();
 			this.write(t);
 			this.emit({ type: "updated", id: t.id, task: this.project(t) });

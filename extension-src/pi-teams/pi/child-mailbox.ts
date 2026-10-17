@@ -12,6 +12,7 @@ export interface ChildMailboxOptions {
 	teamDir: string;
 	teamKey: string;
 	self: string;
+	membershipId?: string;
 	/** True while a native assistant turn is active. */
 	isRunning(): boolean;
 	/** Inject peer content using native prompt when idle, native steer while running. */
@@ -28,6 +29,8 @@ export interface ChildMailboxHandle {
 interface ParticipantAvailability {
 	state?: "idle" | "busy" | "released" | "retired";
 	availability?: "available" | "unavailable";
+	membershipId?: string;
+	operation?: string;
 	recoveryError?: string;
 }
 
@@ -40,9 +43,18 @@ function participantAvailability(teamDir: string): Map<string, ParticipantAvaila
 		const participants = new Map<string, ParticipantAvailability>([["lead", {}]]);
 		for (const member of members) {
 			if (typeof member !== "object" || member === null) continue;
-			const entry = member as { name?: unknown; lifecycle?: unknown; availability?: unknown; recoveryError?: unknown };
+			const entry = member as {
+				name?: unknown;
+				lifecycle?: unknown;
+				availability?: unknown;
+				membershipId?: unknown;
+				operation?: unknown;
+				recoveryError?: unknown;
+			};
 			if (!isMailboxAddress(entry.name) || entry.name === "lead") continue;
 			participants.set(entry.name, {
+				...(typeof entry.membershipId === "string" ? { membershipId: entry.membershipId } : {}),
+				...(typeof entry.operation === "object" && entry.operation !== null ? { operation: "shutting_down" } : {}),
 				...(entry.lifecycle === "idle" ||
 				entry.lifecycle === "busy" ||
 				entry.lifecycle === "released" ||
@@ -68,7 +80,13 @@ function result(text: string, details?: Record<string, unknown>) {
 /** Watch/drain this participant's file mailbox after native bridge startup. */
 export function watchChildMailbox(options: ChildMailboxOptions): ChildMailboxHandle {
 	const warn = options.warn ?? ((message: string) => console.warn(`[pi-teams] ${message}`));
-	const service = new MailboxService({ teamDir: options.teamDir, teamKey: options.teamKey, self: options.self, warn });
+	const service = new MailboxService({
+		teamDir: options.teamDir,
+		teamKey: options.teamKey,
+		self: options.self,
+		...(options.membershipId !== undefined ? { selfMembershipId: options.membershipId } : {}),
+		warn,
+	});
 	mkdirSync(service.inboxDir, { recursive: true, mode: 0o700 });
 	chmodSync(service.inboxDir, 0o700);
 	let closed = false;
@@ -81,6 +99,14 @@ export function watchChildMailbox(options: ChildMailboxOptions): ChildMailboxHan
 		}
 		draining = (async () => {
 			while (!closed) {
+				if (options.membershipId !== undefined) {
+					const self = participantAvailability(options.teamDir).get(options.self);
+					if (!self || self.membershipId !== options.membershipId || self.operation === "shutting_down") {
+						warn(`mailbox stopped: membership incarnation for @${options.self} is no longer current`);
+						closed = true;
+						break;
+					}
+				}
 				const messages = service.receive(16);
 				if (messages.length === 0) {
 					if (drainAgain) {
@@ -145,6 +171,7 @@ export function createChildMailboxTool(service: MailboxService) {
 			if (
 				participant.state === "released" ||
 				participant.state === "retired" ||
+				participant.operation === "shutting_down" ||
 				participant.availability === "unavailable"
 			) {
 				const reason = participant.recoveryError ? `: ${participant.recoveryError}` : "";
@@ -160,7 +187,7 @@ export function createChildMailboxTool(service: MailboxService) {
 					},
 				);
 			}
-			const sent = service.send(args.target, args.message);
+			const sent = service.send(args.target, args.message, participant.membershipId);
 			return result(sent.delivered ? `Message queued for @${args.target}.` : `Message not sent: ${sent.error}`);
 		},
 	});

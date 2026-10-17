@@ -3,7 +3,10 @@ import type { TeammateStatus } from "../app/agent-manager.js";
 /** Only idle/busy, available roster identities can be messaged or offered in the composer. */
 export function isTeammateMessageAvailable(status: TeammateStatus | undefined): boolean {
 	return (
-		status !== undefined && (status.state === "idle" || status.state === "busy") && status.availability === "available"
+		status !== undefined &&
+		(status.state === "idle" || status.state === "busy") &&
+		status.availability === "available" &&
+		status.operation === undefined
 	);
 }
 

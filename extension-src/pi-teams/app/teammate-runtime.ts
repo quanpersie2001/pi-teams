@@ -6,9 +6,11 @@ export type TeammateLifecycle = "idle" | "busy" | "released" | "retired";
 /** Session-owned teammate identity and child context. Runs contain outcomes; this owns live child resources. */
 export interface TeammateRuntimeEntry {
 	readonly name: string;
+	readonly membershipId?: string;
 	readonly type: string;
 	readonly color?: string;
 	state: TeammateLifecycle;
+	operation?: "shutting_down";
 	contextGeneration: number;
 	currentRunId?: string;
 	backend?: AgentExecutionBackend;
@@ -22,9 +24,13 @@ export interface TeammateRuntimeEntry {
 export class TeammateRuntime {
 	private readonly entries = new Map<string, TeammateRuntimeEntry>();
 
-	ensure(identity: { name: string; type: string; color?: string }): TeammateRuntimeEntry {
+	ensure(identity: { name: string; membershipId?: string; type: string; color?: string }): TeammateRuntimeEntry {
 		const entry = this.entries.get(identity.name);
 		if (entry) {
+			if (identity.membershipId !== undefined && entry.membershipId !== identity.membershipId)
+				throw new Error(
+					`Teammate "@${identity.name}" runtime belongs to a different membership incarnation; recover it before reuse.`,
+				);
 			if (entry.type !== identity.type)
 				throw new Error(`Teammate "@${identity.name}" keeps its specialist role; use a new name for a different role.`);
 			if (identity.color !== undefined && entry.color !== identity.color)
@@ -37,6 +43,7 @@ export class TeammateRuntime {
 		}
 		const created: TeammateRuntimeEntry = {
 			name: identity.name,
+			...(identity.membershipId !== undefined ? { membershipId: identity.membershipId } : {}),
 			type: identity.type,
 			...(identity.color !== undefined ? { color: identity.color } : {}),
 			state: "released",
@@ -44,6 +51,13 @@ export class TeammateRuntime {
 		};
 		this.entries.set(identity.name, created);
 		return created;
+	}
+
+	remove(name: string, expected?: TeammateRuntimeEntry): boolean {
+		const current = this.entries.get(name);
+		if (!current || (expected !== undefined && current !== expected)) return false;
+		this.entries.delete(name);
+		return true;
 	}
 
 	get(name: string): TeammateRuntimeEntry | undefined {

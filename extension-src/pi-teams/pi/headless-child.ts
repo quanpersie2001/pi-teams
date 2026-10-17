@@ -233,7 +233,12 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 
 	mailboxService =
 		bootstrap.teamDir && bootstrap.teamKey && bootstrap.teammateName
-			? new MailboxService({ teamDir: bootstrap.teamDir, teamKey: bootstrap.teamKey, self: bootstrap.teammateName })
+			? new MailboxService({
+					teamDir: bootstrap.teamDir,
+					teamKey: bootstrap.teamKey,
+					self: bootstrap.teammateName,
+					...(bootstrap.membershipId !== undefined ? { selfMembershipId: bootstrap.membershipId } : {}),
+				})
 			: undefined;
 	const taskBoard =
 		bootstrap.teamDir && bootstrap.teammateName
@@ -520,6 +525,7 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 				teamDir: bootstrap.teamDir,
 				teamKey: bootstrap.teamKey,
 				self: bootstrap.teammateName,
+				...(bootstrap.membershipId !== undefined ? { membershipId: bootstrap.membershipId } : {}),
 				isRunning: () => activeBridge.state().execution === "running",
 				prompt: (text) => activeBridge.startMailboxRun(text),
 				steer: (text) => host.steer(text),

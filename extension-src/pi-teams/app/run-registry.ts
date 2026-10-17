@@ -39,6 +39,8 @@ export interface AgentRegistryEntry {
 	description: string;
 	/** Teammate address this run was spawned under (ADR 0007 §2). */
 	teammateName?: string;
+	/** Exact membership incarnation; legacy records may omit it. */
+	membershipId?: string;
 	/** Effective teammate identity color, normalized to lowercase #RRGGBB. */
 	teammateColor?: string;
 	status: AgentRunStatus;
@@ -145,6 +147,7 @@ export function toRegistryEntry(
 		isBackground: record.isBackground === true,
 	};
 	if (record.teammateName !== undefined) entry.teammateName = record.teammateName;
+	if (record.membershipId !== undefined) entry.membershipId = record.membershipId;
 	if (record.teammateColor !== undefined) entry.teammateColor = record.teammateColor;
 	if (record.handle !== undefined) {
 		const serialized = project?.(record.handle, record.sessionFile);

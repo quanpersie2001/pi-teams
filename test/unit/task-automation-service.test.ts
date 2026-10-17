@@ -143,6 +143,7 @@ describe("TaskAutomationService", () => {
 		const lockPath = join(board.taskDir, "board.lock");
 		const manager = {
 			subscribe: () => () => {},
+			teammateMembershipId: () => undefined,
 			spawn: vi.fn(async () => {
 				expect(existsSync(lockPath)).toBe(false);
 				return { id: "run-child-lock-test" };
@@ -251,6 +252,7 @@ describe("TaskAutomationService", () => {
 		});
 		const manager = {
 			subscribe: () => () => {},
+			teammateMembershipId: () => undefined,
 			spawn: vi.fn(async () => ({ id: "stale-plan-run" })),
 			get: () => undefined,
 		};
@@ -302,6 +304,7 @@ describe("TaskAutomationService", () => {
 		});
 		const manager = {
 			subscribe: () => () => {},
+			teammateMembershipId: () => undefined,
 			spawn: vi.fn(async () => ({ id: "stale-identity-run" })),
 			get: () => undefined,
 		};
@@ -360,6 +363,7 @@ describe("TaskAutomationService", () => {
 		});
 		const manager = {
 			subscribe: () => () => {},
+			teammateMembershipId: () => undefined,
 			spawn: vi.fn(async () => ({ id: "auto-overrode-manual-claim" })),
 			get: () => undefined,
 		};
@@ -409,6 +413,7 @@ describe("TaskAutomationService", () => {
 		});
 		const manager = {
 			subscribe: () => () => {},
+			teammateMembershipId: () => undefined,
 			spawn: vi.fn(async () => ({ id: "run-after-shutdown" })),
 			get: () => undefined,
 		};
@@ -424,6 +429,58 @@ describe("TaskAutomationService", () => {
 		await flush();
 		expect(manager.spawn).not.toHaveBeenCalled();
 		expect(board.get(dependent.id)).toMatchObject({ status: "pending", attempts: [] });
+		execution.dispose();
+	});
+
+	it("joins a fenced pre-spawn reservation through conflicting rollback writes", async () => {
+		const board = createBoard();
+		const task = board.create({ title: "Reserved before spawn" });
+		let releaseSpawn!: () => void;
+		let enteredSpawn!: () => void;
+		const spawnEntered = new Promise<void>((resolve) => {
+			enteredSpawn = resolve;
+		});
+		const spawnGate = new Promise<void>((resolve) => {
+			releaseSpawn = resolve;
+		});
+		let reconcile!: (name: string, membershipId?: string, phase?: "fence" | "reconcile") => Promise<void>;
+		const manager = {
+			registerTaskShutdownReconciler: (callback: typeof reconcile) => {
+				reconcile = callback;
+				return () => {};
+			},
+			subscribe: () => () => {},
+			teammateMembershipId: () => undefined,
+			spawn: vi.fn(async () => {
+				enteredSpawn();
+				await spawnGate;
+				throw new Error("shutdown fenced admission");
+			}),
+			get: () => undefined,
+		};
+		const execution = new TaskExecutionService({ board, manager: manager as never });
+		const attempt = execution.execute(task.id, {
+			actor: { name: "lead", coordinator: true },
+			type: "reviewer",
+			name: "worker",
+		});
+		await spawnEntered;
+		await reconcile("worker", undefined, "fence");
+		const lock = join(board.taskDir, "board.lock");
+		writeFileSync(lock, `${process.pid}:11111111-1111-1111-1111-111111111111`);
+		let reconciliationFinished = false;
+		const reconciliation = reconcile("worker", undefined, "reconcile").then(() => {
+			reconciliationFinished = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(reconciliationFinished).toBe(false);
+		releaseSpawn();
+		const unlockTimer = setTimeout(() => rmSync(lock, { force: true }), 120);
+		await expect(attempt).rejects.toThrow(/shutdown fenced admission/);
+		clearTimeout(unlockTimer);
+		rmSync(lock, { force: true });
+		await reconciliation;
+		expect(board.get(task.id)).toMatchObject({ status: "pending", attempts: [{ status: "failed" }] });
 		execution.dispose();
 	});
 

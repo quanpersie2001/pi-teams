@@ -52,6 +52,8 @@ export interface ChildBootstrap {
 	teamKey?: string;
 	/** This child's teammate name (its mailbox address). */
 	teammateName?: string;
+	/** Exact roster incarnation bound to this child context. */
+	membershipId?: string;
 	/** Normalized #RRGGBB runtime identity color. */
 	teammateColor?: string;
 }

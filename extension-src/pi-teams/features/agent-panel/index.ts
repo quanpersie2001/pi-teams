@@ -188,6 +188,7 @@ function compactTokens(value: number): string {
 
 function hubStatus(row: AgentListRow): string {
 	if (row.resourceState === "cleanup-unconfirmed") return "cleanup unconfirmed";
+	if (row.teammateOperation === "shutting_down") return "shutting down";
 	if (row.teammateAvailability === "unavailable") return "unavailable";
 	if (row.teammateState && row.teammateState !== "busy") return row.teammateState;
 	if (row.resourceState === "idle") return "idle";

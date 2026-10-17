@@ -27,6 +27,13 @@ describe("teammate composer routing availability", () => {
 		).toEqual(["idle", "busy"]);
 	});
 
+	it("hides a busy member as soon as shutdown operation is persisted", () => {
+		expect(isTeammateMessageAvailable({ ...status("worker", "busy"), operation: "shutting_down" })).toBe(false);
+		expect(
+			eligibleTeammateNames([{ name: "worker" }], () => ({ ...status("worker", "idle"), operation: "shutting_down" })),
+		).toEqual([]);
+	});
+
 	it("fails closed when a status is missing or unavailable", () => {
 		expect(isTeammateMessageAvailable(undefined)).toBe(false);
 		expect(isTeammateMessageAvailable(status("released", "released"))).toBe(false);

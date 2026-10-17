@@ -1,6 +1,6 @@
 // Mailbox filesystem behavior and HMAC authenticity (ADR 0007 §3).
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -38,6 +38,49 @@ describe("MailboxService", () => {
 			text: "hello",
 		});
 		expect(recipient.receive()).toMatchObject([{ from: "lead", to: "worker", text: "hello" }]);
+	});
+
+	it("fences send against shutdown and binds queued delivery to the recipient incarnation", () => {
+		const { sender, teamDir } = services();
+		writeFileSync(join(teamDir, "config.json"), JSON.stringify({ members: [{ name: "worker", membershipId: "M1" }] }));
+		const firstSend = sender.send("worker", "for M1", "M1");
+		expect(firstSend.delivered).toBe(true);
+		writeFileSync(
+			join(teamDir, "config.json"),
+			JSON.stringify({ members: [{ name: "worker", membershipId: "M1", operation: { kind: "shutdown" } }] }),
+		);
+		expect(sender.send("worker", "too late", "M1")).toMatchObject({ delivered: false });
+		const next = new MailboxService({ teamDir, teamKey: "per-team-secret", self: "worker", selfMembershipId: "M2" });
+		expect(next.receive()).toEqual([]);
+	});
+
+	it("rejects a late old-incarnation write after a same-name membership is created", () => {
+		const { sender, teamDir } = services();
+		const mailbox = join(teamDir, "inboxes", "worker");
+		writeFileSync(join(teamDir, "config.json"), JSON.stringify({ members: [{ name: "worker", membershipId: "M2" }] }));
+		const payload = {
+			id: "late-M1",
+			from: "lead",
+			to: "worker",
+			toMembershipId: "M1",
+			text: "old",
+			sentAt: 1,
+			hmac: "",
+		};
+		payload.hmac = signMessage("per-team-secret", payload);
+		mkdirSync(mailbox, { recursive: true });
+		writeFileSync(join(mailbox, "000-late.json"), JSON.stringify(payload));
+		const next = new MailboxService({ teamDir, teamKey: "per-team-secret", self: "worker", selfMembershipId: "M2" });
+		expect(next.receive()).toEqual([]);
+		expect(readdirSync(join(mailbox, "quarantine"))).toContain("000-late.json");
+		const staleSender = new MailboxService({
+			teamDir,
+			teamKey: "per-team-secret",
+			self: "worker",
+			selfMembershipId: "M1",
+		});
+		expect(staleSender.send("lead", "late outbound")).toMatchObject({ delivered: false });
+		expect(sender.send("worker", "current", "M2").delivered).toBe(true);
 	});
 
 	it("quarantines tampered and malformed entries without blocking valid delivery", () => {

@@ -208,3 +208,8 @@ An extension can explicitly assign ownership and notification routing:
 ```
 
 Direct model-facing `Agent` calls receive conversation ownership and `delivery: "conversation"`. See [Integration](./INTEGRATION.md) for request fields and delivery policies, and [Architecture](./ARCHITECTURE.md) for cleanup/security invariants.
+
+
+## Independent peer messaging (implementation status)
+
+Peer settings are `peers.enabled` (default `false`), `peers.scope` (default `project`), and receiver-controlled `peers.policy` (default `hold`). The Pi host registers peer tools and inbound approval controls when enabled. Peer messages are untrusted input, cannot grant permissions, and do not confer lifecycle or task ownership. A `queued` receipt means durable enqueue only; it is not proof of injection or model comprehension. An automated offline-provider smoke covers signed delivery between two independent Pi SDK sessions, held privacy, approval and correlated SDK acceptance; it does not verify production loader registration, interactive TUI behavior, or busy SDK steering. Missing SDK acceptance is ambiguous and preserves pending mail, so retry can duplicate delivery. Windows remains disabled/fail-closed until a real per-user storage ACL verifier is implemented.

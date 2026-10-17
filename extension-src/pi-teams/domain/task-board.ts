@@ -50,6 +50,7 @@ export interface TaskRequirementSnapshot {
 export interface TaskAttempt {
 	runId: string;
 	teammateName?: string;
+	membershipId?: string;
 	reservationId?: string;
 	startedAt: number;
 	settledAt?: number;
@@ -69,6 +70,7 @@ export interface BoardTask {
 	status: TaskStatus;
 	dependencies: string[];
 	owner?: string;
+	ownerMembershipId?: string;
 	assignee?: string;
 	reviewRequested?: boolean;
 	executionPlan?: TaskExecutionPlan;
@@ -232,6 +234,7 @@ function parseAttempt(value: unknown): TaskAttempt | undefined {
 		typeof value.runId !== "string" ||
 		value.runId.length === 0 ||
 		(value.teammateName !== undefined && !isMailboxAddress(value.teammateName)) ||
+		(value.membershipId !== undefined && (typeof value.membershipId !== "string" || value.membershipId.length === 0)) ||
 		(value.reservationId !== undefined &&
 			(typeof value.reservationId !== "string" || value.reservationId.length === 0)) ||
 		!Number.isSafeInteger(value.startedAt) ||
@@ -252,6 +255,7 @@ function parseAttempt(value: unknown): TaskAttempt | undefined {
 	return {
 		runId: value.runId,
 		...(typeof value.teammateName === "string" ? { teammateName: value.teammateName } : {}),
+		...(typeof value.membershipId === "string" ? { membershipId: value.membershipId } : {}),
 		...(typeof value.reservationId === "string" ? { reservationId: value.reservationId } : {}),
 		startedAt: value.startedAt as number,
 		...(typeof value.settledAt === "number" ? { settledAt: value.settledAt } : {}),
@@ -284,6 +288,8 @@ export function parseBoardTask(value: unknown): BoardTask | undefined {
 		(r.owner !== undefined && (typeof r.owner !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(r.owner))) ||
 		(r.assignee !== undefined &&
 			(typeof r.assignee !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(r.assignee))) ||
+		(r.ownerMembershipId !== undefined &&
+			(typeof r.ownerMembershipId !== "string" || r.ownerMembershipId.length === 0)) ||
 		(r.reviewRequested !== undefined && typeof r.reviewRequested !== "boolean") ||
 		(r.executionPlan !== undefined && !parseExecutionPlan(r.executionPlan)) ||
 		!Number.isSafeInteger(r.createdAt) ||
@@ -318,6 +324,7 @@ export function parseBoardTask(value: unknown): BoardTask | undefined {
 		status: r.status as TaskStatus,
 		dependencies: [...r.dependencies],
 		...(typeof r.owner === "string" ? { owner: r.owner } : {}),
+		...(typeof r.ownerMembershipId === "string" ? { ownerMembershipId: r.ownerMembershipId } : {}),
 		...(typeof r.assignee === "string" ? { assignee: r.assignee } : {}),
 		...(typeof r.reviewRequested === "boolean" ? { reviewRequested: r.reviewRequested } : {}),
 		...(executionPlan ? { executionPlan } : {}),

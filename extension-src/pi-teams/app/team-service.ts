@@ -7,6 +7,18 @@
 
 import { randomBytes } from "node:crypto";
 import { deriveTeamId, ensureMemberIdentity, type TeamRoster, upsertMember } from "../domain/team.js";
+import { withMailboxMutationLock } from "./mailbox-lock.js";
+
+export class TeamRosterReadError extends Error {
+	constructor(
+		readonly kind: "malformed" | "unsupported-version",
+		message: string,
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+		this.name = "TeamRosterReadError";
+	}
+}
 
 /** Durable roster adapter; implementations write atomically with owner-only permissions. */
 export interface TeamStore {
@@ -16,7 +28,7 @@ export interface TeamStore {
 	writeRoster(roster: TeamRoster): void;
 }
 
-export type PendingMailboxDiscardReason = "release" | "retire" | "fresh" | "context-reset";
+export type PendingMailboxDiscardReason = "release" | "retire" | "shutdown" | "fresh" | "context-reset";
 
 export interface TeamServiceOptions {
 	sessionId: string;
@@ -62,16 +74,36 @@ export class TeamService {
 		if (this.roster) return this.roster;
 		const teamId = deriveTeamId(this.sessionId);
 		const existing = this.store.readRoster();
-		if (existing && existing.teamId === teamId && existing.sessionId === this.sessionId) {
+		if (existing && existing.version !== 1)
+			throw new TeamRosterReadError("unsupported-version", `Unsupported team roster version in ${this.store.teamDir}.`);
+		if (existing && (existing.teamId !== teamId || existing.sessionId !== this.sessionId))
+			throw new TeamRosterReadError(
+				"malformed",
+				`Team roster identity does not match session ${this.sessionId}; preserving ${this.store.teamDir} for recovery.`,
+			);
+		if (existing) {
 			// A persisted roster is identity/history, never a live child receipt.
+			const migrationRequired =
+				existing.members.some((member) => !member.membershipId) ||
+				existing.members.some(
+					(member) => member.lifecycle === "retired" && member.availability !== "unavailable" && !member.recoveryError,
+				);
+			const migratedMembers = existing.members.map((member) => ({
+				...member,
+				// One-time backfill: persisted before membership incarnations existed.
+				membershipId: member.membershipId ?? randomBytes(16).toString("hex"),
+				lifecycle: member.lifecycle === "retired" ? ("retired" as const) : ("released" as const),
+			}));
+			const archived = migratedMembers.filter(
+				(member) => member.lifecycle === "retired" && member.availability !== "unavailable" && !member.recoveryError,
+			);
 			this.roster = {
 				...existing,
-				members: existing.members.map((member) => ({
-					...member,
-					lifecycle: member.lifecycle === "retired" ? "retired" : "released",
-				})),
+				members: migratedMembers.filter((member) => !archived.includes(member)),
+				...(archived.length > 0 ? { archivedMembers: [...(existing.archivedMembers ?? []), ...archived] } : {}),
 			};
-			this.persist();
+			if (!this.persist() && migrationRequired)
+				throw new Error(`Cannot persist teammate identity migration in ${this.store.teamDir}.`);
 			return this.roster;
 		}
 		this.roster = {
@@ -100,8 +132,12 @@ export class TeamService {
 		if (!this.roster) return identity.color;
 		const ensured = ensureMemberIdentity(this.roster, identity, this.now());
 		if (ensured.roster !== this.roster) {
+			const previous = this.roster;
 			this.roster = ensured.roster;
-			this.persist();
+			if (!this.persist()) {
+				this.roster = previous;
+				throw new Error(`Cannot persist teammate identity for @${identity.name}; admission cancelled.`);
+			}
 		}
 		return ensured.color;
 	}
@@ -120,10 +156,59 @@ export class TeamService {
 		await this.discardPendingCallback?.(name, reason);
 	}
 
-	setAvailability(name: string, availability: "available" | "unavailable", recoveryError?: string): void {
+	setShutdownOperation(
+		name: string,
+		operation: NonNullable<TeamRoster["members"][number]["operation"]>,
+		membershipId?: string,
+	): boolean {
+		const result = withMailboxMutationLock(this.store.teamDir, () => {
+			if (!this.roster) return false;
+			const member = this.roster.members.find((candidate) => candidate.name === name);
+			if (!member || (membershipId !== undefined && member.membershipId !== membershipId)) return false;
+			const previous = this.roster;
+			this.roster = {
+				...previous,
+				members: previous.members.map((candidate) => (candidate === member ? { ...candidate, operation } : candidate)),
+			};
+			if (!this.persist()) {
+				this.roster = previous;
+				return false;
+			}
+			return true;
+		});
+		return result.acquired && result.value;
+	}
+
+	removeMember(name: string, membershipId?: string): boolean {
+		const result = withMailboxMutationLock(this.store.teamDir, () => {
+			if (!this.roster) return false;
+			const member = this.roster.members.find((candidate) => candidate.name === name);
+			if (!member || (membershipId !== undefined && member.membershipId !== membershipId)) return false;
+			const previous = this.roster;
+			const { operation: _operation, ...archivedMember } = member;
+			this.roster = {
+				...previous,
+				members: previous.members.filter((candidate) => candidate !== member),
+				archivedMembers: [...(previous.archivedMembers ?? []), { ...archivedMember, lifecycle: "released" }],
+			};
+			if (!this.persist()) {
+				this.roster = previous;
+				return false;
+			}
+			return true;
+		});
+		return result.acquired && result.value;
+	}
+
+	setAvailability(
+		name: string,
+		availability: "available" | "unavailable",
+		recoveryError?: string,
+		membershipId?: string,
+	): void {
 		if (!this.roster) return;
 		const member = this.roster.members.find((candidate) => candidate.name === name);
-		if (!member) return;
+		if (!member || (membershipId !== undefined && member.membershipId !== membershipId)) return;
 		this.roster = {
 			...this.roster,
 			members: this.roster.members.map((candidate) => {
@@ -137,10 +222,19 @@ export class TeamService {
 		this.persist();
 	}
 
-	setLifecycle(name: string, lifecycle: NonNullable<TeamRoster["members"][number]["lifecycle"]>): void {
+	setLifecycle(
+		name: string,
+		lifecycle: NonNullable<TeamRoster["members"][number]["lifecycle"]>,
+		membershipId?: string,
+	): void {
 		if (!this.roster) return;
 		const member = this.roster.members.find((candidate) => candidate.name === name);
-		if (!member || member.lifecycle === lifecycle) return;
+		if (
+			!member ||
+			(membershipId !== undefined && member.membershipId !== membershipId) ||
+			member.lifecycle === lifecycle
+		)
+			return;
 		this.roster = {
 			...this.roster,
 			members: this.roster.members.map((candidate) =>
@@ -150,14 +244,16 @@ export class TeamService {
 		this.persist();
 	}
 
-	private persist(): void {
-		if (!this.roster) return;
+	private persist(): boolean {
+		if (!this.roster) return false;
 		try {
 			this.store.writeRoster(this.roster);
+			return true;
 		} catch (error) {
 			this.warn(
 				`team roster write failed in ${this.store.teamDir}: ${error instanceof Error ? error.message : String(error)}`,
 			);
+			return false;
 		}
 	}
 }

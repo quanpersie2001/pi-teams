@@ -14,7 +14,7 @@ export function registerAgentsCommand(
 	},
 ): void {
 	pi.registerCommand("agents", {
-		description: "Open Team Hub; release runs or inspect/release/retire named teammates",
+		description: "Open Team Hub; release runs or inspect/release/shutdown named teammates",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const words = args.trim().split(/\s+/);
 			if (words[0] === "panel") {
@@ -30,7 +30,7 @@ export function registerAgentsCommand(
 				);
 				return;
 			}
-			if (words[0] === "teammate-status" || words[0] === "teammate-release" || words[0] === "teammate-retire") {
+			if (words[0] === "teammate-status" || words[0] === "teammate-release" || words[0] === "teammate-shutdown") {
 				const [action, name, extra] = words;
 				if (!name || extra !== undefined) {
 					ctx.ui.notify(`Usage: /agents ${action} <teammate-name>`, "error");
@@ -47,15 +47,19 @@ export function registerAgentsCommand(
 						);
 						return;
 					}
-					const retired = action === "teammate-retire";
-					const changed = retired ? await deps.manager.retireTeammate(name) : await deps.manager.releaseTeammate(name);
-					const status = changed ? deps.manager.teammateStatus(name) : undefined;
+					const shutdown = action === "teammate-shutdown";
+					const changed = shutdown
+						? await deps.manager.shutdownTeammate(name)
+						: await deps.manager.releaseTeammate(name);
+					const status = changed && !shutdown ? deps.manager.teammateStatus(name) : undefined;
 					ctx.ui.notify(
 						!changed
 							? `Unknown teammate: ${name}`
 							: status
 								? `Teammate @${name} is now ${status.state}. Task-board claims are unchanged.`
-								: `Lifecycle operation completed for @${name}, but current status is unavailable.`,
+								: shutdown
+									? `Teammate @${name} was shut down and removed.`
+									: `Lifecycle operation completed for @${name}, but current status is unavailable.`,
 						changed ? "info" : "error",
 					);
 				} catch (error) {
@@ -85,7 +89,7 @@ export function registerAgentsCommand(
 			}
 			if (args.trim()) {
 				ctx.ui.notify(
-					"Usage: /agents [panel [show|hide|toggle] | release <id> [--worktree] | teammate-status <name> | teammate-release <name> | teammate-retire <name>]",
+					"Usage: /agents [panel [show|hide|toggle] | release <id> [--worktree] | teammate-status <name> | teammate-release <name> | teammate-shutdown <name>]",
 					"error",
 				);
 				return;

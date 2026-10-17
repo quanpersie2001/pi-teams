@@ -210,6 +210,7 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 	const teamDir = parseOptionalString(value, "teamDir", 4_096);
 	const teamKey = parseOptionalString(value, "teamKey", 512);
 	const teammateName = parseOptionalString(value, "teammateName", 64);
+	const membershipId = parseOptionalString(value, "membershipId", 128);
 	const teammateColor = parseOptionalString(value, "teammateColor", 7);
 	if (teammateColor !== undefined && !/^#[\da-fA-F]{6}$/.test(teammateColor))
 		throw new ChildProtocolError("invalid_bootstrap", "teammateColor must be a normalized #RRGGBB value");
@@ -240,7 +241,13 @@ export function parseChildBootstrap(value: unknown): ChildBootstrap {
 		...(maxTurns !== undefined ? { maxTurns } : {}),
 		...(graceTurns !== undefined ? { graceTurns } : {}),
 		...(teamDir !== undefined && teamKey !== undefined && teammateName !== undefined
-			? { teamDir, teamKey, teammateName, ...(teammateColor ? { teammateColor } : {}) }
+			? {
+					teamDir,
+					teamKey,
+					teammateName,
+					...(membershipId ? { membershipId } : {}),
+					...(teammateColor ? { teammateColor } : {}),
+				}
 			: {}),
 	};
 }
@@ -593,6 +600,7 @@ class ChildRuntime {
 		return {
 			childId: this.bootstrap.childId,
 			...(this.bootstrap.teammateName !== undefined ? { teammateName: this.bootstrap.teammateName } : {}),
+			...(this.bootstrap.membershipId !== undefined ? { membershipId: this.bootstrap.membershipId } : {}),
 			...(this.bootstrap.teammateColor !== undefined ? { teammateColor: this.bootstrap.teammateColor } : {}),
 			pid: process.pid,
 			...(sessionFile !== undefined ? { sessionFile } : {}),
@@ -1481,6 +1489,7 @@ export async function installChildBridgeExtension(pi: ExtensionAPI): Promise<voi
 					teamDir: initialBootstrap.teamDir,
 					teamKey: initialBootstrap.teamKey,
 					self: initialBootstrap.teammateName,
+					...(initialBootstrap.membershipId !== undefined ? { selfMembershipId: initialBootstrap.membershipId } : {}),
 				}),
 			),
 		);
@@ -1507,6 +1516,7 @@ export async function installChildBridgeExtension(pi: ExtensionAPI): Promise<voi
 				teamDir: bootstrap.teamDir,
 				teamKey: bootstrap.teamKey,
 				self: bootstrap.teammateName,
+				...(bootstrap.membershipId !== undefined ? { membershipId: bootstrap.membershipId } : {}),
 				isRunning: () => activeBridge.state().execution === "running",
 				prompt: (text) => activeBridge.startMailboxRun(text),
 				steer: (text) => host.steer(text),

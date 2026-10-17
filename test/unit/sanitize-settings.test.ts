@@ -35,6 +35,7 @@ describe("sanitizeSettings", () => {
 				backend: "headless",
 			}),
 		).toEqual({
+			peers: { enabled: false, policy: "hold", scope: "project" },
 			tasks: { autoCascade: false, reminders: false },
 			maxConcurrent: 8,
 			defaultMaxTurns: 50,

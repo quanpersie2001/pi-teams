@@ -13,6 +13,7 @@ export interface TeamBootstrapContext {
 	teamDir: string;
 	teamKey: string;
 	teammateName: string;
+	membershipId?: string;
 	teammateColor?: string;
 }
 

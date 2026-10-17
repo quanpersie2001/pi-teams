@@ -9,11 +9,14 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
 import { AgentRegistry, type LoadedAgentFile } from "../../extension-src/pi-teams/app/agent-registry.js";
+import { archiveRegistryRuns } from "../../extension-src/pi-teams/app/registry-archive.js";
 import type {
 	CompletedRunHistoryEntry,
 	PersistedRegistryEntry,
 	SubagentRunStore,
 } from "../../extension-src/pi-teams/app/run-registry.js";
+import { TaskBoardService } from "../../extension-src/pi-teams/app/task-board-service.js";
+import { TaskExecutionService } from "../../extension-src/pi-teams/app/task-execution-service.js";
 import { TeamService } from "../../extension-src/pi-teams/app/team-service.js";
 import type { SubagentsSettings } from "../../extension-src/pi-teams/domain/config.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
@@ -590,6 +593,144 @@ function escapeRegExp(value: string): string {
 }
 
 describe("session teardown (ADR 0007 §1)", () => {
+	it("dispatches all cooperative stops before waiting on enforcement deadlines", async () => {
+		const fixture = makeManager({ teardownGraceMs: 1 });
+		await load(fixture);
+		const a = await spawnBg(fixture.manager, "a");
+		const b = await spawnBg(fixture.manager, "b");
+		await settle(fixture.manager);
+		await fixture.manager.shutdownSession();
+		expect(fixture.backend.stops).toHaveLength(2);
+		expect(fixture.backend.enforced).toHaveLength(2);
+		expect(fixture.manager.get(a.id)).toBeUndefined();
+		expect(fixture.manager.get(b.id)).toBeUndefined();
+	});
+
+	it("starts enforcement for a running child while an unrelated launch remains held", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		await spawnBg(fixture.manager, "active");
+		await settle(fixture.manager);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		fixture.backend.launchGate = gate;
+		const launching = fixture.manager.spawn({ type: "general-purpose", prompt: "held", run_in_background: true });
+		await settle();
+		const shutdown = fixture.manager.shutdownSession();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(fixture.backend.enforced).toContain("fake-handle-1");
+		release();
+		await launching;
+		await shutdown;
+	});
+
+	it("dispatches every stop before enforcing despite hanging and rejecting acknowledgements", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		const runs = await Promise.all([spawnBg(fixture.manager), spawnBg(fixture.manager), spawnBg(fixture.manager)]);
+		await settle(fixture.manager);
+		const dispatched = new Set<string>();
+		fixture.backend.stop = async (handle) => {
+			dispatched.add(handle.handle);
+			if (dispatched.size === 1) return new Promise<boolean>(() => {});
+			throw new Error("stop rejected");
+		};
+		await fixture.manager.shutdownSession();
+		expect(dispatched.size).toBe(runs.length);
+		expect(fixture.backend.enforced).toHaveLength(runs.length);
+	});
+
+	it("joins concurrent session shutdown and makes successful repeats cleanup-free", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "join",
+			prompt: "x",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(run.id, "done");
+		await fixture.manager.whenSettled(run.id);
+		let release!: () => void;
+		let entered!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const disposing = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const dispose = fixture.backend.dispose.bind(fixture.backend);
+		fixture.backend.dispose = async (handle) => {
+			entered();
+			await gate;
+			await dispose(handle);
+		};
+		const first = fixture.manager.shutdownSession();
+		const second = fixture.manager.shutdownSession();
+		await disposing;
+		expect(() => fixture.manager.beginSession()).toThrow(/teardown is in progress/);
+		expect(fixture.backend.disposeAttempts).toHaveLength(0);
+		release();
+		await Promise.all([first, second]);
+		await fixture.manager.shutdownSession();
+		expect(fixture.backend.disposeAttempts).toHaveLength(1);
+	});
+
+	it("overlaps idle teammate disposal in batches of at most four", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "batch",
+			store: {
+				teamDir: "/tmp/batch",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (value) => {
+					saved = JSON.stringify(value);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		for (let i = 0; i < 5; i++) {
+			const run = await fixture.manager.spawn({
+				type: "general-purpose",
+				name: `batch-${i}`,
+				prompt: "work",
+				run_in_background: true,
+			});
+			await settle(fixture.manager);
+			fixture.backend.complete(run.id, "done");
+			await fixture.manager.whenSettled(run.id);
+		}
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let active = 0;
+		let maximum = 0;
+		const original = fixture.backend.dispose.bind(fixture.backend);
+		fixture.backend.dispose = async (handle) => {
+			active++;
+			maximum = Math.max(maximum, active);
+			await gate;
+			try {
+				await original(handle);
+			} finally {
+				active--;
+			}
+		};
+		const shutdown = fixture.manager.shutdownSession();
+		await vi.waitFor(() => expect(active).toBe(4));
+		expect(maximum).toBe(4);
+		release();
+		await shutdown;
+		expect(fixture.backend.disposedHandles).toHaveLength(5);
+	});
+
 	it("cooperatively stops an active child at shutdown without force-kill", async () => {
 		const fixture = makeManager({ teardownGraceMs: 5_000 });
 		await load(fixture);
@@ -606,6 +747,49 @@ describe("session teardown (ADR 0007 §1)", () => {
 		expect(fixture.backend.enforced).toEqual([]);
 		expect(fixture.store.history[0]).toMatchObject({ id: record.id, status: "stopped" });
 		expect(fixture.manager.list()).toEqual([]);
+	});
+
+	it("fails shutdown on pending cleanup error and retries it on the next call", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		let calls = 0;
+		let failNext = false;
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "pending-retry",
+			discardPending: () => {
+				calls++;
+				if (failNext) {
+					failNext = false;
+					throw new Error("mailbox offline");
+				}
+			},
+			store: {
+				teamDir: "/tmp/pending-retry",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (value) => {
+					saved = JSON.stringify(value);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "pending",
+			prompt: "x",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(run.id, "done");
+		await fixture.manager.whenSettled(run.id);
+		calls = 0;
+		failNext = true;
+		await expect(fixture.manager.shutdownSession()).rejects.toThrow(/Session shutdown incomplete/);
+		expect(() => fixture.manager.beginSession()).toThrow(/cleanup is unconfirmed/);
+		await fixture.manager.shutdownSession();
+		expect(calls).toBeGreaterThanOrEqual(2);
+		fixture.manager.beginSession();
 	});
 
 	it("disposes an idle teammate runtime exactly once at session shutdown", async () => {
@@ -676,6 +860,20 @@ describe("session teardown (ADR 0007 §1)", () => {
 		expect(fixture.manager.teammateStatus("uncertain")).toMatchObject({ state: "idle", availability: "unavailable" });
 		expect(fixture.store.registry).toMatchObject([{ id: run.id, handle: { childId: "child-run-1" } }]);
 		expect(fixture.manager.get(run.id)?.recoveryError).toMatch(/owned child cannot be verified/);
+		fixture.backend.disposeError = undefined;
+		await fixture.manager.shutdownSession();
+		fixture.manager.beginSession();
+		const next = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "next-session",
+			prompt: "new",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(next.id, "done");
+		await fixture.manager.whenSettled(next.id);
+		await fixture.manager.shutdownSession();
+		expect(fixture.backend.disposedHandles).toHaveLength(2);
 	});
 
 	it("force-kills an uncooperative child through the enforcement path after the grace", async () => {
@@ -997,18 +1195,541 @@ describe("teammate names (ADR 0007 §2)", () => {
 		expect(fixture.manager.get(continued.id)?.handle).toBeUndefined();
 	});
 
-	it("retired names are reserved for the team lifetime and reusable after session shutdown", async () => {
+	it("shutdown cancels a busy teammate, verifies disposal, removes membership, and permits a new incarnation", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "shutdown-session",
+			store: {
+				teamDir: "/tmp/shutdown-team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "worker",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		const oldId = team.current?.members[0]?.membershipId;
+		fixture.backend.stopError = new Error("cooperative stop rejected");
+		await Promise.all([fixture.manager.shutdownTeammate("worker"), fixture.manager.shutdownTeammate("worker")]);
+		expect(fixture.manager.get(run.id)?.status).toBe("stopped");
+		expect(fixture.backend.disposedHandles).toHaveLength(1);
+		expect(fixture.backend.enforced).toHaveLength(1);
+		expect(team.current?.members).toHaveLength(0);
+		expect(team.current?.archivedMembers?.[0]?.membershipId).toBe(oldId);
+		const fresh = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "worker",
+			prompt: "new",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		expect(team.current?.members[0]?.membershipId).not.toBe(oldId);
+		await expect(fixture.manager.release(run.id)).rejects.toThrow(/stale run/);
+		expect(fixture.backend.disposedHandles).toHaveLength(1);
+		expect(fixture.manager.teammateStatus("worker")).toMatchObject({ state: "busy", currentRunId: fresh.id });
+		fixture.backend.complete(run.id, "late old incarnation event");
+		expect(fixture.manager.teammateStatus("worker")?.state).toBe("busy");
+		expect(team.current?.members[0]?.membershipId).not.toBe(oldId);
+		expect(team.current?.members[0]?.lifecycle).toBe("busy");
+		fixture.backend.complete(fresh.id, "done");
+		await fixture.manager.whenSettled(fresh.id);
+	});
+
+	it("enforces verified termination when cooperative stop never resolves", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "hang-stop",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.stop = async () => new Promise<boolean>(() => {});
+		await fixture.manager.shutdownTeammate("hang-stop");
+		expect(fixture.backend.enforced).toHaveLength(1);
+		expect(fixture.manager.get(run.id)?.status).toBe("stopped");
+	});
+
+	it("retains a durable shutdown fence after cleanup failure and retries the same incarnation", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "retry-shutdown",
+			store: {
+				teamDir: "/tmp/retry-shutdown",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "retry",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(run.id, "done");
+		await fixture.manager.whenSettled(run.id);
+		fixture.backend.disposeError = new Error("temporary dispose fault");
+		await expect(fixture.manager.shutdownTeammate("retry")).rejects.toThrow(/temporary dispose fault/);
+		expect(team.current?.members[0]?.operation).toMatchObject({ kind: "shutdown", phase: "tasks_reconciled" });
+		await expect(
+			fixture.manager.spawn({ type: "general-purpose", name: "retry", prompt: "blocked", run_in_background: true }),
+		).rejects.toThrow(/shutting down/);
+		fixture.backend.disposeError = undefined;
+		await fixture.manager.shutdownTeammate("retry");
+		expect(team.current?.members).toHaveLength(0);
+	});
+
+	it("retains an archived ownership receipt when persisted disposal cannot be verified", async () => {
 		const fixture = makeManager();
 		await load(fixture);
 		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "receipt-failure",
+			store: {
+				teamDir: "/tmp/receipt-failure",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		team.ensureIdentity({ name: "worker", type: "general-purpose" });
+		const membershipId = team.current?.members[0]?.membershipId;
+		team.setShutdownOperation(
+			"worker",
+			{ kind: "shutdown", operationId: "op-receipt", phase: "tasks_reconciled" },
+			membershipId,
+		);
+		const receipt = { id: "persisted-run", membershipId, handle: { kind: "process" } } as never;
+		fixture.store.registry = [receipt];
+		fixture.manager.setPreservedRegistryEntries([receipt]);
+		(fixture.backend as unknown as { disposePersisted: () => Promise<boolean> }).disposePersisted = async () => false;
+		fixture.manager.setTeamService(team);
+		await expect(fixture.manager.shutdownTeammate("worker")).rejects.toThrow(/could not verify disposal/);
+		expect(team.current?.members[0]?.operation).toMatchObject({ operationId: "op-receipt" });
+		expect(fixture.store.registry).toContain(receipt);
+		const restarted = makeManager({ store: fixture.store });
+		await load(restarted);
+		restarted.manager.setPreservedRegistryEntries([receipt]);
+		(restarted.backend as unknown as { disposePersisted: () => Promise<boolean> }).disposePersisted = async () => false;
+		restarted.manager.setTeamService(team);
+		await expect(restarted.manager.shutdownTeammate("worker")).rejects.toThrow(/could not verify disposal/);
+		expect(team.current?.members[0]?.operation).toMatchObject({ operationId: "op-receipt" });
+		expect(fixture.store.registry).toContain(receipt);
+	});
+
+	it("keeps failed archive receipts through manager sync and retries after restart", async () => {
+		const fixture = makeManager({ settingsOverrides: { rememberAgents: true } });
+		await load(fixture);
+		const receipt = {
+			id: "archived-terminal-receipt",
+			type: "general-purpose",
+			description: "previous run",
+			status: "completed",
+			backend: "process",
+			handle: {
+				kind: "process",
+				childId: "old-child",
+				socketPath: "/tmp/old.sock",
+				token: "token",
+				runDir: "/tmp/old",
+			},
+			cwd: "/tmp/project",
+			configCwd: "/tmp/project",
+			owner: { kind: "conversation", sessionId: "session-main" },
+			delivery: "conversation",
+			startedAt: 1,
+			completedAt: 2,
+		} as never;
+		await archiveRegistryRuns([receipt], {
+			dispose: async () => false,
+			recordCompleted: (entry) => fixture.store.recordCompleted(entry),
+			persist: (entries) => {
+				fixture.manager.setPreservedRegistryEntries(entries);
+				fixture.store.writeRegistry(entries);
+			},
+			rememberAgents: true,
+			warn: () => {},
+			now: () => 3,
+		});
+		const unrelated = await fixture.manager.spawn({
+			type: "general-purpose",
+			prompt: "sync registry",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(unrelated.id, "done");
+		await fixture.manager.whenSettled(unrelated.id);
+		await fixture.manager.release(unrelated.id);
+		expect(fixture.store.registry).toContainEqual(
+			expect.objectContaining({ id: "archived-terminal-receipt", handle: expect.any(Object) }),
+		);
+
+		const restarted = makeManager({ settingsOverrides: { rememberAgents: true }, store: fixture.store });
+		await load(restarted);
+		restarted.manager.setPreservedRegistryEntries(fixture.store.readRegistry());
+		(restarted.backend as unknown as { disposePersisted: (handle: unknown) => Promise<boolean> }).disposePersisted =
+			async () => true;
+		await archiveRegistryRuns(fixture.store.readRegistry(), {
+			dispose: (entry) => restarted.manager.attemptStaleDisposal(entry as never),
+			recordCompleted: (entry) => fixture.store.recordCompleted(entry),
+			persist: (entries) => {
+				restarted.manager.setPreservedRegistryEntries(entries);
+				fixture.store.writeRegistry(entries);
+			},
+			rememberAgents: true,
+			warn: () => {},
+			now: () => 4,
+		});
+		expect(fixture.store.registry).toEqual([]);
+	});
+
+	it("preserves cold resume for the current released membership", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "valid-resume",
+			store: {
+				teamDir: "/tmp/valid-resume",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const original = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "worker",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(original.id, "done", "/tmp/current-session.jsonl");
+		await fixture.manager.whenSettled(original.id);
+		await fixture.manager.releaseTeammate("worker");
+		const resumed = await fixture.manager.resume(original.id, "continue current member");
+		expect(resumed.membershipId).toBe(original.membershipId);
+		fixture.backend.complete(resumed.id, "done again");
+		await fixture.manager.whenSettled(resumed.id);
+	});
+
+	it("fails closed on legacy named resume after same-name membership shutdown", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		let saved: string | undefined;
+		const store = {
+			teamDir: "/tmp/legacy-resume",
+			readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+			writeRoster: (roster: unknown) => {
+				saved = JSON.stringify(roster);
+			},
+		};
+		const team = new TeamService({ sessionId: "legacy-resume", store });
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const old = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "reuse",
+			prompt: "old",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(old.id, "done", "/tmp/old-session.jsonl");
+		await fixture.manager.whenSettled(old.id);
+		await fixture.manager.shutdownTeammate("reuse");
+		const history = fixture.store.history.find((entry) => entry.id === old.id);
+		if (!history) throw new Error("shutdown did not preserve history");
+		delete history.membershipId; // persisted by a pre-incarnation version
+		const next = makeManager({ store: fixture.store });
+		await load(next);
+		const nextTeam = new TeamService({ sessionId: "legacy-resume", store });
+		nextTeam.sessionStart();
+		next.manager.setTeamService(nextTeam);
+		await expect(next.manager.resume(old.id, "cold resume")).rejects.toThrow(/older or unverified membership/);
+	});
+
+	it("fails closed when a recovered task-reconciled shutdown has no cleanup proof", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "no-cleanup-proof",
+			store: {
+				teamDir: "/tmp/no-cleanup-proof",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		team.ensureIdentity({ name: "worker", type: "general-purpose" });
+		const membershipId = team.current?.members[0]?.membershipId;
+		team.setShutdownOperation(
+			"worker",
+			{ kind: "shutdown", operationId: "op-1", phase: "tasks_reconciled" },
+			membershipId,
+		);
+		fixture.manager.setTeamService(team);
+		await expect(fixture.manager.shutdownTeammate("worker")).rejects.toThrow(/no cleanup proof/);
+		expect(team.current?.members[0]?.operation).toMatchObject({ operationId: "op-1", phase: "tasks_reconciled" });
+		expect(team.current?.archivedMembers).toBeUndefined();
+	});
+
+	it("persists verified cleanup proof before mailbox/archive failure and resumes safely after restart", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		let saved: string | undefined;
+		let failArchive = false;
+		const team = new TeamService({
+			sessionId: "proof-restart",
+			discardPending: () => {
+				if (failArchive) throw new Error("archive offline");
+			},
+			store: {
+				teamDir: "/tmp/proof-restart",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "worker",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(run.id, "done");
+		await fixture.manager.whenSettled(run.id);
+		failArchive = true;
+		await expect(fixture.manager.shutdownTeammate("worker")).rejects.toThrow(/archive offline/);
+		expect(team.current?.members[0]?.operation?.phase).toBe("resources_disposed");
+		expect(fixture.backend.disposedHandles).toHaveLength(1);
+		failArchive = false;
+		const restarted = makeManager({ store: fixture.store });
+		await load(restarted);
+		restarted.manager.setTeamService(team);
+		await restarted.manager.shutdownTeammate("worker");
+		expect(team.current?.members).toHaveLength(0);
+	});
+
+	it("settles task attempts before releasing teammate-owned claims during shutdown", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "shutdown-task-board",
+			store: {
+				teamDir: "/tmp/shutdown-task-team",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const dir = mkdtempSync(join(tmpdir(), "shutdown-task-board-"));
+		const leadBoard = new TaskBoardService({ teamDir: dir, self: "lead" });
+		const workerBoard = new TaskBoardService({ teamDir: dir, self: "worker" });
+		const task = leadBoard.create({ title: "Shutdown task" });
+		leadBoard.update({ id: task.id, executionPlan: { type: "general-purpose", name: "worker" } });
+		workerBoard.update({ id: task.id, status: "in_progress" });
+		const completed = leadBoard.create({
+			title: "Completed planned task",
+			executionPlan: { type: "general-purpose", name: "worker" },
+		});
+		leadBoard.update({ id: completed.id, status: "in_progress" });
+		leadBoard.update({ id: completed.id, status: "completed", outcome: { summary: "done" } });
+		const cancelled = leadBoard.create({
+			title: "Cancelled planned task",
+			executionPlan: { type: "general-purpose", name: "worker" },
+		});
+		leadBoard.cancel({ id: cancelled.id });
+		const taskExecution = new TaskExecutionService({ board: leadBoard, manager: fixture.manager });
+		const replacementExecution = new TaskExecutionService({ board: leadBoard, manager: fixture.manager });
+		taskExecution.dispose();
+		const { runId } = await replacementExecution.execute(task.id, {
+			actor: { name: "lead", coordinator: true },
+			type: "general-purpose",
+			name: "worker",
+		});
+		await settle(fixture.manager);
+		await fixture.manager.shutdownTeammate("worker");
+		expect(leadBoard.get(task.id)?.attempts.at(-1)?.status).toBe("stopped");
+		expect(leadBoard.get(task.id)).toMatchObject({ status: "pending" });
+		expect(leadBoard.get(task.id)?.executionPlan).toBeUndefined();
+		expect(leadBoard.get(completed.id)).toMatchObject({ status: "completed", executionPlan: { name: "worker" } });
+		expect(leadBoard.get(cancelled.id)).toMatchObject({ status: "cancelled", executionPlan: { name: "worker" } });
+		expect(fixture.manager.get(runId)?.status).toBe("stopped");
+		replacementExecution.dispose();
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it.each(["in_progress", "in_review"] as const)(
+		"fails closed on legacy %s claims without verifiable membership ownership",
+		async (status) => {
+			const fixture = makeManager({ teardownGraceMs: 0 });
+			await load(fixture);
+			let saved: string | undefined;
+			const team = new TeamService({
+				sessionId: `legacy-claim-${status}`,
+				store: {
+					teamDir: `/tmp/legacy-claim-${status}`,
+					readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+					writeRoster: (roster) => {
+						saved = JSON.stringify(roster);
+					},
+				},
+			});
+			team.sessionStart();
+			team.ensureIdentity({ name: "worker", type: "general-purpose" });
+			const dir = mkdtempSync(join(tmpdir(), `legacy-task-claim-${status}-`));
+			const leadBoard = new TaskBoardService({ teamDir: dir, self: "lead" });
+			const workerBoard = new TaskBoardService({ teamDir: dir, self: "worker" });
+			const task = leadBoard.create({
+				title: `Legacy ${status} claim`,
+				...(status === "in_review" ? { reviewRequested: true } : {}),
+			});
+			workerBoard.update({ id: task.id, status: "in_progress" });
+			if (status === "in_review") workerBoard.update({ id: task.id, status: "in_review" });
+			const execution = new TaskExecutionService({ board: leadBoard, manager: fixture.manager });
+			fixture.manager.setTeamService(team);
+			await expect(fixture.manager.shutdownTeammate("worker")).rejects.toThrow(/no verifiable membership owner/);
+			expect(team.current?.members).toHaveLength(1);
+			expect(team.current?.members[0]?.operation?.kind).toBe("shutdown");
+			expect(team.current?.members[0]?.availability).toBe("unavailable");
+			expect(team.current?.members[0]?.recoveryError).toMatch(/no verifiable membership owner/);
+			expect(leadBoard.get(task.id)).toMatchObject({ status, owner: "worker" });
+			execution.dispose();
+			leadBoard.dispose();
+			workerBoard.dispose();
+			rmSync(dir, { recursive: true, force: true });
+		},
+	);
+
+	it.each(["in_progress", "in_review"] as const)(
+		"migrates a legacy %s claim only when its settled attempt proves membership ownership",
+		async (status) => {
+			const fixture = makeManager({ teardownGraceMs: 0 });
+			await load(fixture);
+			let saved: string | undefined;
+			const team = new TeamService({
+				sessionId: "legacy-claim-verified",
+				store: {
+					teamDir: "/tmp/legacy-claim-verified",
+					readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+					writeRoster: (roster) => {
+						saved = JSON.stringify(roster);
+					},
+				},
+			});
+			team.sessionStart();
+			team.ensureIdentity({ name: "worker", type: "general-purpose" });
+			const membershipId = team.current?.members[0]?.membershipId;
+			const dir = mkdtempSync(join(tmpdir(), "legacy-task-verified-"));
+			const leadBoard = new TaskBoardService({ teamDir: dir, self: "lead" });
+			const workerBoard = new TaskBoardService({ teamDir: dir, self: "worker" });
+			const task = leadBoard.create({
+				title: "Legacy verified claim",
+				...(status === "in_review" ? { reviewRequested: true } : {}),
+			});
+			workerBoard.update({ id: task.id, status: "in_progress" });
+			const attempt = workerBoard.reserveAttempt(task.id, "legacy-run");
+			workerBoard.bindAttempt(task.id, attempt.reservationId ?? attempt.runId, attempt.runId, membershipId);
+			workerBoard.settleAttempt(task.id, attempt.runId, { status: "completed", settledAt: Date.now() });
+			if (status === "in_review") workerBoard.update({ id: task.id, status: "in_review" });
+			const execution = new TaskExecutionService({ board: leadBoard, manager: fixture.manager });
+			fixture.manager.setTeamService(team);
+			await fixture.manager.shutdownTeammate("worker");
+			expect(leadBoard.get(task.id)).toMatchObject({ status: "pending" });
+			expect(leadBoard.get(task.id)?.owner).toBeUndefined();
+			expect(team.current?.members).toHaveLength(0);
+			execution.dispose();
+			leadBoard.dispose();
+			workerBoard.dispose();
+			rmSync(dir, { recursive: true, force: true });
+		},
+	);
+
+	it("shutdown cancels queued teammate work without launching it", async () => {
+		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 1 }, teardownGraceMs: 0 });
+		await load(fixture);
+		let saved: string | undefined;
+		const team = new TeamService({
+			sessionId: "queued-shutdown",
+			store: {
+				teamDir: "/tmp/queued-shutdown",
+				readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+				writeRoster: (roster) => {
+					saved = JSON.stringify(roster);
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		const active = await fixture.manager.spawn({
+			type: "general-purpose",
+			prompt: "hold slot",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		const queued = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "queued",
+			prompt: "must not launch",
+			run_in_background: true,
+		});
+		expect(queued.status).toBe("queued");
+		await fixture.manager.shutdownTeammate("queued");
+		expect(fixture.backend.launches.map((launch) => launch.runId)).not.toContain(queued.id);
+		expect(fixture.manager.get(queued.id)?.status).toBe("stopped");
+		expect(team.current?.members).toHaveLength(0);
+		fixture.backend.complete(active.id, "done");
+		await fixture.manager.whenSettled(active.id);
+	});
+
+	it("retired names are reserved for the team lifetime and reusable after session shutdown", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		const savedBySession = new Map<string, string>();
 		const makeTeam = (sessionId: string) =>
 			new TeamService({
 				sessionId,
 				store: {
 					teamDir: `/tmp/${sessionId}`,
-					readRoster: () => (saved === undefined ? undefined : JSON.parse(saved)),
+					readRoster: () => {
+						const saved = savedBySession.get(sessionId);
+						return saved === undefined ? undefined : JSON.parse(saved);
+					},
 					writeRoster: (roster) => {
-						saved = JSON.stringify(roster);
+						savedBySession.set(sessionId, JSON.stringify(roster));
 					},
 				},
 			});

@@ -12,6 +12,8 @@ export interface MailboxMessage {
 	from: string;
 	/** Recipient address: teammate name or `lead`. */
 	to: string;
+	/** Recipient's immutable teammate incarnation; absent only for lead/legacy mail. */
+	toMembershipId?: string;
 	text: string;
 	sentAt: number;
 	/** Hex HMAC-SHA256 over the canonical payload (shared/hmac.ts). */
@@ -35,6 +37,7 @@ export function parseMailboxMessage(value: unknown): MailboxMessage | undefined 
 		raw.id.length === 0 ||
 		!isMailboxAddress(raw.from) ||
 		!isMailboxAddress(raw.to) ||
+		(raw.toMembershipId !== undefined && (typeof raw.toMembershipId !== "string" || raw.toMembershipId.length === 0)) ||
 		typeof raw.text !== "string" ||
 		typeof raw.sentAt !== "number" ||
 		!Number.isSafeInteger(raw.sentAt) ||
@@ -47,6 +50,7 @@ export function parseMailboxMessage(value: unknown): MailboxMessage | undefined 
 		id: raw.id,
 		from: raw.from,
 		to: raw.to,
+		...(typeof raw.toMembershipId === "string" ? { toMembershipId: raw.toMembershipId } : {}),
 		text: raw.text,
 		sentAt: raw.sentAt,
 		hmac: raw.hmac,

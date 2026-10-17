@@ -192,9 +192,11 @@ export interface ReleaseOptions {
 
 export interface TeammateStatus {
 	name: string;
+	membershipId?: string;
 	type: string;
 	color?: string;
 	state: "idle" | "busy" | "released" | "retired";
+	operation?: "shutting_down";
 	availability: "available" | "unavailable";
 	recoveryError?: string;
 	/** Most recent assignment artifact; distinct from the live runtime owner. */
@@ -226,6 +228,8 @@ export class AgentManager {
 	private settings: SubagentsSettings;
 	private disposed = false;
 	private shuttingDown = false;
+	private sessionShutdownOperation: Promise<void> | undefined;
+	private sessionShutdownComplete = false;
 	private admissionEpoch = 0;
 
 	private readonly registry: AgentRegistry;
@@ -240,9 +244,15 @@ export class AgentManager {
 	private readonly registryStore: SubagentRunStore | undefined;
 	private readonly worktreeService: WorktreeService | undefined;
 	private teamService: TeamService | undefined;
+	private taskShutdownReconciler:
+		| ((name: string, membershipId?: string, phase?: "fence" | "reconcile") => void | Promise<void>)
+		| undefined;
+	private readonly taskShutdownReconcilers = new Set<NonNullable<typeof this.taskShutdownReconciler>>();
 	private readonly teammateRuntime = new TeammateRuntime();
 	private readonly teammateLocks = new Map<string, Promise<void>>();
 	private readonly pendingMailboxAssignments = new Set<string>();
+	private readonly shuttingDownTeammates = new Set<string>();
+	private readonly teammateShutdownOperations = new Map<string, Promise<boolean>>();
 	private readonly terminalCleanupByChild = new WeakMap<AgentExecutionBackend, Map<string, Promise<void>>>();
 	private preservedRegistryEntries: PersistedRegistryEntry[] = [];
 	/** Rows owned by other conversations/extensions; kept verbatim on every rewrite. */
@@ -272,6 +282,24 @@ export class AgentManager {
 	setTeamService(service: TeamService | undefined): void {
 		this.teamService = service;
 	}
+	setTaskShutdownReconciler(
+		reconcile:
+			| ((name: string, membershipId?: string, phase?: "fence" | "reconcile") => void | Promise<void>)
+			| undefined,
+	): void {
+		this.taskShutdownReconciler = reconcile;
+	}
+	registerTaskShutdownReconciler(reconcile: NonNullable<typeof this.taskShutdownReconciler>): () => void {
+		this.taskShutdownReconcilers.add(reconcile);
+		return () => this.taskShutdownReconcilers.delete(reconcile);
+	}
+	private async reconcileShutdownTasks(name: string, membershipId: string | undefined, phase: "fence" | "reconcile") {
+		for (const reconcile of [
+			...this.taskShutdownReconcilers,
+			...(this.taskShutdownReconciler ? [this.taskShutdownReconciler] : []),
+		])
+			await reconcile(name, membershipId, phase);
+	}
 
 	// -- configuration ---------------------------------------------------------
 
@@ -282,6 +310,10 @@ export class AgentManager {
 	/** Begin a host session after the previous session's teardown completes. */
 	beginSession(): void {
 		if (this.disposed) throw new Error("AgentManager is disposed");
+		if (this.sessionShutdownOperation)
+			throw new Error("Cannot begin a session while previous session teardown is in progress.");
+		if (this.shuttingDown && !this.sessionShutdownComplete)
+			throw new Error("Cannot begin a session while previous session cleanup is unconfirmed; retry session shutdown.");
 		if (
 			[...this.runs.values()].some((internal) => isActiveStatus(internal.record.status) || this.liveResource(internal))
 		)
@@ -289,6 +321,8 @@ export class AgentManager {
 		this.teammateRuntime.clearSettled();
 		this.admissionEpoch += 1;
 		this.shuttingDown = false;
+		this.sessionShutdownOperation = undefined;
+		this.sessionShutdownComplete = false;
 		for (const backend of this.backends) backend.setPresentationActive?.(true);
 	}
 
@@ -333,6 +367,7 @@ export class AgentManager {
 			description: snapshot.description,
 			status: snapshot.status,
 			...(snapshot.teammateName !== undefined ? { teammateName: snapshot.teammateName } : {}),
+			...(snapshot.membershipId !== undefined ? { membershipId: snapshot.membershipId } : {}),
 			...(snapshot.teammateColor !== undefined ? { teammateColor: snapshot.teammateColor } : {}),
 			owner: snapshot.owner,
 			delivery: snapshot.delivery,
@@ -399,6 +434,10 @@ export class AgentManager {
 		return this.runs.get(agentId)?.settle;
 	}
 
+	teammateMembershipId(name: string): string | undefined {
+		return this.teamService?.current?.members.find((member) => member.name === name)?.membershipId;
+	}
+
 	teammateStatus(name: string): TeammateStatus | undefined {
 		const member = this.teamService?.current?.members.find((candidate) => candidate.name === name);
 		const runtime = this.teammateRuntime.get(name);
@@ -427,9 +466,13 @@ export class AgentManager {
 							: (member?.lifecycle ?? "released");
 		return {
 			name,
+			...(member?.membershipId !== undefined ? { membershipId: member.membershipId } : {}),
 			type: runtime?.type ?? member?.type ?? latest?.type ?? "unknown",
 			...(color !== undefined ? { color } : {}),
 			state,
+			...((runtime?.operation ?? (member?.operation ? "shutting_down" : undefined)) !== undefined
+				? { operation: runtime?.operation ?? "shutting_down" }
+				: {}),
 			availability:
 				runtime?.recoveryError !== undefined || member?.availability === "unavailable" ? "unavailable" : "available",
 			...(recoveryError ? { recoveryError } : {}),
@@ -439,7 +482,147 @@ export class AgentManager {
 		};
 	}
 
+	shutdownTeammate(name: string): Promise<boolean> {
+		const existing = this.teammateShutdownOperations.get(name);
+		if (existing) return existing;
+		const operation = this.shutdownTeammateCore(name);
+		this.teammateShutdownOperations.set(name, operation);
+		void operation
+			.finally(() => {
+				if (this.teammateShutdownOperations.get(name) === operation) this.teammateShutdownOperations.delete(name);
+			})
+			.catch(() => {});
+		return operation;
+	}
+
+	private async shutdownTeammateCore(name: string): Promise<boolean> {
+		const member = this.teamService?.current?.members.find((candidate) => candidate.name === name);
+		const runtime = this.teammateRuntime.get(name);
+		if (!member && !runtime) return false;
+		if (this.shuttingDownTeammates.has(name)) throw new Error(`Shutdown already in progress for @${name}.`);
+		this.shuttingDownTeammates.add(name);
+		if (runtime) runtime.operation = "shutting_down";
+		const membershipId = member?.membershipId;
+		const operationId = member?.operation?.operationId ?? randomUUID();
+		const existingPhase = member?.operation?.phase;
+		const phaseRank = { requested: 0, settled: 1, tasks_reconciled: 2, resources_disposed: 3 } as const;
+		let currentPhase = existingPhase;
+		const persistPhase = (phase: keyof typeof phaseRank): boolean => {
+			if (!member || (currentPhase !== undefined && phaseRank[currentPhase] >= phaseRank[phase])) return true;
+			if (!this.teamService?.setShutdownOperation(name, { kind: "shutdown", operationId, phase }, membershipId))
+				return false;
+			currentPhase = phase;
+			return true;
+		};
+		let shutdownComplete = false;
+		if (!persistPhase("requested")) {
+			this.shuttingDownTeammates.delete(name);
+			if (runtime) delete runtime.operation;
+			throw new Error(`Could not persist shutdown intent for @${name}; shutdown was not started.`);
+		}
+		try {
+			await this.reconcileShutdownTasks(name, membershipId, "fence");
+			// Fence admission before cancellation; never hold the teammate lock while waiting for settlement.
+			const owned = [...this.runs.values()].filter(
+				(run) => run.record.teammateName === name && isActiveStatus(run.record.status),
+			);
+			// Stop RPCs may reject or hang; enforcement deadline starts independently and never awaits them.
+			for (const run of owned) void this.stop(run.record.id).catch(() => false);
+			await Promise.all(owned.map((run) => this.enforceStopDeadline(run, this.teardownGraceMs)));
+			const unsettled = owned.find((run) => isActiveStatus(run.record.status));
+			if (unsettled)
+				throw new Error(
+					`Shutdown could not verify settlement for @${name}; run ${unsettled.record.id} remains active.`,
+				);
+			await Promise.all(owned.map((run) => run.settle));
+			await Promise.all(owned.map((run) => run.finalizePromise).filter((promise) => promise !== undefined));
+			if (!persistPhase("settled")) throw new Error(`Could not persist settled shutdown phase for @${name}.`);
+			await this.reconcileShutdownTasks(name, membershipId, "reconcile");
+			if (!persistPhase("tasks_reconciled"))
+				throw new Error(`Could not persist task reconciliation phase for @${name}.`);
+			return await this.withTeammateLock(name, async () => {
+				const stillActive = [...this.runs.values()].find(
+					(run) => run.record.teammateName === name && isActiveStatus(run.record.status),
+				);
+				if (stillActive)
+					throw new Error(
+						`Shutdown could not verify settlement for @${name}; run ${stillActive.record.id} remains active.`,
+					);
+				const ownerId =
+					runtime?.currentRunId ?? [...this.runs.values()].find((run) => run.record.teammateName === name)?.record.id;
+				if (ownerId)
+					await this.releaseCore(ownerId, {}, "shutdown", () => {
+						if (!persistPhase("resources_disposed"))
+							throw new Error(`Could not persist verified cleanup proof for @${name}.`);
+					});
+				else if (runtime?.backend && runtime.handle) throw new Error(`Shutdown cannot verify ownership for @${name}.`);
+				const registryRows = [
+					...(this.registryStore?.readRegistry() ?? []),
+					...this.preservedRegistryEntries,
+					...this.foreignRegistryEntries,
+				];
+				const receipts = [
+					...new Map(
+						registryRows.flatMap((entry) =>
+							!isIncompatibleRegistryEntry(entry) &&
+							membershipId !== undefined &&
+							entry.membershipId === membershipId &&
+							entry.handle !== undefined
+								? [[entry.id, entry] as const]
+								: [],
+						),
+					).values(),
+				];
+				for (const receipt of receipts) {
+					if (!(await this.attemptStaleDisposal(receipt)))
+						throw new Error(
+							`Shutdown could not verify disposal of persisted run ${receipt.id}; membership remains fenced.`,
+						);
+				}
+				if (receipts.length > 0) {
+					const disposedIds = new Set(receipts.map((entry) => entry.id));
+					this.preservedRegistryEntries = this.preservedRegistryEntries.filter(
+						(entry) => isIncompatibleRegistryEntry(entry) || !disposedIds.has(entry.id),
+					);
+					this.foreignRegistryEntries = this.foreignRegistryEntries.filter(
+						(entry) => isIncompatibleRegistryEntry(entry) || !disposedIds.has(entry.id),
+					);
+					this.syncRegistry();
+				}
+				if (
+					existingPhase !== undefined &&
+					existingPhase !== "resources_disposed" &&
+					!runtime &&
+					!ownerId &&
+					receipts.length === 0
+				)
+					throw new Error(`Shutdown recovery for @${name} has no cleanup proof; membership remains fenced.`);
+				if (!persistPhase("resources_disposed")) throw new Error(`Could not persist cleanup phase for @${name}.`);
+				if (!ownerId) await this.teamService?.discardPending(name, "shutdown");
+				if (this.teammateRuntime.get(name) !== runtime)
+					throw new Error(`Membership changed during shutdown for @${name}.`);
+				if (this.teamService && !this.teamService.removeMember(name, membershipId))
+					throw new Error(`Could not persist removal of teammate @${name}; membership remains available for recovery.`);
+				this.teammateRuntime.remove(name, runtime);
+				shutdownComplete = true;
+				return true;
+			});
+		} catch (error) {
+			const recoveryError = `Shutdown for @${name} remains fenced: ${errorText(error)}`;
+			if (runtime) this.teammateRuntime.setRecoveryError(name, recoveryError);
+			this.teamService?.setAvailability(name, "unavailable", recoveryError, membershipId);
+			throw error;
+		} finally {
+			this.shuttingDownTeammates.delete(name);
+			if (shutdownComplete && runtime && this.teammateRuntime.get(name) === runtime) delete runtime.operation;
+		}
+	}
+
 	async releaseTeammate(name: string): Promise<boolean> {
+		if (
+			this.teamService?.current?.members.some((member) => member.name === name && member.operation?.kind === "shutdown")
+		)
+			throw new Error(`Teammate "@${name}" is shutting down; retry shutdown recovery instead.`);
 		const status = this.teammateStatus(name);
 		if (!status) return false;
 		if (status.state === "retired") return true;
@@ -483,6 +666,11 @@ export class AgentManager {
 	 * an active run still carries it.
 	 */
 	private assertTeammateNameAvailable(name: string): void {
+		if (
+			this.shuttingDownTeammates.has(name) ||
+			this.teamService?.current?.members.some((member) => member.name === name && member.operation?.kind === "shutdown")
+		)
+			throw new Error(`Teammate "@${name}" is shutting down.`);
 		const problem = teammateNameProblem(name);
 		if (problem !== undefined) throw new Error(`Invalid teammate name "${name}": ${problem}.`);
 		if (
@@ -696,10 +884,15 @@ export class AgentManager {
 					previous?.teammateColor ??
 					color)
 				: undefined;
+		const currentMember =
+			request.name !== undefined
+				? this.teamService?.current?.members.find((candidate) => candidate.name === request.name)
+				: undefined;
 		const teammate =
 			request.name !== undefined
 				? this.teammateRuntime.ensure({
 						name: request.name,
+						...(currentMember?.membershipId !== undefined ? { membershipId: currentMember.membershipId } : {}),
 						type: snapshot.resolved.type,
 						...(teammateColor !== undefined ? { color: teammateColor } : {}),
 					})
@@ -780,6 +973,7 @@ export class AgentManager {
 			status: "queued",
 			backend: "process",
 			...(request.name !== undefined ? { teammateName: request.name } : {}),
+			...(currentMember?.membershipId !== undefined ? { membershipId: currentMember.membershipId } : {}),
 			...(teammateColor !== undefined ? { teammateColor } : {}),
 			model: admission.model,
 			...(admission.fallback !== undefined ? { modelFallback: admission.fallback } : {}),
@@ -834,7 +1028,12 @@ export class AgentManager {
 		this.runs.set(id, internal);
 		if (request.name !== undefined && teammate) {
 			this.teammateRuntime.reserve(request.name, id);
-			this.teamService?.setLifecycle(request.name, "busy");
+			this.teamService?.recordAssignment({
+				name: request.name,
+				type: record.type,
+				runId: id,
+				...(record.teammateColor !== undefined ? { color: record.teammateColor } : {}),
+			});
 		}
 
 		if (this.runningSlots < this.maxConcurrent) {
@@ -1283,6 +1482,22 @@ export class AgentManager {
 		if (source.worktreeReleased) {
 			throw new Error(`Agent "${agentId}"'s worktree was explicitly released and its checkout is no longer resumable.`);
 		}
+		if (source.teammateName !== undefined) {
+			const currentMember = this.teamService?.current?.members.find((member) => member.name === source.teammateName);
+			const hasArchivedIncarnation = this.teamService?.current?.archivedMembers?.some(
+				(member) => member.name === source.teammateName,
+			);
+			if (
+				this.teamService &&
+				(!currentMember ||
+					(source.membershipId !== undefined
+						? currentMember.membershipId !== source.membershipId
+						: currentMember.lastRunId !== source.id && hasArchivedIncarnation))
+			)
+				throw new Error(
+					`Run "${agentId}" belongs to an older or unverified membership; create a new teammate identity to resume it.`,
+				);
+		}
 		const teammateResource =
 			source.teammateName !== undefined ? this.teammateRuntime.get(source.teammateName) : undefined;
 		if (source.handle !== undefined || (teammateResource?.backend && teammateResource.handle)) {
@@ -1467,13 +1682,26 @@ export class AgentManager {
 	private async releaseCore(
 		agentId: string,
 		options: ReleaseOptions = {},
-		discardReason: "release" | "retire" | "fresh" | "context-reset" = "release",
+		discardReason: "release" | "retire" | "fresh" | "context-reset" | "shutdown" = "release",
+		onVerifiedDispose?: () => void,
 	): Promise<boolean> {
 		const target = this.runs.get(agentId);
 		if (!target) return false;
 		if (isActiveStatus(target.record.status)) throw new Error(`Cannot release active run "${agentId}".`);
 		const teammateName = target.record.teammateName;
 		const runtime = teammateName !== undefined ? this.teammateRuntime.get(teammateName) : undefined;
+		const currentMember =
+			teammateName !== undefined
+				? this.teamService?.current?.members.find((member) => member.name === teammateName)
+				: undefined;
+		if (
+			teammateName !== undefined &&
+			((runtime !== undefined && runtime.membershipId !== target.record.membershipId) ||
+				(currentMember !== undefined && currentMember.membershipId !== target.record.membershipId))
+		)
+			throw new Error(
+				`Cannot release stale run "${agentId}"; its membership does not match the current @${teammateName} incarnation.`,
+			);
 		const runtimeOwner = runtime?.currentRunId ? this.runs.get(runtime.currentRunId) : undefined;
 		if (runtimeOwner && isActiveStatus(runtimeOwner.record.status))
 			throw new Error(`Cannot release child for "${agentId}" while run "${runtimeOwner.record.id}" is active.`);
@@ -1526,6 +1754,7 @@ export class AgentManager {
 		if (ownedBackend && ownedHandle) {
 			try {
 				await ownedBackend.dispose(ownedHandle);
+				onVerifiedDispose?.();
 			} catch (error) {
 				const message = `Child cleanup failed; process receipt retained: ${errorText(error)}`;
 				if (teammateName !== undefined) {
@@ -1721,23 +1950,34 @@ export class AgentManager {
 	 * budget-enforcement path. Worktrees, history and result files survive.
 	 */
 	async shutdownSession(): Promise<void> {
+		if (this.disposed || this.sessionShutdownComplete) return;
+		if (this.sessionShutdownOperation) return this.sessionShutdownOperation;
+		const operation = this.shutdownSessionCore();
+		this.sessionShutdownOperation = operation;
+		try {
+			await operation;
+			this.sessionShutdownComplete = true;
+		} finally {
+			if (this.sessionShutdownOperation === operation) this.sessionShutdownOperation = undefined;
+		}
+	}
+
+	private async shutdownSessionCore(): Promise<void> {
 		if (this.disposed) return;
 		this.shuttingDown = true;
 		this.admissionEpoch += 1;
 		await Promise.all([...this.teammateLocks.values()]);
 		for (const backend of this.backends) backend.setPresentationActive?.(false);
 		const active = [...this.runs.values()].filter((internal) => isActiveStatus(internal.record.status));
-		for (const internal of active) {
-			try {
-				await this.stop(internal.record.id);
-			} catch {
-				// The enforcement deadline below covers an uncooperative child.
-			}
-		}
+		// Start every cooperative stop without waiting for its RPC acknowledgement;
+		// each independent enforcement deadline runs concurrently below.
+		for (const internal of active) void this.stop(internal.record.id).catch(() => false);
 		await Promise.allSettled(
-			[...this.runs.values()].map((internal) => internal.launchPromise).filter((promise) => promise !== undefined),
+			active.map(async (internal) => {
+				await internal.launchPromise;
+				await this.enforceStopDeadline(internal, this.teardownGraceMs);
+			}),
 		);
-		await Promise.allSettled(active.map((internal) => this.enforceStopDeadline(internal, this.teardownGraceMs)));
 		// Let settlement finalization (worktree preserve, registry/history
 		// writes) finish before detaching what is left.
 		await Promise.allSettled(
@@ -1759,6 +1999,8 @@ export class AgentManager {
 			);
 		}
 		const retainedRunIds = new Set<string>();
+		let pendingCleanupFailed = false;
+		const idleCleanup: Array<() => Promise<void>> = [];
 		for (const runtime of this.teammateRuntime.values()) {
 			if (!runtime.backend || !runtime.handle) {
 				try {
@@ -1767,6 +2009,7 @@ export class AgentManager {
 					const message = `Pending mailbox cleanup failed during session shutdown: ${errorText(error)}`;
 					this.teammateRuntime.setRecoveryError(runtime.name, message);
 					this.teamService?.setAvailability(runtime.name, "unavailable", message);
+					pendingCleanupFailed = true;
 				}
 				continue;
 			}
@@ -1782,22 +2025,26 @@ export class AgentManager {
 				}
 				continue;
 			}
-			try {
-				await this.releaseCore(owner.record.id, {}, "context-reset");
-			} catch (error) {
-				const message = errorText(error);
-				this.teammateRuntime.setRecoveryError(runtime.name, message);
-				this.teamService?.setAvailability(runtime.name, "unavailable", message);
-				retainedRunIds.add(owner.record.id);
-			}
+			idleCleanup.push(async () => {
+				try {
+					await this.withTeammateLock(runtime.name, () => this.releaseCore(owner.record.id, {}, "context-reset"));
+				} catch (error) {
+					const message = errorText(error);
+					this.teammateRuntime.setRecoveryError(runtime.name, message);
+					this.teamService?.setAvailability(runtime.name, "unavailable", message);
+					retainedRunIds.add(owner.record.id);
+				}
+			});
 		}
+		for (let i = 0; i < idleCleanup.length; i += 4)
+			await Promise.all(idleCleanup.slice(i, i + 4).map((cleanup) => cleanup()));
 		for (const internal of this.runs.values()) {
 			if (internal.record.teammateName === undefined && this.liveResource(internal)) {
 				await this.disposeTerminalChild(internal);
 				if (this.liveResource(internal)) retainedRunIds.add(internal.record.id);
 			}
 		}
-		if (retainedRunIds.size > 0) {
+		if (retainedRunIds.size > 0 || pendingCleanupFailed) {
 			this.syncRegistry();
 			throw new Error(
 				`Session shutdown incomplete: child cleanup is unconfirmed for ${[...retainedRunIds].join(", ")}. Retry cleanup before switching sessions.`,
@@ -1863,12 +2110,16 @@ export class AgentManager {
 		const finish = (): void => {
 			if (record.teammateName !== undefined) {
 				const runtime = this.teammateRuntime.get(record.teammateName);
-				const nextState: TeammateLifecycle = runtime?.handle ? "idle" : "released";
-				this.teammateRuntime.setState(record.teammateName, nextState);
-				this.teamService?.setLifecycle(record.teammateName, nextState);
-				if (record.recoveryError?.startsWith("Teammate connection unavailable:")) delete record.recoveryError;
-				if (runtime?.handle && runtime.recoveryError === undefined)
-					this.teamService?.setAvailability(record.teammateName, "available");
+				const sameMembership =
+					runtime !== undefined && (record.membershipId === undefined || runtime.membershipId === record.membershipId);
+				if (sameMembership) {
+					const nextState: TeammateLifecycle = runtime.handle ? "idle" : "released";
+					this.teammateRuntime.setState(record.teammateName, nextState);
+					this.teamService?.setLifecycle(record.teammateName, nextState, record.membershipId);
+					if (record.recoveryError?.startsWith("Teammate connection unavailable:")) delete record.recoveryError;
+					if (runtime.handle && runtime.recoveryError === undefined)
+						this.teamService?.setAvailability(record.teammateName, "available", undefined, record.membershipId);
+				}
 			}
 			this.emit(record, lifecycleName(next));
 			internal.resolveSettle(record);
@@ -1878,8 +2129,11 @@ export class AgentManager {
 			const message = errorText(error);
 			record.recoveryError = message;
 			if (record.teammateName !== undefined) {
-				this.teammateRuntime.setRecoveryError(record.teammateName, message);
-				this.teamService?.setAvailability(record.teammateName, "unavailable", message);
+				const runtime = this.teammateRuntime.get(record.teammateName);
+				if (runtime && (record.membershipId === undefined || runtime.membershipId === record.membershipId)) {
+					this.teammateRuntime.setRecoveryError(record.teammateName, message);
+					this.teamService?.setAvailability(record.teammateName, "unavailable", message, record.membershipId);
+				}
 			}
 			finish();
 		});
@@ -2080,10 +2334,13 @@ export class AgentManager {
 		const service = this.teamService;
 		const team = service?.current;
 		if (!service || !team || record.teammateName === undefined) return undefined;
+		const member = team.members.find((candidate) => candidate.name === record.teammateName);
+		if (!member || (record.membershipId !== undefined && member.membershipId !== record.membershipId)) return undefined;
 		return {
 			teamDir: service.teamDir,
 			teamKey: team.teamKey,
 			teammateName: record.teammateName,
+			membershipId: member.membershipId,
 			...(record.teammateColor !== undefined ? { teammateColor: record.teammateColor } : {}),
 		};
 	}
@@ -2142,6 +2399,8 @@ export class AgentManager {
 		if (
 			this.shuttingDown ||
 			this.disposed ||
+			this.shuttingDownTeammates.has(name) ||
+			(source.record.membershipId !== undefined && runtime?.membershipId !== source.record.membershipId) ||
 			runtime?.state !== "idle" ||
 			!runtimeResource ||
 			!isTerminalStatus(source.record.status) ||
@@ -2166,6 +2425,7 @@ export class AgentManager {
 			description: previous.description,
 			status: "queued",
 			teammateName,
+			...(previous.membershipId !== undefined ? { membershipId: previous.membershipId } : {}),
 			...(previous.teammateColor !== undefined ? { teammateColor: previous.teammateColor } : {}),
 			backend: "process",
 			handle,
@@ -2563,10 +2823,12 @@ export class AgentManager {
 				entries.push(preserved);
 				continue;
 			}
-			if (this.settings.rememberAgents || !isTerminalStatus(preserved.status) || persistedIds.has(preserved.id)) {
-				continue;
+			if (persistedIds.has(preserved.id)) continue;
+			// Terminal outcomes may be omitted from the active registry when history is enabled,
+			// but serialized handles are unresolved cleanup receipts and must survive sync.
+			if (preserved.handle !== undefined || (!this.settings.rememberAgents && isTerminalStatus(preserved.status))) {
+				entries.push(preserved);
 			}
-			entries.push(preserved);
 		}
 		for (const foreign of this.foreignRegistryEntries) {
 			if (isIncompatibleRegistryEntry(foreign)) {
@@ -2680,6 +2942,7 @@ function historyToRun(entry: CompletedRunHistoryEntry): AgentRun {
 		description: entry.description,
 		status: entry.status,
 		...(entry.teammateName !== undefined ? { teammateName: entry.teammateName } : {}),
+		...(entry.membershipId !== undefined ? { membershipId: entry.membershipId } : {}),
 		...(entry.teammateColor !== undefined ? { teammateColor: entry.teammateColor } : {}),
 		backend: entry.backend,
 		...(entry.model !== undefined ? { model: entry.model } : {}),

@@ -1,10 +1,10 @@
 // TeamService roster lifecycle + fs-backed team store (ADR 0007 §2).
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { TeamService, type TeamStore } from "../../extension-src/pi-teams/app/team-service.js";
+import { TeamRosterReadError, TeamService, type TeamStore } from "../../extension-src/pi-teams/app/team-service.js";
 import { teamsArtifactDir } from "../../extension-src/pi-teams/pi/registry-host.js";
 import { createPiTeamStore, teamDirFor } from "../../extension-src/pi-teams/pi/teams-host.js";
 
@@ -41,10 +41,32 @@ describe("TeamService", () => {
 		original.recordAssignment({ name: "retired", type: "scout", runId: "run-2" });
 		original.setLifecycle("retired", "retired");
 		const restarted = new TeamService({ sessionId: "sess-a", store });
-		expect(restarted.sessionStart().members).toMatchObject([
-			{ name: "scout", lifecycle: "released" },
-			{ name: "retired", lifecycle: "retired" },
-		]);
+		const migrated = restarted.sessionStart();
+		expect(migrated.members).toMatchObject([{ name: "scout", lifecycle: "released" }]);
+		expect(migrated.archivedMembers).toMatchObject([{ name: "retired", lifecycle: "retired" }]);
+	});
+
+	it("backfills legacy membership IDs once and preserves them across reload", () => {
+		const roster = {
+			version: 1,
+			teamId: "sess-a",
+			sessionId: "sess-a",
+			createdAt: 1,
+			teamKey: "key",
+			members: [{ name: "legacy", type: "scout" }],
+		};
+		let saved: unknown = roster;
+		const store: TeamStore = {
+			teamDir: "/tmp/legacy",
+			readRoster: () => saved as ReturnType<TeamStore["readRoster"]>,
+			writeRoster: (next) => {
+				saved = next;
+			},
+		};
+		const first = new TeamService({ sessionId: "sess-a", store }).sessionStart().members[0]?.membershipId;
+		const second = new TeamService({ sessionId: "sess-a", store }).sessionStart().members[0]?.membershipId;
+		expect(first).toBeTruthy();
+		expect(second).toBe(first);
 	});
 
 	it("forwards an optional archive reason when discarding pending mailbox entries", async () => {
@@ -136,10 +158,46 @@ describe("createPiTeamStore", () => {
 		expect(read).toMatchObject({ teamId: "sess-x", sessionId: "sess-x" });
 	});
 
-	it("returns undefined for absent or corrupt rosters", () => {
+	it("distinguishes a missing roster from corrupt and unsupported files without overwriting either", () => {
 		tempDir = mkdtempSync(join(tmpdir(), "teams-store-"));
 		const store = createPiTeamStore(tempDir, "sess-y");
 		expect(store.readRoster()).toBeUndefined();
 		expect(teamDirFor(tempDir, "sess-y")).toBe(join(teamsArtifactDir(tempDir), "t", "sess-y"));
+		mkdirSync(store.teamDir, { recursive: true });
+		const configPath = join(store.teamDir, "config.json");
+		for (const [contents, kind] of [
+			["{broken", "malformed"],
+			[JSON.stringify({ version: 2, members: [] }), "unsupported-version"],
+		] as const) {
+			writeFileSync(configPath, contents);
+			const before = readFileSync(configPath, "utf8");
+			const service = new TeamService({ sessionId: "sess-y", store });
+			expect(() => service.sessionStart()).toThrow(TeamRosterReadError);
+			expect(() => service.sessionStart()).toThrow(expect.objectContaining({ kind }));
+			expect(readFileSync(configPath, "utf8")).toBe(before);
+		}
+	});
+
+	it("fails closed instead of replacing a valid roster for a different session", () => {
+		let writes = 0;
+		const service = new TeamService({
+			sessionId: "sess-b",
+			store: {
+				teamDir: "/tmp/mismatched-roster",
+				readRoster: () => ({
+					version: 1,
+					teamId: "sess-a",
+					sessionId: "sess-a",
+					createdAt: 1,
+					teamKey: "key",
+					members: [],
+				}),
+				writeRoster: () => {
+					writes += 1;
+				},
+			},
+		});
+		expect(() => service.sessionStart()).toThrow(/does not match session/);
+		expect(writes).toBe(0);
 	});
 });

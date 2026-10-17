@@ -33,6 +33,19 @@ describe("TaskBoardService", () => {
 		worker.update({ id: next.id, status: "in_progress" });
 	});
 
+	it("allows the lead to release an in-review claim after attempts settle", () => {
+		root = mkdtempSync(join(tmpdir(), "task-board-review-release-"));
+		const lead = board("review-team", "lead");
+		const worker = board("review-team", "worker");
+		const task = lead.create({ title: "Review then release" });
+		lead.update({ id: task.id, reviewRequested: true });
+		worker.update({ id: task.id, status: "in_progress" });
+		worker.update({ id: task.id, status: "in_review" });
+		lead.update({ id: task.id, status: "pending" });
+		expect(lead.get(task.id)?.status).toBe("pending");
+		expect(lead.get(task.id)?.owner).toBeUndefined();
+	});
+
 	it("admits exactly one claimant, enforces owner release/completion, and reports lock conflicts", () => {
 		root = mkdtempSync(join(tmpdir(), "task-board-"));
 		const lead = board("team-a", "lead");

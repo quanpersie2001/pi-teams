@@ -54,6 +54,17 @@ export function mergeSettings(global: unknown, project: unknown): Record<string,
 	const globalRecord = typeof global === "object" && global !== null ? (global as Record<string, unknown>) : {};
 	const projectRecord = typeof project === "object" && project !== null ? (project as Record<string, unknown>) : {};
 	const merged = { ...globalRecord, ...projectRecord };
+	if ("peers" in globalRecord || "peers" in projectRecord) {
+		const globalPeers =
+			typeof globalRecord.peers === "object" && globalRecord.peers !== null
+				? (globalRecord.peers as Record<string, unknown>)
+				: {};
+		const projectPeers =
+			typeof projectRecord.peers === "object" && projectRecord.peers !== null
+				? (projectRecord.peers as Record<string, unknown>)
+				: {};
+		merged.peers = { ...globalPeers, ...projectPeers };
+	}
 	if ("tasks" in globalRecord || "tasks" in projectRecord) {
 		const globalTasks =
 			typeof globalRecord.tasks === "object" && globalRecord.tasks !== null
@@ -104,5 +115,30 @@ export async function loadSubagentsSettings(
 		readRawJson(paths.global, "global settings file", warn),
 		readRawJson(paths.project, "project settings file", warn),
 	]);
-	return sanitizeSettings(mergeSettings(global, project));
+	const merged = mergeSettings(global, project);
+	// Receiver trust policy is user-owned; project configuration cannot elevate it.
+	const globalPeers =
+		typeof global === "object" && global !== null ? (global as Record<string, unknown>).peers : undefined;
+	const projectPeers =
+		typeof project === "object" && project !== null ? (project as Record<string, unknown>).peers : undefined;
+	const globalPolicy =
+		typeof globalPeers === "object" && globalPeers !== null
+			? (globalPeers as Record<string, unknown>).policy
+			: undefined;
+	const mergedPeers =
+		typeof merged.peers === "object" && merged.peers !== null ? (merged.peers as Record<string, unknown>) : {};
+	merged.peers = { ...mergedPeers, policy: globalPolicy ?? "hold" };
+	// Scope broadening is also user-controlled; project may narrow to project only.
+	if (
+		typeof projectPeers === "object" &&
+		projectPeers !== null &&
+		(projectPeers as Record<string, unknown>).scope === "all"
+	) {
+		const globalScope =
+			typeof globalPeers === "object" && globalPeers !== null
+				? (globalPeers as Record<string, unknown>).scope
+				: undefined;
+		merged.peers = { ...mergedPeers, policy: globalPolicy ?? "hold", scope: globalScope === "all" ? "all" : "project" };
+	}
+	return sanitizeSettings(merged);
 }

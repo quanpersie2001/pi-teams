@@ -4,7 +4,14 @@
 // spawn and persist across assignments until the session ends — a settled
 // teammate may receive a new assignment under the same name; an active one may
 // not. Pure module: no Pi, fs or process imports.
+import { randomUUID } from "node:crypto";
+
+function randomMembershipId(): string {
+	return randomUUID();
+}
 export interface TeamMember {
+	/** Immutable membership incarnation; aliases may be reused only with a new ID. */
+	membershipId: string;
 	/** Team-unique teammate address: mailbox path segment, send_message target, @mention. */
 	name: string;
 	/** Specialist type (agent definition) the teammate was spawned as. */
@@ -16,6 +23,12 @@ export interface TeamMember {
 	/** Lifecycle state; absent in older persisted rosters means idle/released by runtime. */
 	lifecycle?: "idle" | "busy" | "released" | "retired";
 	availability?: "available" | "unavailable";
+	/** Durable in-progress shutdown receipt; live membership remains fenced until removed. */
+	operation?: {
+		kind: "shutdown";
+		operationId: string;
+		phase: "requested" | "settled" | "tasks_reconciled" | "resources_disposed";
+	};
 	recoveryError?: string;
 	firstAssignedAt?: number;
 	lastAssignedAt?: number;
@@ -29,6 +42,8 @@ export interface TeamRoster {
 	/** Per-team HMAC key for mailbox message signing (ADR 0007 §3); distributed via the authenticated bootstrap. */
 	teamKey: string;
 	members: TeamMember[];
+	/** Historical memberships no longer participating in live routing. */
+	archivedMembers?: TeamMember[];
 }
 
 /** Mailbox/board address of the session acting as the fixed lead. */
@@ -73,6 +88,7 @@ export function ensureMemberIdentity(
 		return { roster, ...(existing.color !== undefined ? { color: existing.color } : {}) };
 	}
 	const member: TeamMember = {
+		membershipId: randomMembershipId(),
 		name: identity.name,
 		type: identity.type,
 		...(identity.color !== undefined ? { color: identity.color } : {}),
@@ -123,6 +139,7 @@ export function upsertMember(
 		: [
 				...roster.members,
 				{
+					membershipId: randomMembershipId(),
 					name: assignment.name,
 					type: assignment.type,
 					...(assignment.color !== undefined ? { color: assignment.color } : {}),
