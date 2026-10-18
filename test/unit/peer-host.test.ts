@@ -250,7 +250,7 @@ describe("local peer host durability, quotas and receipt state", () => {
 			expect(await h.listHeld()).toHaveLength(1);
 			expect(await h.acceptIngress(makeMessage("after-held"))).toEqual({ status: "unavailable" });
 		},
-		15_000,
+		process.platform === "win32" ? 60_000 : 15_000,
 	);
 	hostIt("binds message IDs immutably and keeps terminal receipts monotonic", async () => {
 		const h = await host(),

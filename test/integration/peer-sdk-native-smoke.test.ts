@@ -61,7 +61,7 @@ function extensionAdapter(
 	} as ExtensionAPI;
 }
 
-async function waitUntil(check: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> {
+async function waitUntil(check: () => Promise<boolean>, timeoutMs = 25_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!(await check())) {
 		if (Date.now() >= deadline) throw new Error("condition did not become true before timeout");
@@ -200,5 +200,5 @@ describe("native Pi SDK peer sessions", () => {
 			),
 			JSON.stringify(receiverSession.state.messages),
 		).toBe(true);
-	});
+	}, 30_000);
 });

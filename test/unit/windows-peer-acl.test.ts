@@ -129,7 +129,7 @@ foreach ($path in @($Root, (Join-Path $Root 'child'), (Join-Path $Root 'child/fi
   $owner = ([Security.Principal.NTAccount]::new($acl.Owner)).Translate([Security.Principal.SecurityIdentifier]).Value
   $result += [pscustomobject]@{ owner=$owner; protected=$acl.AreAccessRulesProtected; rules=@($acl.Access | ForEach-Object { [pscustomobject]@{ sid=$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; type=$_.AccessControlType.ToString(); full=(($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl) } }) }
 }
-$result | ConvertTo-Json -Compress`,
+$result | ConvertTo-Json -Depth 6 -Compress`,
 				);
 				const { stdout: verifiedDescendants, stderr: verifyStderr } = await runPowerShell(
 					["-NoLogo", "-NoProfile", "-NonInteractive", "-File", verifyScript, root],

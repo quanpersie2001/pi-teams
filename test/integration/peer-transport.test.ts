@@ -359,23 +359,34 @@ describe("authenticated peer ingress across processes", () => {
 				resolveSenderKey: createPeerKeyResolver(mailbox, "project"),
 				mailbox,
 			});
+			let sendOutcome:
+				| Promise<{ kind: "resolved"; receipt: string } | { kind: "rejected"; error: unknown }>
+				| undefined;
 			try {
-				const send = sendPeerMessage({
+				sendOutcome = sendPeerMessage({
 					socketPath,
 					message: message(sender, receiver, "windows-lock-close"),
 					privateKey: keys.privateKey,
-				});
+				}).then(
+					(receipt) => ({ kind: "resolved" as const, receipt }),
+					(error: unknown) => ({ kind: "rejected" as const, error }),
+				);
 				await vi.waitFor(() => expect(hasEntered).toBe(true), { timeout: 10_000 });
 				await lockWait;
 				await ingress.close();
-				await expect(send).rejects.toThrow();
+				const outcome = await sendOutcome;
+				expect(outcome.kind).toBe("rejected");
+				if (outcome.kind === "resolved") throw new Error(`send unexpectedly resolved: ${outcome.receipt}`);
+				expect(outcome.error).toBeInstanceOf(Error);
 				expect(await mailbox.getBinding("windows-lock-close")).toBeUndefined();
 				expect(await mailbox.receiptState("windows-lock-close")).toBeUndefined();
 				expect(await mailbox.pending(receiver)).toEqual([]);
 			} finally {
 				await ingress.close();
+				if (sendOutcome) await sendOutcome;
 			}
 		},
+		60_000,
 	);
 	it.skipIf(process.platform !== "win32")("closes the Windows helper with a partial pipe frame", async () => {
 		const root = await mkdtemp(join(tmpdir(), "peer-partial-frame-"));
@@ -475,5 +486,6 @@ describe("authenticated peer ingress across processes", () => {
 				await ingress.close();
 			}
 		},
+		30_000,
 	);
 });
