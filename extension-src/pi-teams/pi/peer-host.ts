@@ -97,6 +97,9 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 	protected async linkInboxEntry(temp: string, target: string): Promise<void> {
 		await link(temp, target);
 	}
+	protected openQuotaLock(path: string) {
+		return open(path, "wx", 0o600);
+	}
 	private async ensureWindowsRoot(signal?: AbortSignal): Promise<void> {
 		throwIfAborted(signal);
 		if (this.windowsRootIdentity) {
@@ -641,7 +644,7 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			throwIfAborted(signal);
 			try {
 				token = randomUUID();
-				const h = await open(lock, "wx", 0o600);
+				const h = await this.openQuotaLock(lock);
 				acquired = true;
 				try {
 					await h.writeFile(JSON.stringify({ token, pid: process.pid }));
@@ -663,6 +666,7 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 					continue;
 				}
 				if (code !== "EEXIST") throw error;
+				windowsEpermDeadline = undefined;
 				try {
 					const s = await stat(lock);
 					if (Date.now() - s.mtimeMs > 30_000) {

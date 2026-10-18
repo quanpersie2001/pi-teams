@@ -1,6 +1,5 @@
 import { generateKeyPairSync } from "node:crypto";
-import * as fsPromises from "node:fs/promises";
-import { access, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -237,7 +236,14 @@ describe("local peer host durability, quotas and receipt state", () => {
 					...makeMessage(`quota-${i}`),
 					sender: { peerSessionId: `sender-${Math.floor(i / 10)}`, runtimeId: "runtime" },
 				}));
-			const results = await Promise.all(messages.map((m) => h.acceptIngress(m)));
+			const operations = messages.map((m) => h.acceptIngress(m));
+			const settled = await Promise.allSettled(operations);
+			const failed = settled.find((result) => result.status === "rejected");
+			if (failed?.status === "rejected") throw failed.reason;
+			const results = settled.map((result) => {
+				if (result.status !== "fulfilled") throw new Error("quota ingress did not settle");
+				return result.value;
+			});
 			expect(results.filter((r) => r.status === "queued")).toHaveLength(100);
 			expect(results.filter((r) => r.status === "unavailable")).toHaveLength(30);
 			const firstMessage = messages[0];
@@ -256,43 +262,66 @@ describe("local peer host durability, quotas and receipt state", () => {
 	it.skipIf(process.platform !== "win32")(
 		"retries only bounded transient Windows quota-lock EPERM and preserves abort",
 		async () => {
-			const h = await host();
+			const root = await mkdtemp(join(tmpdir(), "peer-host-open-hook-"));
+			roots.push(root);
+			let openLock = (path: string) => open(path, "wx", 0o600);
+			class OpenHookHost extends LocalPeerHost {
+				protected override openQuotaLock(path: string) {
+					return openLock(path);
+				}
+			}
+			const h = new OpenHookHost(root);
 			await h.list("project");
-			const root = (h as unknown as { root: string }).root;
 			const lockDir = join(root, "locks");
-			await mkdir(lockDir, { recursive: true });
-			(h as unknown as { lastPruneAt: number }).lastPruneAt = Date.now();
 			const lockPath = join(lockDir, "quota.lock");
-			const nativeOpen = fsPromises.open.bind(fsPromises);
+			(h as unknown as { lastPruneAt: number }).lastPruneAt = Date.now();
+
 			let attempts = 0;
-			const transientSpy = vi.spyOn(fsPromises, "open").mockImplementation(async (path, flags, mode) => {
+			openLock = async (path) => {
 				if (path === lockPath && attempts++ < 2) throw Object.assign(new Error("delete-pending"), { code: "EPERM" });
-				return nativeOpen(path, flags, mode);
-			});
+				return open(path, "wx", 0o600);
+			};
+			expect(await h.acceptIngress(makeMessage("ephemeral-eperm"))).toEqual({ status: "queued" });
+			expect(attempts).toBe(3);
+
+			const owner = await open(lockPath, "wx", 0o600);
+			await owner.writeFile(JSON.stringify({ token: "live-owner", pid: process.pid }));
+			await owner.close();
+			let fakeNow = Date.now();
+			const clock = vi.spyOn(Date, "now").mockImplementation(() => fakeNow);
+			let episodeAttempts = 0;
+			openLock = async (path) => {
+				if (path !== lockPath) return open(path, "wx", 0o600);
+				episodeAttempts++;
+				if (episodeAttempts === 1) throw Object.assign(new Error("delete-pending"), { code: "EPERM" });
+				if (episodeAttempts === 2) return open(path, "wx", 0o600);
+				if (episodeAttempts === 3) {
+					fakeNow += 2_000;
+					await rm(path, { force: true });
+					throw Object.assign(new Error("delete-pending"), { code: "EPERM" });
+				}
+				return open(path, "wx", 0o600);
+			};
 			try {
-				expect(await h.acceptIngress(makeMessage("ephemeral-eperm"))).toEqual({ status: "queued" });
-				expect(attempts).toBe(3);
+				expect(await h.acceptIngress(makeMessage("separate-eperm-episodes"))).toEqual({ status: "queued" });
+				expect(episodeAttempts).toBe(4);
 			} finally {
-				transientSpy.mockRestore();
+				clock.mockRestore();
 			}
 
 			let persistentAttempts = 0;
-			const permanentSpy = vi.spyOn(fsPromises, "open").mockImplementation(async (path, flags, mode) => {
+			openLock = async (path) => {
 				if (path === lockPath) {
 					persistentAttempts++;
 					throw Object.assign(new Error("access-denied"), { code: "EPERM" });
 				}
-				return nativeOpen(path, flags, mode);
-			});
-			try {
-				const startedAt = performance.now();
-				await expect(h.acceptIngress(makeMessage("persistent-eperm"))).rejects.toMatchObject({ code: "EPERM" });
-				expect(performance.now() - startedAt).toBeLessThan(2_000);
-				expect(persistentAttempts).toBeGreaterThan(1);
-				expect(await h.getBinding("persistent-eperm")).toBeUndefined();
-			} finally {
-				permanentSpy.mockRestore();
-			}
+				return open(path, "wx", 0o600);
+			};
+			const startedAt = performance.now();
+			await expect(h.acceptIngress(makeMessage("persistent-eperm"))).rejects.toMatchObject({ code: "EPERM" });
+			expect(performance.now() - startedAt).toBeLessThan(2_000);
+			expect(persistentAttempts).toBeGreaterThan(1);
+			expect(await h.getBinding("persistent-eperm")).toBeUndefined();
 
 			const controller = new AbortController();
 			const reason = new Error("abort lock retry");
@@ -300,22 +329,18 @@ describe("local peer host durability, quotas and receipt state", () => {
 			const started = new Promise<void>((resolve) => {
 				firstAttempt = resolve;
 			});
-			const abortSpy = vi.spyOn(fsPromises, "open").mockImplementation(async (path, flags, mode) => {
+			openLock = async (path) => {
 				if (path === lockPath) {
 					firstAttempt();
 					throw Object.assign(new Error("delete-pending"), { code: "EPERM" });
 				}
-				return nativeOpen(path, flags, mode);
-			});
-			try {
-				const operation = h.acceptIngress(makeMessage("aborted-eperm"), controller.signal);
-				await started;
-				controller.abort(reason);
-				await expect(operation).rejects.toBe(reason);
-				expect(await h.getBinding("aborted-eperm")).toBeUndefined();
-			} finally {
-				abortSpy.mockRestore();
-			}
+				return open(path, "wx", 0o600);
+			};
+			const operation = h.acceptIngress(makeMessage("aborted-eperm"), controller.signal);
+			await started;
+			controller.abort(reason);
+			await expect(operation).rejects.toBe(reason);
+			expect(await h.getBinding("aborted-eperm")).toBeUndefined();
 		},
 	);
 	hostIt("binds message IDs immutably and keeps terminal receipts monotonic", async () => {
