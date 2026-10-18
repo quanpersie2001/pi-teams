@@ -1,4 +1,5 @@
 import { generateKeyPairSync } from "node:crypto";
+import * as fsPromises from "node:fs/promises";
 import { access, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -251,6 +252,71 @@ describe("local peer host durability, quotas and receipt state", () => {
 			expect(await h.acceptIngress(makeMessage("after-held"))).toEqual({ status: "unavailable" });
 		},
 		process.platform === "win32" ? 60_000 : 15_000,
+	);
+	it.skipIf(process.platform !== "win32")(
+		"retries only bounded transient Windows quota-lock EPERM and preserves abort",
+		async () => {
+			const h = await host();
+			await h.list("project");
+			const root = (h as unknown as { root: string }).root;
+			const lockDir = join(root, "locks");
+			await mkdir(lockDir, { recursive: true });
+			(h as unknown as { lastPruneAt: number }).lastPruneAt = Date.now();
+			const lockPath = join(lockDir, "quota.lock");
+			const nativeOpen = fsPromises.open.bind(fsPromises);
+			let attempts = 0;
+			const transientSpy = vi.spyOn(fsPromises, "open").mockImplementation(async (path, flags, mode) => {
+				if (path === lockPath && attempts++ < 2) throw Object.assign(new Error("delete-pending"), { code: "EPERM" });
+				return nativeOpen(path, flags, mode);
+			});
+			try {
+				expect(await h.acceptIngress(makeMessage("ephemeral-eperm"))).toEqual({ status: "queued" });
+				expect(attempts).toBe(3);
+			} finally {
+				transientSpy.mockRestore();
+			}
+
+			let persistentAttempts = 0;
+			const permanentSpy = vi.spyOn(fsPromises, "open").mockImplementation(async (path, flags, mode) => {
+				if (path === lockPath) {
+					persistentAttempts++;
+					throw Object.assign(new Error("access-denied"), { code: "EPERM" });
+				}
+				return nativeOpen(path, flags, mode);
+			});
+			try {
+				const startedAt = performance.now();
+				await expect(h.acceptIngress(makeMessage("persistent-eperm"))).rejects.toMatchObject({ code: "EPERM" });
+				expect(performance.now() - startedAt).toBeLessThan(2_000);
+				expect(persistentAttempts).toBeGreaterThan(1);
+				expect(await h.getBinding("persistent-eperm")).toBeUndefined();
+			} finally {
+				permanentSpy.mockRestore();
+			}
+
+			const controller = new AbortController();
+			const reason = new Error("abort lock retry");
+			let firstAttempt!: () => void;
+			const started = new Promise<void>((resolve) => {
+				firstAttempt = resolve;
+			});
+			const abortSpy = vi.spyOn(fsPromises, "open").mockImplementation(async (path, flags, mode) => {
+				if (path === lockPath) {
+					firstAttempt();
+					throw Object.assign(new Error("delete-pending"), { code: "EPERM" });
+				}
+				return nativeOpen(path, flags, mode);
+			});
+			try {
+				const operation = h.acceptIngress(makeMessage("aborted-eperm"), controller.signal);
+				await started;
+				controller.abort(reason);
+				await expect(operation).rejects.toBe(reason);
+				expect(await h.getBinding("aborted-eperm")).toBeUndefined();
+			} finally {
+				abortSpy.mockRestore();
+			}
+		},
 	);
 	hostIt("binds message IDs immutably and keeps terminal receipts monotonic", async () => {
 		const h = await host(),

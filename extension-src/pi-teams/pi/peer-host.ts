@@ -10,6 +10,7 @@ import { ensureWindowsPeerStorage } from "./windows-peer-acl.js";
 
 const TERMINAL = new Set<PeerReceipt>(["delivered", "refused", "expired"]);
 const CLAIM_STALE_MS = 5 * 60_000;
+const WINDOWS_LOCK_OPEN_RETRY_MS = 1_000;
 
 type DirectoryIdentity = { dev: number; ino: number };
 type SharedVerification<T> = {
@@ -635,6 +636,7 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 		const lock = join(dir, "quota.lock");
 		let token = "";
 		let acquired = false;
+		let windowsEpermDeadline: number | undefined;
 		for (;;) {
 			throwIfAborted(signal);
 			try {
@@ -653,7 +655,14 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 					await this.releaseQuotaLock(lock, token);
 					throw error;
 				}
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				const code = (error as NodeJS.ErrnoException).code;
+				if (process.platform === "win32" && code === "EPERM") {
+					windowsEpermDeadline ??= Date.now() + WINDOWS_LOCK_OPEN_RETRY_MS;
+					if (Date.now() >= windowsEpermDeadline) throw error;
+					await abortableDelay(10, signal);
+					continue;
+				}
+				if (code !== "EEXIST") throw error;
 				try {
 					const s = await stat(lock);
 					if (Date.now() - s.mtimeMs > 30_000) {

@@ -85,6 +85,7 @@ Set-Acl -LiteralPath $Root -AclObject $acl
 [IO.File]::WriteAllText((Join-Path $Root 'child/file.txt'), 'private')
 foreach ($path in @((Join-Path $Root 'child'), (Join-Path $Root 'child/file.txt'))) {
   $childAcl = Get-Acl -LiteralPath $path
+  $childAcl.SetAccessRuleProtection($true, $true)
   $childAcl.SetOwner($adminSid)
   Set-Acl -LiteralPath $path -AclObject $childAcl
 }
