@@ -261,6 +261,65 @@ describe("local peer host durability, quotas and receipt state", () => {
 		},
 		process.platform === "win32" ? 60_000 : 15_000,
 	);
+	hostIt("queues same-host quota callers FIFO and releases an aborted waiter's ticket", async () => {
+		const root = await mkdtemp(join(tmpdir(), "peer-host-quota-queue-"));
+		roots.push(root);
+		let openAttempts = 0;
+		class QueueHost extends LocalPeerHost {
+			protected override openQuotaLock(path: string) {
+				openAttempts++;
+				return open(path, "wx", 0o600);
+			}
+		}
+		const h = new QueueHost(root);
+		const withLock = (
+			h as unknown as {
+				withQuotaLock: <T>(fn: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
+			}
+		).withQuotaLock.bind(h);
+		let entered!: () => void;
+		let unblock!: () => void;
+		const headEntered = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const headGate = new Promise<void>((resolve) => {
+			unblock = resolve;
+		});
+		const order: string[] = [];
+		const first = withLock(async () => {
+			order.push("first");
+			entered();
+			await headGate;
+		});
+		await headEntered;
+		const controller = new AbortController();
+		const reason = new Error("cancel queued quota waiter");
+		const second = withLock(async () => {
+			order.push("cancelled waiter entered");
+		}, controller.signal);
+		const secondRejected = expect(second).rejects.toBe(reason);
+		const thirdFailure = new Error("quota callback failed");
+		const third = withLock(async () => {
+			order.push("third");
+			throw thirdFailure;
+		});
+		const thirdRejected = expect(third).rejects.toBe(thirdFailure);
+		const fourth = withLock(async () => {
+			order.push("fourth");
+		});
+		controller.abort(reason);
+		try {
+			await secondRejected;
+			expect(openAttempts).toBe(1);
+			expect(order).toEqual(["first"]);
+		} finally {
+			unblock();
+			await Promise.allSettled([first, second, third, fourth]);
+		}
+		await thirdRejected;
+		expect(openAttempts).toBe(3);
+		expect(order).toEqual(["first", "third", "fourth"]);
+	});
 	it.skipIf(process.platform !== "win32")(
 		"retries only bounded transient Windows quota-lock EPERM and preserves abort",
 		async () => {
@@ -277,13 +336,14 @@ describe("local peer host durability, quotas and receipt state", () => {
 			const lockDir = join(await realpath(root), "locks");
 			const lockPath = join(lockDir, "quota.lock");
 			(h as unknown as { lastPruneAt: number }).lastPruneAt = Date.now();
+			const longLivedMessage = (id: string) => ({ ...makeMessage(id), expiresAt: Date.now() + 120_000 });
 
 			let attempts = 0;
 			openLock = async (path) => {
 				if (path === lockPath && attempts++ < 2) throw Object.assign(new Error("delete-pending"), { code: "EPERM" });
 				return open(path, "wx", 0o600);
 			};
-			expect(await h.acceptIngress(makeMessage("ephemeral-eperm"))).toEqual({ status: "queued" });
+			expect(await h.acceptIngress(longLivedMessage("ephemeral-eperm"))).toEqual({ status: "queued" });
 			expect(attempts).toBe(3);
 
 			const owner = await open(lockPath, "wx", 0o600);
@@ -305,7 +365,7 @@ describe("local peer host durability, quotas and receipt state", () => {
 				return open(path, "wx", 0o600);
 			};
 			try {
-				expect(await h.acceptIngress(makeMessage("separate-eperm-episodes"))).toEqual({ status: "queued" });
+				expect(await h.acceptIngress(longLivedMessage("separate-eperm-episodes"))).toEqual({ status: "queued" });
 				expect(episodeAttempts).toBe(4);
 			} finally {
 				clock.mockRestore();
@@ -344,6 +404,7 @@ describe("local peer host durability, quotas and receipt state", () => {
 			await expect(operation).rejects.toBe(reason);
 			expect(await h.getBinding("aborted-eperm")).toBeUndefined();
 		},
+		30_000,
 	);
 	hostIt("binds message IDs immutably and keeps terminal receipts monotonic", async () => {
 		const h = await host(),

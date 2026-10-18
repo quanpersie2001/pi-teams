@@ -89,6 +89,7 @@ async function assertNoWindowsReparseAncestors(path: string): Promise<void> {
 /** Per-user durable registry/inbox; Windows storage is provisioned and audited through the OS ACL adapter. */
 export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 	private lastPruneAt = 0;
+	private quotaLockQueueTail: Promise<void> = Promise.resolve();
 	private windowsRootIdentity: DirectoryIdentity | undefined;
 	private windowsRootInitialization: SharedVerification<void> | undefined;
 	private readonly windowsDirectoryIdentities = new Map<string, DirectoryIdentity>();
@@ -631,64 +632,89 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 		}
 		return count;
 	}
-	private async withQuotaLock<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+	private async acquireQuotaLockTurn(signal?: AbortSignal): Promise<() => void> {
 		throwIfAborted(signal);
-		const dir = join(this.root, "locks");
-		await this.ready(dir, signal);
-		throwIfAborted(signal);
-		const lock = join(dir, "quota.lock");
-		let token = "";
-		let acquired = false;
-		let windowsEpermDeadline: number | undefined;
-		for (;;) {
+		const predecessor = this.quotaLockQueueTail;
+		let releaseTicket!: () => void;
+		const ticket = new Promise<void>((resolve) => {
+			releaseTicket = resolve;
+		});
+		this.quotaLockQueueTail = predecessor.then(
+			() => ticket,
+			() => ticket,
+		);
+		try {
+			await waitForAbortable(predecessor, signal);
 			throwIfAborted(signal);
-			try {
-				token = randomUUID();
-				const h = await this.openQuotaLock(lock);
-				acquired = true;
-				try {
-					await h.writeFile(JSON.stringify({ token, pid: process.pid }));
-				} finally {
-					await h.close();
-				}
-				throwIfAborted(signal);
-				break;
-			} catch (error) {
-				if (acquired) {
-					await this.releaseQuotaLock(lock, token);
-					throw error;
-				}
-				const code = (error as NodeJS.ErrnoException).code;
-				if (process.platform === "win32" && code === "EPERM") {
-					windowsEpermDeadline ??= Date.now() + WINDOWS_LOCK_OPEN_RETRY_MS;
-					if (Date.now() >= windowsEpermDeadline) throw error;
-					await abortableDelay(10, signal);
-					continue;
-				}
-				if (code !== "EEXIST") throw error;
-				windowsEpermDeadline = undefined;
-				try {
-					const s = await stat(lock);
-					if (Date.now() - s.mtimeMs > 30_000) {
-						let pid: number | undefined;
-						try {
-							const value = JSON.parse(await readFile(lock, "utf8")) as { pid?: unknown };
-							if (typeof value.pid === "number") pid = value.pid;
-						} catch {}
-						throwIfAborted(signal);
-						if (pid === undefined || !pidIsAlive(pid)) await rm(lock, { force: true });
-					}
-				} catch {
-					throwIfAborted(signal);
-				}
-				await abortableDelay(5, signal);
-			}
+			return releaseTicket;
+		} catch (error) {
+			releaseTicket();
+			throw error;
 		}
+	}
+	private async withQuotaLock<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		const releaseTurn = await this.acquireQuotaLockTurn(signal);
 		try {
 			throwIfAborted(signal);
-			return await fn();
+			const dir = join(this.root, "locks");
+			await this.ready(dir, signal);
+			throwIfAborted(signal);
+			const lock = join(dir, "quota.lock");
+			let token = "";
+			let acquired = false;
+			let windowsEpermDeadline: number | undefined;
+			for (;;) {
+				throwIfAborted(signal);
+				try {
+					token = randomUUID();
+					const h = await this.openQuotaLock(lock);
+					acquired = true;
+					try {
+						await h.writeFile(JSON.stringify({ token, pid: process.pid }));
+					} finally {
+						await h.close();
+					}
+					throwIfAborted(signal);
+					break;
+				} catch (error) {
+					if (acquired) {
+						await this.releaseQuotaLock(lock, token);
+						throw error;
+					}
+					const code = (error as NodeJS.ErrnoException).code;
+					if (process.platform === "win32" && code === "EPERM") {
+						windowsEpermDeadline ??= Date.now() + WINDOWS_LOCK_OPEN_RETRY_MS;
+						if (Date.now() >= windowsEpermDeadline) throw error;
+						await abortableDelay(10, signal);
+						continue;
+					}
+					if (code !== "EEXIST") throw error;
+					windowsEpermDeadline = undefined;
+					try {
+						const s = await stat(lock);
+						if (Date.now() - s.mtimeMs > 30_000) {
+							let pid: number | undefined;
+							try {
+								const value = JSON.parse(await readFile(lock, "utf8")) as { pid?: unknown };
+								if (typeof value.pid === "number") pid = value.pid;
+							} catch {}
+							throwIfAborted(signal);
+							if (pid === undefined || !pidIsAlive(pid)) await rm(lock, { force: true });
+						}
+					} catch {
+						throwIfAborted(signal);
+					}
+					await abortableDelay(5, signal);
+				}
+			}
+			try {
+				throwIfAborted(signal);
+				return await fn();
+			} finally {
+				await this.releaseQuotaLock(lock, token);
+			}
 		} finally {
-			await this.releaseQuotaLock(lock, token);
+			releaseTurn();
 		}
 	}
 	private async releaseQuotaLock(lock: string, token: string): Promise<void> {
@@ -853,6 +879,33 @@ function throwIfAborted(signal?: AbortSignal): void {
 	const error = new Error("Peer ingress operation aborted");
 	error.name = "AbortError";
 	throw error;
+}
+function waitForAbortable(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
+	throwIfAborted(signal);
+	if (!signal) return promise;
+	return new Promise<void>((resolve, reject) => {
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		const onAbort = () => {
+			cleanup();
+			try {
+				throwIfAborted(signal);
+			} catch (error) {
+				reject(error);
+			}
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			() => {
+				cleanup();
+				resolve();
+			},
+			(error: unknown) => {
+				cleanup();
+				reject(error);
+			},
+		);
+		if (signal.aborted) onAbort();
+	});
 }
 function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
 	throwIfAborted(signal);
