@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.1.9] - 2026-10-18
+
+### Bug Fixes
+
+- Make Windows peer fixtures portable and expose ACL diagnostics
+- Isolate Windows ACL helper from PowerShell module path conflicts
+- Provision private Windows storage for elevated token owners
+- Canonicalize verified Windows peer storage and coalesce ACL checks
+- Use cancellable Windows pipe reads and isolate native fixtures
+- Bound Windows delete-pending quota lock retries
+- Reset Windows lock retry bounds between contention episodes
+- Serialize same-host quota admission before global file locking
+
+### Documentation
+
+- Record passing native Windows peer and lifecycle CI evidence
+- Illustrate teammate lifecycle and peer message flow
+- Remove CI verification notes from README
+
+### Features
+
+- Add teammate shutdown and secure local peer messaging
+- Complete lifecycle migration and secure Windows peer transport
+
+### Testing
+
+- Cover Windows peer path aliases and ACL cache invalidation
+- Preserve ACL evidence and bound native integration waits
+- Keep Windows quota stress fixtures live through native I/O
+- Reuse independent Windows registry observer during withdrawal
+
 ## [0.1.8] - 2026-10-13
 
 ### Bug Fixes
@@ -113,7 +144,3 @@
 
 - Pi-subagents → pi-teams (ADR 0008)
 
-
-## Unreleased
-
-- Complete lifecycle identity migration fences and verified shutdown cleanup; add opt-in peer discovery/messaging with receiver-controlled policy. Unix transport and independent SDK/production-loader/busy-safe-point plus rendered TUI flows have automated coverage. Windows uses protected per-user ACLs and a pwsh 7+ `CurrentUserOnly` pipe helper; native Windows verification remains pending.
