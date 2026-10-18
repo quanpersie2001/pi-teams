@@ -1374,7 +1374,7 @@ describe("real process runtime", () => {
 		}
 	}, 60_000);
 
-	it("keeps, resets, releases, and retires native teammate contexts", async () => {
+	it("keeps, resets, releases, and shuts down native teammate contexts", async () => {
 		const provider = await localProvider();
 		const { launcher, launched, spawned } = observedHeadlessLaunchers();
 		const backend = new ProcessAgentExecutionBackend({ launchers: [launcher], connectTimeoutMs: 15_000 });
@@ -1487,14 +1487,20 @@ describe("real process runtime", () => {
 			expect(defaultPid).not.toBe(freshPid);
 			expect(defaultSession).not.toBe(freshSession);
 
-			expect(await manager.retireTeammate("native-worker")).toBe(true);
+			expect(await manager.shutdownTeammate("native-worker")).toBe(true);
 			await defaultChild.exited;
 			expect(() => process.kill(defaultPid, 0)).toThrow(/ESRCH/);
-			expect(manager.teammateStatus("native-worker")).toMatchObject({ state: "retired", availability: "available" });
-			await expect(
-				manager.spawn({ type: "worker", name: "native-worker", prompt: "A retired teammate cannot be assigned." }),
-			).rejects.toThrow(/retired/i);
-			expect(launched).toHaveLength(3);
+			expect(manager.teammateMembershipId("native-worker")).toBeUndefined();
+			expect(manager.teammateStatus("native-worker")).toMatchObject({ state: "released" });
+			const replacement = await manager.spawn({
+				type: "worker",
+				name: "native-worker",
+				prompt: "A new membership may reuse the alias.",
+			});
+			expect(replacement.membershipId).not.toBe(afterRelease.membershipId);
+			await manager.shutdownTeammate("native-worker");
+			await launched[3]?.exited;
+			expect(launched).toHaveLength(4);
 		} finally {
 			await manager.dispose();
 			await Promise.all(launched.map((child) => child.exited));

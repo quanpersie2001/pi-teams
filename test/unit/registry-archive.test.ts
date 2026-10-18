@@ -54,7 +54,7 @@ describe("archiveRegistryRuns", () => {
 		]);
 		expect(history[0]).not.toHaveProperty("handle");
 		expect(persisted[0]).toMatchObject([
-			{ id: "run-1", status: "stopped", recoveryError: expect.stringContaining("could not be confirmed") },
+			{ id: "run-1", status: "running", recoveryError: expect.stringContaining("could not be confirmed") },
 		]);
 		expect(persisted[0]?.[0]).toHaveProperty("handle");
 		const retryRows: PersistedRegistryEntry[][] = [];
@@ -67,6 +67,35 @@ describe("archiveRegistryRuns", () => {
 			now: () => 6000,
 		});
 		expect(retryRows).toEqual([[]]);
+	});
+
+	it("retains no-handle registry identities as unresolved cleanup receipts", async () => {
+		const row = entry({
+			status: "completed",
+			teammateName: "worker",
+			membershipId: "member-1",
+			handle: undefined,
+		});
+		let persisted: PersistedRegistryEntry[] = [];
+		const history: AgentRegistryEntry[] = [];
+		const result = await archiveRegistryRuns([row], {
+			dispose: () => {
+				throw new Error("must not dispose without handle");
+			},
+			recordCompleted: (candidate) => history.push(candidate),
+			persist: (rows) => {
+				persisted = [...rows];
+			},
+			rememberAgents: true,
+			warn: () => {},
+			now: () => 5000,
+		});
+		expect(result.verifiedDisposed).toEqual([]);
+		expect(result.unresolved).toMatchObject([
+			{ id: row.id, membershipId: "member-1", recoveryError: expect.any(String) },
+		]);
+		expect(persisted).toMatchObject([{ id: row.id, membershipId: "member-1", recoveryError: expect.any(String) }]);
+		expect(history[0]).toMatchObject({ recoveryError: expect.any(String) });
 	});
 
 	it("keeps terminal history and preserves incompatible rows byte-for-value", async () => {

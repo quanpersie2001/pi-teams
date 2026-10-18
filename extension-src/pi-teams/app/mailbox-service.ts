@@ -125,7 +125,7 @@ export class MailboxService {
 	/** Archive pending entries for this participant so a replacement context cannot replay them. */
 	async discardPending(
 		participant: string,
-		reason: "release" | "retire" | "shutdown" | "fresh" | "context-reset" = "context-reset",
+		reason: "release" | "shutdown" | "fresh" | "context-reset" = "context-reset",
 	): Promise<void> {
 		if (!isMailboxAddress(participant)) throw new Error("invalid mailbox participant address");
 		const mailbox = this.mailboxOf(participant);

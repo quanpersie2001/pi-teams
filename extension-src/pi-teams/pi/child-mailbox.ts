@@ -27,7 +27,7 @@ export interface ChildMailboxHandle {
 }
 
 interface ParticipantAvailability {
-	state?: "idle" | "busy" | "released" | "retired";
+	state?: "idle" | "busy" | "released";
 	availability?: "available" | "unavailable";
 	membershipId?: string;
 	operation?: string;
@@ -55,10 +55,7 @@ function participantAvailability(teamDir: string): Map<string, ParticipantAvaila
 			participants.set(entry.name, {
 				...(typeof entry.membershipId === "string" ? { membershipId: entry.membershipId } : {}),
 				...(typeof entry.operation === "object" && entry.operation !== null ? { operation: "shutting_down" } : {}),
-				...(entry.lifecycle === "idle" ||
-				entry.lifecycle === "busy" ||
-				entry.lifecycle === "released" ||
-				entry.lifecycle === "retired"
+				...(entry.lifecycle === "idle" || entry.lifecycle === "busy" || entry.lifecycle === "released"
 					? { state: entry.lifecycle }
 					: {}),
 				...(entry.availability === "available" || entry.availability === "unavailable"
@@ -170,13 +167,11 @@ export function createChildMailboxTool(service: MailboxService) {
 			if (!participant) return result(`Unknown teammate: ${args.target}`, { target: args.target, queued: false });
 			if (
 				participant.state === "released" ||
-				participant.state === "retired" ||
 				participant.operation === "shutting_down" ||
 				participant.availability === "unavailable"
 			) {
 				const reason = participant.recoveryError ? `: ${participant.recoveryError}` : "";
-				const blockedAs =
-					participant.state === "released" || participant.state === "retired" ? participant.state : "unavailable";
+				const blockedAs = participant.state === "released" ? participant.state : "unavailable";
 				return result(
 					`Message not sent: @${args.target} is ${blockedAs}${participant.state ? ` (state ${participant.state})` : ""}${reason}.`,
 					{

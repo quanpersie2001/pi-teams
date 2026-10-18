@@ -45,7 +45,12 @@ import type {
 	PersistedRegistryEntry,
 	SubagentRunStore,
 } from "./run-registry.js";
-import { isIncompatibleRegistryEntry, toHistoryEntry, toRegistryEntry } from "./run-registry.js";
+import {
+	hasVerifiedCleanupProof,
+	isIncompatibleRegistryEntry,
+	toHistoryEntry,
+	toRegistryEntry,
+} from "./run-registry.js";
 import type { TeamService } from "./team-service.js";
 import { type TeammateLifecycle, TeammateRuntime } from "./teammate-runtime.js";
 import { type BudgetExpiry, TimeBudgetWatcher } from "./time-budget-watcher.js";
@@ -195,7 +200,7 @@ export interface TeammateStatus {
 	membershipId?: string;
 	type: string;
 	color?: string;
-	state: "idle" | "busy" | "released" | "retired";
+	state: "idle" | "busy" | "released";
 	operation?: "shutting_down";
 	availability: "available" | "unavailable";
 	recoveryError?: string;
@@ -228,6 +233,7 @@ export class AgentManager {
 	private settings: SubagentsSettings;
 	private disposed = false;
 	private shuttingDown = false;
+	private admissionBlockReason: string | undefined;
 	private sessionShutdownOperation: Promise<void> | undefined;
 	private sessionShutdownComplete = false;
 	private admissionEpoch = 0;
@@ -282,6 +288,17 @@ export class AgentManager {
 	setTeamService(service: TeamService | undefined): void {
 		this.teamService = service;
 	}
+	/** Fail closed when startup cannot durably persist required ownership fences. */
+	blockAdmissions(reason: string): void {
+		this.admissionBlockReason = reason;
+		this.admissionEpoch += 1;
+	}
+
+	private assertAdmissionEpoch(epoch: number): void {
+		if (this.admissionBlockReason) throw new Error(`Agent admission is blocked: ${this.admissionBlockReason}`);
+		if (this.disposed || this.shuttingDown || epoch !== this.admissionEpoch)
+			throw new Error("AgentManager session changed during admission; no run was allocated.");
+	}
 	setTaskShutdownReconciler(
 		reconcile:
 			| ((name: string, membershipId?: string, phase?: "fence" | "reconcile") => void | Promise<void>)
@@ -310,6 +327,7 @@ export class AgentManager {
 	/** Begin a host session after the previous session's teardown completes. */
 	beginSession(): void {
 		if (this.disposed) throw new Error("AgentManager is disposed");
+		this.admissionBlockReason = undefined;
 		if (this.sessionShutdownOperation)
 			throw new Error("Cannot begin a session while previous session teardown is in progress.");
 		if (this.shuttingDown && !this.sessionShutdownComplete)
@@ -454,16 +472,13 @@ export class AgentManager {
 			[...this.runs.values()].some(
 				(internal) => internal.record.teammateName === name && isActiveStatus(internal.record.status),
 			);
-		const state =
-			runtime?.state === "retired" || member?.lifecycle === "retired"
-				? "retired"
-				: running
-					? "busy"
-					: runtime?.state === "released"
-						? "released"
-						: runtime?.state === "idle"
-							? "idle"
-							: (member?.lifecycle ?? "released");
+		const state = running
+			? "busy"
+			: runtime?.state === "released"
+				? "released"
+				: runtime?.state === "idle"
+					? "idle"
+					: (member?.lifecycle ?? "released");
 		return {
 			name,
 			...(member?.membershipId !== undefined ? { membershipId: member.membershipId } : {}),
@@ -550,37 +565,61 @@ export class AgentManager {
 					);
 				const ownerId =
 					runtime?.currentRunId ?? [...this.runs.values()].find((run) => run.record.teammateName === name)?.record.id;
-				if (ownerId)
-					await this.releaseCore(ownerId, {}, "shutdown", () => {
-						if (!persistPhase("resources_disposed"))
-							throw new Error(`Could not persist verified cleanup proof for @${name}.`);
-					});
-				else if (runtime?.backend && runtime.handle) throw new Error(`Shutdown cannot verify ownership for @${name}.`);
 				const registryRows = [
 					...(this.registryStore?.readRegistry() ?? []),
 					...this.preservedRegistryEntries,
 					...this.foreignRegistryEntries,
 				];
+				const hasOpaqueReceipt = registryRows.some(isIncompatibleRegistryEntry);
+				const hasUncorrelatedNamedReceipt = registryRows.some(
+					(entry) =>
+						!isIncompatibleRegistryEntry(entry) &&
+						!hasVerifiedCleanupProof(entry) &&
+						entry.teammateName === name &&
+						entry.membershipId === undefined,
+				);
+				if (member?.recoveryFence && hasUncorrelatedNamedReceipt)
+					throw new Error(`Shutdown cannot correlate a legacy receipt to @${name}; membership remains fenced.`);
 				const receipts = [
 					...new Map(
 						registryRows.flatMap((entry) =>
 							!isIncompatibleRegistryEntry(entry) &&
 							membershipId !== undefined &&
 							entry.membershipId === membershipId &&
-							entry.handle !== undefined
+							!hasVerifiedCleanupProof(entry) &&
+							(entry.handle !== undefined || entry.recoveryError !== undefined)
 								? [[entry.id, entry] as const]
 								: [],
 						),
 					).values(),
 				];
-				for (const receipt of receipts) {
+				if ((member?.recoveryFence || existingPhase !== undefined) && hasOpaqueReceipt)
+					throw new Error(
+						`Shutdown cannot resolve an incompatible persisted receipt for @${name}; membership remains fenced.`,
+					);
+				const ownerRun = ownerId ? this.runs.get(ownerId) : undefined;
+				const ownerBackend = runtime?.backend ?? ownerRun?.backend;
+				const ownerHandle = runtime?.handle ?? ownerRun?.record.handle;
+				const ownerIsLocallyDisposable = ownerBackend !== undefined && ownerHandle !== undefined;
+				const ownerSerialized = ownerIsLocallyDisposable
+					? (ownerBackend as AgentExecutionBackend & PersistedExecutionBackend).serializeHandle?.(
+							ownerHandle,
+							runtime?.sessionFile ?? ownerRun?.record.sessionFile,
+						)
+					: undefined;
+				const staleReceipts = receipts.filter((receipt) => {
+					if (receipt.id === ownerId && ownerIsLocallyDisposable) return false;
+					if (!ownerSerialized || !receipt.handle) return true;
+					return receipt.handle.childId !== ownerSerialized.childId;
+				});
+				for (const receipt of staleReceipts) {
 					if (!(await this.attemptStaleDisposal(receipt)))
 						throw new Error(
 							`Shutdown could not verify disposal of persisted run ${receipt.id}; membership remains fenced.`,
 						);
 				}
-				if (receipts.length > 0) {
-					const disposedIds = new Set(receipts.map((entry) => entry.id));
+				if (staleReceipts.length > 0) {
+					const disposedIds = new Set(staleReceipts.map((entry) => entry.id));
 					this.preservedRegistryEntries = this.preservedRegistryEntries.filter(
 						(entry) => isIncompatibleRegistryEntry(entry) || !disposedIds.has(entry.id),
 					);
@@ -589,19 +628,32 @@ export class AgentManager {
 					);
 					this.syncRegistry();
 				}
+				let ownerCleanupVerified = false;
+				if (ownerId) {
+					await this.releaseCore(ownerId, {}, "shutdown", () => {
+						ownerCleanupVerified = true;
+						if (!persistPhase("resources_disposed"))
+							throw new Error(`Could not persist verified cleanup proof for @${name}.`);
+					});
+				} else if (runtime?.backend && runtime.handle) {
+					throw new Error(`Shutdown cannot verify ownership for @${name}.`);
+				}
+				const receiptCleanupVerified = staleReceipts.length > 0;
+				const priorCleanupVerified = existingPhase === "resources_disposed";
 				if (
-					existingPhase !== undefined &&
-					existingPhase !== "resources_disposed" &&
-					!runtime &&
-					!ownerId &&
-					receipts.length === 0
+					(member?.recoveryFence || (existingPhase !== undefined && existingPhase !== "resources_disposed")) &&
+					!ownerCleanupVerified &&
+					!receiptCleanupVerified &&
+					!priorCleanupVerified
 				)
-					throw new Error(`Shutdown recovery for @${name} has no cleanup proof; membership remains fenced.`);
+					throw new Error(
+						`Shutdown recovery for @${name} has no correlated cleanup receipt; membership remains fenced.`,
+					);
 				if (!persistPhase("resources_disposed")) throw new Error(`Could not persist cleanup phase for @${name}.`);
 				if (!ownerId) await this.teamService?.discardPending(name, "shutdown");
 				if (this.teammateRuntime.get(name) !== runtime)
 					throw new Error(`Membership changed during shutdown for @${name}.`);
-				if (this.teamService && !this.teamService.removeMember(name, membershipId))
+				if (this.teamService && !this.teamService.removeMember(name, membershipId, true))
 					throw new Error(`Could not persist removal of teammate @${name}; membership remains available for recovery.`);
 				this.teammateRuntime.remove(name, runtime);
 				shutdownComplete = true;
@@ -625,23 +677,10 @@ export class AgentManager {
 			throw new Error(`Teammate "@${name}" is shutting down; retry shutdown recovery instead.`);
 		const status = this.teammateStatus(name);
 		if (!status) return false;
-		if (status.state === "retired") return true;
 		return this.withTeammateLock(name, async () => {
 			const latest = this.latestTeammateRun(name);
 			if (latest && isActiveStatus(latest.status)) throw new Error(`Cannot release busy teammate "@${name}".`);
 			await this.releaseTeammateCore(name, "released");
-			return true;
-		});
-	}
-
-	async retireTeammate(name: string): Promise<boolean> {
-		const status = this.teammateStatus(name);
-		if (!status) return false;
-		if (status.state === "retired") return true;
-		return this.withTeammateLock(name, async () => {
-			const latest = this.latestTeammateRun(name);
-			if (latest && isActiveStatus(latest.status)) throw new Error(`Cannot retire busy teammate "@${name}".`);
-			await this.releaseTeammateCore(name, "retired");
 			return true;
 		});
 	}
@@ -698,10 +737,7 @@ export class AgentManager {
 		return latest;
 	}
 	private assertTeammateColor(name: string, color: string | undefined): void {
-		const member = this.teamService?.current?.members.find((candidate) => candidate.name === name);
 		const runtime = this.teammateRuntime.get(name);
-		if (member?.lifecycle === "retired" || runtime?.state === "retired")
-			throw new Error(`Teammate "@${name}" is retired and cannot be reassigned.`);
 		if (runtime && color !== undefined && color !== runtime.color)
 			throw new Error(
 				`Teammate "@${name}" already has color ${runtime.color ?? "the default"}; its identity color cannot change.`,
@@ -766,6 +802,7 @@ export class AgentManager {
 	}
 
 	private async allocateCore(request: SpawnRequest, plan: LaunchPlan, worktree?: WorktreeInfo): Promise<AgentRun> {
+		if (this.admissionBlockReason) throw new Error(`Agent admission is blocked: ${this.admissionBlockReason}`);
 		if (this.disposed) throw new Error("AgentManager is disposed");
 		if (this.shuttingDown) throw new Error("AgentManager is shutting down");
 		if (request.color !== undefined && request.name === undefined)
@@ -848,8 +885,7 @@ export class AgentManager {
 		// itself; a system-chosen fallback must not produce a "Requested model" failure.
 		const launchStrict = strictRequest && admission.fallback === undefined;
 		if (plan.kind === "launch") plan.strict = launchStrict;
-		if (this.disposed || this.shuttingDown || epoch !== this.admissionEpoch)
-			throw new Error("AgentManager session changed during model admission; no run was allocated.");
+		this.assertAdmissionEpoch(epoch);
 		if (request.name !== undefined) {
 			this.assertTeammateNameAvailable(request.name);
 			this.assertTeammateColor(request.name, color);
@@ -888,6 +924,8 @@ export class AgentManager {
 			request.name !== undefined
 				? this.teamService?.current?.members.find((candidate) => candidate.name === request.name)
 				: undefined;
+		if (currentMember?.recoveryFence)
+			throw new Error(`Teammate "@${request.name}" has unresolved cleanup ownership; all admission types are blocked.`);
 		const teammate =
 			request.name !== undefined
 				? this.teammateRuntime.ensure({
@@ -957,8 +995,6 @@ export class AgentManager {
 				worktree = teammate.worktreeInfo;
 			}
 		}
-		if (request.name !== undefined && teammate?.state === "retired")
-			throw new Error(`Teammate "@${request.name}" is retired and cannot be reassigned.`);
 		const id = this.idFactory();
 		this.registry.trackSnapshot(id, snapshot);
 		if (plan.kind === "resume") {
@@ -1002,6 +1038,9 @@ export class AgentManager {
 			),
 		};
 
+		// Mailbox/context cleanup above can yield after model admission. Recheck at
+		// the final synchronous boundary before an ID, run, or launch is created.
+		this.assertAdmissionEpoch(epoch);
 		const { promise: settle, resolve: resolveSettle } = Promise.withResolvers<AgentRun>();
 		const internal: RunInternals = {
 			record,
@@ -1453,6 +1492,7 @@ export class AgentManager {
 
 	/** Resume a terminal run from its persisted session after completion cleanup. */
 	async resume(agentId: string, prompt: string, options: ResumeOptions = {}): Promise<AgentRun> {
+		if (this.admissionBlockReason) throw new Error(`Agent admission is blocked: ${this.admissionBlockReason}`);
 		if (this.disposed) throw new Error("AgentManager is disposed");
 		const internal = this.runs.get(agentId);
 		let source: AgentRun;
@@ -1470,6 +1510,13 @@ export class AgentManager {
 			if (!historical) throw new Error(`Unknown agent: "${agentId}". It may have been cleaned up.`);
 			source = historyToRun(historical);
 			sourceCwd = historical.cwd;
+		}
+		if (source.teammateName !== undefined) {
+			const fencedMember = this.teamService?.current?.members.find((member) => member.name === source.teammateName);
+			if (fencedMember?.recoveryFence)
+				throw new Error(
+					`Run "${agentId}" belongs to a fenced teammate membership; resume is blocked until cleanup is verified.`,
+				);
 		}
 		if (
 			source.recoveryError &&
@@ -1638,7 +1685,12 @@ export class AgentManager {
 		return resource.backend.attach(resource.handle);
 	}
 
-	private async releaseTeammateCore(name: string, finalState: "released" | "retired"): Promise<void> {
+	private async releaseTeammateCore(name: string, finalState: "released"): Promise<void> {
+		const member = this.teamService?.current?.members.find((candidate) => candidate.name === name);
+		if (member?.recoveryFence)
+			throw new Error(
+				`Teammate "@${name}" has unresolved cleanup ownership; ordinary release cannot clear its recovery fence.`,
+			);
 		const entry = this.teammateRuntime.get(name);
 		const latest = this.latestTeammateRun(name);
 		if (latest && isActiveStatus(latest.status)) throw new Error(`Cannot release busy teammate "@${name}".`);
@@ -1651,10 +1703,10 @@ export class AgentManager {
 			this.teamService?.setAvailability(name, "unavailable", message);
 			throw new Error(message);
 		}
-		if (run) await this.releaseCore(run.record.id, {}, finalState === "retired" ? "retire" : "release");
+		if (run) await this.releaseCore(run.record.id, {}, "release");
 		else {
 			try {
-				await this.teamService?.discardPending(name, finalState === "retired" ? "retire" : "release");
+				await this.teamService?.discardPending(name, "release");
 			} catch (error) {
 				const message = `Pending mailbox cleanup failed; teammate context is unavailable: ${errorText(error)}`;
 				this.teammateRuntime.setRecoveryError(name, message);
@@ -1665,7 +1717,7 @@ export class AgentManager {
 			this.teamService?.setAvailability(name, "available");
 		}
 		if (entry) {
-			this.teammateRuntime.clearChild(name, finalState);
+			this.teammateRuntime.clearChild(name);
 			this.teammateRuntime.setState(name, finalState);
 		}
 		this.teamService?.setLifecycle(name, finalState);
@@ -1682,7 +1734,7 @@ export class AgentManager {
 	private async releaseCore(
 		agentId: string,
 		options: ReleaseOptions = {},
-		discardReason: "release" | "retire" | "fresh" | "context-reset" | "shutdown" = "release",
+		discardReason: "release" | "fresh" | "context-reset" | "shutdown" = "release",
 		onVerifiedDispose?: () => void,
 	): Promise<boolean> {
 		const target = this.runs.get(agentId);
@@ -1779,8 +1831,7 @@ export class AgentManager {
 			}
 		}
 		if (teammateName !== undefined) {
-			const preservedState = runtime?.state === "retired" ? "retired" : "released";
-			this.teammateRuntime.clearChild(teammateName, preservedState);
+			this.teammateRuntime.clearChild(teammateName);
 			try {
 				await this.teamService?.discardPending(teammateName, discardReason);
 			} catch (error) {
@@ -1809,7 +1860,7 @@ export class AgentManager {
 		await this.persistReleasedHistory(sharedChild);
 
 		if (target.record.teammateName !== undefined && (releasable !== undefined || runtime !== undefined)) {
-			const preservedState = runtime?.state === "retired" ? "retired" : "released";
+			const preservedState = "released" as const;
 			this.teammateRuntime.setState(target.record.teammateName, preservedState);
 			this.teamService?.setLifecycle(target.record.teammateName, preservedState);
 			this.teamService?.setAvailability(target.record.teammateName, "available");
@@ -1895,8 +1946,7 @@ export class AgentManager {
 				if (owner) owner.record.recoveryError = message;
 				continue;
 			}
-			const finalState = runtime.state === "retired" ? "retired" : "released";
-			this.teammateRuntime.clearChild(runtime.name, finalState);
+			this.teammateRuntime.clearChild(runtime.name);
 			try {
 				await this.teamService?.discardPending(runtime.name, "context-reset");
 			} catch (error) {
@@ -1906,7 +1956,7 @@ export class AgentManager {
 				continue;
 			}
 			this.teamService?.setAvailability(runtime.name, "available");
-			if (finalState !== "retired") this.teamService?.setLifecycle(runtime.name, "released");
+			this.teamService?.setLifecycle(runtime.name, "released");
 		}
 		this.budgetWatcher.clear();
 		this.syncRegistry();
@@ -2824,9 +2874,13 @@ export class AgentManager {
 				continue;
 			}
 			if (persistedIds.has(preserved.id)) continue;
-			// Terminal outcomes may be omitted from the active registry when history is enabled,
-			// but serialized handles are unresolved cleanup receipts and must survive sync.
-			if (preserved.handle !== undefined || (!this.settings.rememberAgents && isTerminalStatus(preserved.status))) {
+			// Keep receipts with either a handle or an explicit recovery error; missing
+			// process identity is not proof of disposal.
+			if (
+				preserved.handle !== undefined ||
+				preserved.recoveryError !== undefined ||
+				(!this.settings.rememberAgents && isTerminalStatus(preserved.status))
+			) {
 				entries.push(preserved);
 			}
 		}

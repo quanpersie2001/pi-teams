@@ -204,7 +204,7 @@ function hubIdentity(row: AgentListRow, label: string, fg: ThemeFg, fallback: "t
 function hubStatusColor(row: AgentListRow, fg: ThemeFg): string {
 	const status = hubStatus(row);
 	return fg(
-		status === "idle" || status === "released" || status === "retired"
+		status === "idle" || status === "released"
 			? "muted"
 			: status === "cleanup unconfirmed" || status === "unavailable"
 				? "error"

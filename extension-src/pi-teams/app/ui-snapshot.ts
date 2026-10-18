@@ -121,7 +121,6 @@ export function buildAgentListView(
 			row.teammateAvailability = teammate.availability;
 			if (teammate.availability === "unavailable" && record.handle !== undefined)
 				row.resourceState = "cleanup-unconfirmed";
-			if (teammate.state === "retired") row.capabilities.resumable = false;
 		}
 		if (isTerminalStatus(record.status)) finished.push(row);
 		else active.push(row);

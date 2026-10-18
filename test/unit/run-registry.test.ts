@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRegistryEntry, CompletedRunHistoryEntry } from "../../extension-src/pi-teams/app/run-registry.js";
 import {
 	coerceRegistryEntry,
+	hasVerifiedCleanupProof,
 	isIncompatibleRegistryEntry,
 	isSerializableBackendHandle,
 } from "../../extension-src/pi-teams/app/run-registry.js";
@@ -68,6 +69,28 @@ function entry(overrides: Partial<AgentRegistryEntry> = {}): AgentRegistryEntry 
 }
 
 describe("registry roundtrip", () => {
+	it("accepts durable cleanup proof only when bound to the handle-less run identity", () => {
+		const verified = {
+			...entry({ status: "completed" }),
+			handle: undefined,
+			cleanupProof: {
+				kind: "verified-process-disposal" as const,
+				runId: "run-1",
+				verifiedAt: 5000,
+			},
+		};
+		const parsed = coerceRegistryEntry(verified);
+		expect(isIncompatibleRegistryEntry(parsed)).toBe(false);
+		if (!isIncompatibleRegistryEntry(parsed)) expect(hasVerifiedCleanupProof(parsed)).toBe(true);
+
+		expect(isIncompatibleRegistryEntry(coerceRegistryEntry({ ...verified, id: "different-run" }))).toBe(true);
+		expect(
+			isIncompatibleRegistryEntry(
+				coerceRegistryEntry({ ...verified, cleanupProof: { ...verified.cleanupProof, verifiedAt: -1 } }),
+			),
+		).toBe(true);
+	});
+
 	it("writes and reads entries at .pi/teams/registry.json", async () => {
 		const project = await makeProject();
 		const store = createSubagentRunStore(project.cwd);

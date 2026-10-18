@@ -17,7 +17,7 @@ import type {
 } from "../../extension-src/pi-teams/app/run-registry.js";
 import { TaskBoardService } from "../../extension-src/pi-teams/app/task-board-service.js";
 import { TaskExecutionService } from "../../extension-src/pi-teams/app/task-execution-service.js";
-import { TeamService } from "../../extension-src/pi-teams/app/team-service.js";
+import { TeamService, type TeamStore } from "../../extension-src/pi-teams/app/team-service.js";
 import type { SubagentsSettings } from "../../extension-src/pi-teams/domain/config.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
 import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
@@ -928,7 +928,6 @@ describe("teammate names (ADR 0007 §2)", () => {
 		});
 		await settle(fixture.manager);
 		await expect(fixture.manager.releaseTeammate("scout")).rejects.toThrow(/busy/);
-		await expect(fixture.manager.retireTeammate("scout")).rejects.toThrow(/busy/);
 		await expect(
 			fixture.manager.spawn({ type: "general-purpose", name: "scout", prompt: "y", run_in_background: true }),
 		).rejects.toThrow(/already working on run/);
@@ -1184,13 +1183,18 @@ describe("teammate names (ADR 0007 §2)", () => {
 		expect(fixture.backend.launches.at(-1)?.runId).toBe(fresh.id);
 		fixture.backend.complete(fresh.id, "fresh done");
 		await fixture.manager.whenSettled(fresh.id);
-		await fixture.manager.retireTeammate("lifecycle");
-		expect(fixture.manager.teammateStatus("lifecycle")?.state).toBe("retired");
 		await expect(fixture.manager.releaseTeammate("lifecycle")).resolves.toBe(true);
-		expect(fixture.manager.teammateStatus("lifecycle")?.state).toBe("retired");
-		await expect(
-			fixture.manager.spawn({ type: "general-purpose", name: "lifecycle", prompt: "revive", run_in_background: true }),
-		).rejects.toThrow(/retired/);
+		expect(fixture.manager.teammateStatus("lifecycle")?.state).toBe("released");
+		const revived = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "lifecycle",
+			prompt: "again",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(revived.id, "again done");
+		await fixture.manager.whenSettled(revived.id);
+		await fixture.manager.shutdownTeammate("lifecycle");
 		expect(fixture.manager.get(first.id)?.sessionFile).toBe("/tmp/one.jsonl");
 		expect(fixture.manager.get(continued.id)?.handle).toBeUndefined();
 	});
@@ -1435,6 +1439,41 @@ describe("teammate names (ADR 0007 §2)", () => {
 		await fixture.manager.whenSettled(resumed.id);
 	});
 
+	it("does not implicitly fresh-start or remove a legacy retired identity with ambiguous resource ownership", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		let saved: unknown = {
+			version: 1,
+			teamId: "legacy-retired",
+			sessionId: "legacy-retired",
+			createdAt: 1,
+			teamKey: "key",
+			members: [{ name: "orphan", type: "general-purpose", lifecycle: "retired" }],
+		};
+		const team = new TeamService({
+			sessionId: "legacy-retired",
+			store: {
+				teamDir: "/tmp/legacy-retired",
+				readRoster: () => saved as ReturnType<TeamStore["readRoster"]>,
+				writeRoster: (roster) => {
+					saved = roster;
+				},
+			},
+		});
+		team.sessionStart();
+		fixture.manager.setTeamService(team);
+		await expect(
+			fixture.manager.spawn({
+				type: "general-purpose",
+				name: "orphan",
+				context: "fresh",
+				prompt: "no implicit resurrection",
+			}),
+		).rejects.toThrow(/unresolved cleanup ownership/);
+		await expect(fixture.manager.shutdownTeammate("orphan")).rejects.toThrow(/no correlated cleanup receipt/);
+		expect(team.current?.members).toHaveLength(1);
+	});
+
 	it("fails closed on legacy named resume after same-name membership shutdown", async () => {
 		const fixture = makeManager();
 		await load(fixture);
@@ -1493,7 +1532,7 @@ describe("teammate names (ADR 0007 §2)", () => {
 			membershipId,
 		);
 		fixture.manager.setTeamService(team);
-		await expect(fixture.manager.shutdownTeammate("worker")).rejects.toThrow(/no cleanup proof/);
+		await expect(fixture.manager.shutdownTeammate("worker")).rejects.toThrow(/no correlated cleanup receipt/);
 		expect(team.current?.members[0]?.operation).toMatchObject({ operationId: "op-1", phase: "tasks_reconciled" });
 		expect(team.current?.archivedMembers).toBeUndefined();
 	});
@@ -1715,7 +1754,7 @@ describe("teammate names (ADR 0007 §2)", () => {
 		await fixture.manager.whenSettled(active.id);
 	});
 
-	it("retired names are reserved for the team lifetime and reusable after session shutdown", async () => {
+	it("shutdown removes a membership and permits a new identity to reuse the alias", async () => {
 		const fixture = makeManager();
 		await load(fixture);
 		const savedBySession = new Map<string, string>();
@@ -1745,15 +1784,17 @@ describe("teammate names (ADR 0007 §2)", () => {
 		await settle(fixture.manager);
 		fixture.backend.complete(original.id, "done");
 		await fixture.manager.whenSettled(original.id);
-		await fixture.manager.retireTeammate("reusable");
-		await expect(
-			fixture.manager.spawn({
-				type: "general-purpose",
-				name: "reusable",
-				prompt: "same team",
-				run_in_background: true,
-			}),
-		).rejects.toThrow(/retired/);
+		await fixture.manager.shutdownTeammate("reusable");
+		const sameSessionReuse = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "reusable",
+			prompt: "new membership",
+			run_in_background: true,
+		});
+		await settle(fixture.manager);
+		fixture.backend.complete(sameSessionReuse.id, "new membership done");
+		await fixture.manager.whenSettled(sameSessionReuse.id);
+		await fixture.manager.shutdownTeammate("reusable");
 		await fixture.manager.shutdownSession();
 		fixture.manager.beginSession();
 		const newTeam = makeTeam("session-new");

@@ -54,6 +54,31 @@ describe("MailboxService", () => {
 		expect(next.receive()).toEqual([]);
 	});
 
+	it("quarantines legacy mailbox messages without an incarnation instead of delivering to a replacement", () => {
+		const { teamDir } = services();
+		const mailbox = join(teamDir, "inboxes", "worker");
+		writeFileSync(join(teamDir, "config.json"), JSON.stringify({ members: [{ name: "worker", membershipId: "M2" }] }));
+		const legacy = {
+			id: "legacy-no-incarnation",
+			from: "lead",
+			to: "worker",
+			text: "must not replay",
+			sentAt: 1,
+			hmac: "",
+		};
+		legacy.hmac = signMessage("per-team-secret", legacy);
+		mkdirSync(mailbox, { recursive: true });
+		writeFileSync(join(mailbox, "000-legacy.json"), JSON.stringify(legacy));
+		const replacement = new MailboxService({
+			teamDir,
+			teamKey: "per-team-secret",
+			self: "worker",
+			selfMembershipId: "M2",
+		});
+		expect(replacement.receive()).toEqual([]);
+		expect(readdirSync(join(mailbox, "quarantine"))).toContain("000-legacy.json");
+	});
+
 	it("rejects a late old-incarnation write after a same-name membership is created", () => {
 		const { sender, teamDir } = services();
 		const mailbox = join(teamDir, "inboxes", "worker");

@@ -6,19 +6,23 @@ import type { PeerMailbox, PeerMessageBinding } from "../app/peer-messaging-serv
 import type { PeerAddress, PeerReceipt } from "../domain/peer.js";
 import { type PeerAdvertisement, validatePeerAdvertisement } from "../domain/peer.js";
 import { PEER_LIMITS, type PeerMessage, peerMessageFingerprint, validatePeerMessage } from "../domain/peer-message.js";
+import { ensureWindowsPeerStorage } from "./windows-peer-acl.js";
 
 const TERMINAL = new Set<PeerReceipt>(["delivered", "refused", "expired"]);
 const CLAIM_STALE_MS = 5 * 60_000;
 
-/** Per-user durable registry/inbox. Windows use requires a real host ACL verifier. */
+/** Per-user durable registry/inbox; Windows storage is provisioned and audited through the OS ACL adapter. */
 export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 	private lastPruneAt = 0;
-	constructor(
-		private root: string,
-		private readonly verifyWindowsStorage?: (path: string) => Promise<boolean>,
-	) {}
-	private async ready(dir: string): Promise<void> {
-		await mkdir(this.root, { recursive: true, mode: 0o700 });
+	constructor(private root: string) {}
+	protected async linkInboxEntry(temp: string, target: string): Promise<void> {
+		await link(temp, target);
+	}
+	private async ready(dir: string, signal?: AbortSignal): Promise<void> {
+		if (process.platform === "win32") {
+			if (!(await ensureWindowsPeerStorage(this.root, signal)))
+				throw new Error("Windows peer storage root ACL validation/provisioning failed");
+		} else await mkdir(this.root, { recursive: true, mode: 0o700 });
 		const canonicalRoot = await realpath(this.root),
 			requestedRoot = resolve(this.root);
 		const macAlias =
@@ -33,24 +37,22 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 		const rootStat = await lstat(this.root);
 		if (!rootStat.isDirectory() || rootStat.isSymbolicLink())
 			throw new Error("Peer storage root must be a directory, not a symlink");
-		if (process.platform === "win32") {
-			if (!this.verifyWindowsStorage || !(await this.verifyWindowsStorage(this.root)))
-				throw new Error("Windows peer storage requires a successful per-user ACL verifier");
-		} else if (
-			(typeof process.getuid === "function" && rootStat.uid !== process.getuid()) ||
-			(rootStat.mode & 0o077) !== 0
-		) {
+		if (
+			process.platform !== "win32" &&
+			((typeof process.getuid === "function" && rootStat.uid !== process.getuid()) || (rootStat.mode & 0o077) !== 0)
+		)
 			throw new Error("Peer storage root must be current-user-owned and private (mode 0700)");
-		}
-		await mkdir(dir, { recursive: true, mode: 0o700 });
+		if (process.platform === "win32") {
+			if (!(await ensureWindowsPeerStorage(dir, signal)))
+				throw new Error("Windows peer storage directory ACL validation/provisioning failed");
+		} else await mkdir(dir, { recursive: true, mode: 0o700 });
 		const s = await lstat(dir);
 		if (!s.isDirectory() || s.isSymbolicLink()) throw new Error("Peer storage directory must not be a symlink");
-		if (process.platform === "win32") {
-			if (!this.verifyWindowsStorage || !(await this.verifyWindowsStorage(dir)))
-				throw new Error("Windows peer storage ACL verification failed");
-		} else if ((typeof process.getuid === "function" && s.uid !== process.getuid()) || (s.mode & 0o077) !== 0) {
+		if (
+			process.platform !== "win32" &&
+			((typeof process.getuid === "function" && s.uid !== process.getuid()) || (s.mode & 0o077) !== 0)
+		)
 			throw new Error("Peer storage directory must be current-user-owned and private");
-		}
 	}
 	async publish(ad: PeerAdvertisement): Promise<void> {
 		if (!validatePeerAdvertisement(ad)) throw new Error("Invalid peer advertisement");
@@ -68,16 +70,20 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 		await writeFile(temp, JSON.stringify(ad), { mode: 0o600, flag: "wx" });
 		await rename(temp, file);
 	}
-	async list(projectId: string): Promise<PeerAdvertisement[]> {
+	async list(projectId: string, signal?: AbortSignal): Promise<PeerAdvertisement[]> {
+		throwIfAborted(signal);
 		const dir = join(this.root, "registry");
-		await this.ready(dir);
+		await this.ready(dir, signal);
+		throwIfAborted(signal);
 		const out: PeerAdvertisement[] = [];
 		for (const f of await readdir(dir)) {
+			throwIfAborted(signal);
 			if (!f.endsWith(".json")) continue;
 			try {
 				const v: unknown = JSON.parse(await readFile(join(dir, f), "utf8"));
 				if (validatePeerAdvertisement(v) && v.projectId === projectId) out.push(v);
 			} catch {
+				throwIfAborted(signal);
 				/* Corrupt registration is invisible. */
 			}
 		}
@@ -86,9 +92,9 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 	async remove(ad: PeerAdvertisement): Promise<void> {
 		await rm(join(this.root, "registry", `${safe(ad.peerSessionId)}-${safe(ad.runtimeId)}.json`), { force: true });
 	}
-	private async bind(message: PeerMessage): Promise<"new" | "duplicate" | "conflict"> {
+	private async bind(message: PeerMessage, signal?: AbortSignal): Promise<"new" | "duplicate" | "conflict"> {
 		const dir = join(this.root, "bindings");
-		await this.ready(dir);
+		await this.ready(dir, signal);
 		const record = {
 			sender: message.sender,
 			fingerprint: peerMessageFingerprint(message),
@@ -98,7 +104,9 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 		const file = join(dir, `${safe(message.messageId)}.json`),
 			temp = `${file}.${randomUUID()}.tmp`;
 		try {
+			throwIfAborted(signal);
 			await writeFile(temp, JSON.stringify(record), { flag: "wx", mode: 0o600 });
+			throwIfAborted(signal);
 			await link(temp, file);
 			return "new";
 		} catch (e) {
@@ -113,17 +121,23 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			await rm(temp, { force: true });
 		}
 	}
-	async acceptIngress(message: PeerMessage): Promise<{
+	async acceptIngress(
+		message: PeerMessage,
+		signal?: AbortSignal,
+	): Promise<{
 		status: "queued" | "held" | "delivered" | "refused" | "expired" | "unavailable" | "conflict" | "rate_limited";
 	}> {
+		throwIfAborted(signal);
 		const now = Date.now();
 		if (now - this.lastPruneAt > 60_000) {
 			this.lastPruneAt = now;
-			await this.prune(now);
+			await this.prune(now, signal);
 		}
 		return this.withQuotaLock(async () => {
+			throwIfAborted(signal);
 			const fingerprint = peerMessageFingerprint(message),
 				prior = await this.getBinding(message.messageId);
+			throwIfAborted(signal);
 			if (
 				prior &&
 				(prior.fingerprint !== fingerprint ||
@@ -132,6 +146,7 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			)
 				return { status: "conflict" };
 			const terminal = await this.receiptState(message.messageId);
+			throwIfAborted(signal);
 			if (terminal === "delivered" || terminal === "refused" || terminal === "expired") {
 				if (!prior && (await this.terminalFingerprint(message.messageId)) !== fingerprint)
 					return { status: "conflict" };
@@ -139,8 +154,10 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			}
 			if (terminal === "held") return { status: "held" };
 			if (!prior && terminal) return { status: "conflict" };
+			throwIfAborted(signal);
 			const rateDir = join(this.root, "rates");
-			await this.ready(rateDir);
+			await this.ready(rateDir, signal);
+			throwIfAborted(signal);
 			const rateFile = join(rateDir, `${safe(message.sender.peerSessionId)}-${safe(message.sender.runtimeId)}.json`);
 			if (
 				!(await exists(rateFile)) &&
@@ -155,11 +172,19 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 						(n): n is number => typeof n === "number" && Date.now() - n < PEER_LIMITS.rateWindowMs,
 					);
 			} catch {}
+			throwIfAborted(signal);
 			if (times.length >= PEER_LIMITS.rateCount) return { status: "rate_limited" };
 			times.push(Date.now());
 			const rateTemp = `${rateFile}.${randomUUID()}.tmp`;
-			await writeFile(rateTemp, JSON.stringify({ times }), { flag: "wx", mode: 0o600 });
-			await rename(rateTemp, rateFile);
+			try {
+				throwIfAborted(signal);
+				await writeFile(rateTemp, JSON.stringify({ times }), { flag: "wx", mode: 0o600 });
+				throwIfAborted(signal);
+				await rename(rateTemp, rateFile);
+			} finally {
+				await rm(rateTemp, { force: true });
+			}
+			throwIfAborted(signal);
 			const bindingsDir = join(this.root, "bindings");
 			if (
 				!prior &&
@@ -167,24 +192,39 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			)
 				return { status: "unavailable" };
 			const dir = join(this.root, "inbox", safe(message.recipient.peerSessionId), safe(message.recipient.runtimeId));
-			await this.ready(dir);
+			await this.ready(dir, signal);
+			throwIfAborted(signal);
 			const target = join(dir, `${safe(message.messageId)}.json`);
-			if (!(await exists(target)) && (await this.pendingCount(message.recipient)) >= PEER_LIMITS.pending)
+			if (!(await exists(target)) && (await this.pendingCount(message.recipient, signal)) >= PEER_LIMITS.pending)
 				return { status: "unavailable" };
-			if (!prior && (await this.bind(message)) === "conflict") return { status: "conflict" };
+			if (!prior && (await this.bind(message, signal)) === "conflict") return { status: "conflict" };
+			throwIfAborted(signal);
+			let committedByThisRequest = false;
 			if (!(await exists(target))) {
 				const temp = `${target}.${randomUUID()}.tmp`;
-				await writeFile(temp, JSON.stringify(message), { flag: "wx", mode: 0o600 });
+				throwIfAborted(signal);
 				try {
-					await link(temp, target);
+					await writeFile(temp, JSON.stringify(message), { flag: "wx", mode: 0o600 });
+					throwIfAborted(signal);
+					await this.linkInboxEntry(temp, target);
+					committedByThisRequest = true;
 				} catch (e) {
 					if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
 				} finally {
-					await rm(temp, { force: true });
+					await rm(temp, { force: true }).catch(() => {});
 				}
 			}
-			return { status: await this.setReceiptUnlocked(message.messageId, "queued", fingerprint) };
-		});
+			if (!committedByThisRequest) throwIfAborted(signal);
+			// The successful hard link is the commit point; persist its receipt even if shutdown races afterward.
+			return {
+				status: await this.setReceiptUnlocked(
+					message.messageId,
+					"queued",
+					fingerprint,
+					committedByThisRequest ? undefined : signal,
+				),
+			};
+		}, signal);
 	}
 	async getBinding(messageId: string): Promise<PeerMessageBinding | undefined> {
 		const record = await this.readBindingRecord(messageId);
@@ -213,24 +253,33 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			return undefined;
 		}
 	}
-	async claim(messageId: string): Promise<(() => Promise<void>) | undefined> {
+	async claim(messageId: string, signal?: AbortSignal): Promise<(() => Promise<void>) | undefined> {
+		throwIfAborted(signal);
 		const dir = join(this.root, "claims");
-		await this.ready(dir);
+		await this.ready(dir, signal);
+		throwIfAborted(signal);
 		const file = join(dir, `${safe(messageId)}.lock`);
 		for (let attempt = 0; attempt < 2; attempt++) {
+			throwIfAborted(signal);
+			let token = "";
+			let acquired = false;
 			try {
-				const token = randomUUID();
+				token = randomUUID();
 				const handle = await open(file, "wx", 0o600);
-				await handle.writeFile(JSON.stringify({ token, pid: process.pid, at: Date.now() }));
-				await handle.close();
-				return async () => {
-					try {
-						const current = JSON.parse(await readFile(file, "utf8")) as { token?: unknown };
-						if (current.token === token) await rm(file, { force: true });
-					} catch {}
-				};
-			} catch (e) {
-				if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+				acquired = true;
+				try {
+					await handle.writeFile(JSON.stringify({ token, pid: process.pid, at: Date.now() }));
+				} finally {
+					await handle.close();
+				}
+				throwIfAborted(signal);
+				return async () => this.releaseClaim(file, token);
+			} catch (error) {
+				if (acquired) {
+					await this.releaseClaim(file, token);
+					throw error;
+				}
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 				try {
 					const info = await stat(file);
 					if (Date.now() - info.mtimeMs > CLAIM_STALE_MS) {
@@ -239,18 +288,26 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 							const value = JSON.parse(await readFile(file, "utf8")) as { pid?: unknown };
 							if (typeof value.pid === "number") pid = value.pid;
 						} catch {}
+						throwIfAborted(signal);
 						if (pid === undefined || !pidIsAlive(pid)) {
 							await rm(file, { force: true });
 							continue;
 						}
 					}
 				} catch {
+					throwIfAborted(signal);
 					continue;
 				}
 				return undefined;
 			}
 		}
 		return undefined;
+	}
+	private async releaseClaim(file: string, token: string): Promise<void> {
+		try {
+			const current = JSON.parse(await readFile(file, "utf8")) as { token?: unknown };
+			if (current.token === token) await rm(file, { force: true });
+		} catch {}
 	}
 	async receiptState(messageId: string): Promise<PeerReceipt | undefined> {
 		const dir = join(this.root, "receipts"),
@@ -272,16 +329,24 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			return undefined;
 		}
 	}
-	async setReceipt(messageId: string, receipt: PeerReceipt, fingerprint?: string): Promise<PeerReceipt> {
-		return this.withQuotaLock(() => this.setReceiptUnlocked(messageId, receipt, fingerprint));
+	async setReceipt(
+		messageId: string,
+		receipt: PeerReceipt,
+		fingerprint?: string,
+		signal?: AbortSignal,
+	): Promise<PeerReceipt> {
+		return this.withQuotaLock(() => this.setReceiptUnlocked(messageId, receipt, fingerprint, signal), signal);
 	}
 	private async setReceiptUnlocked(
 		messageId: string,
 		receipt: PeerReceipt,
 		fingerprint?: string,
+		signal?: AbortSignal,
 	): Promise<PeerReceipt> {
+		throwIfAborted(signal);
 		const dir = join(this.root, "receipts");
-		await this.ready(dir);
+		await this.ready(dir, signal);
+		throwIfAborted(signal);
 		const id = safe(messageId);
 		if (receipt === "unavailable") return (await this.receiptState(id)) ?? "unavailable";
 		const current = await this.receiptState(id);
@@ -303,6 +368,7 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			file = join(dir, `${id}.${terminal ? "terminal" : receipt}.json`);
 		try {
 			const binding = await this.readBindingRecord(id);
+			throwIfAborted(signal);
 			await writeFile(
 				file,
 				JSON.stringify({ receipt, fingerprint, expiresAt: binding?.expiresAt, updatedAt: Date.now() }),
@@ -314,12 +380,15 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
 		}
+		throwIfAborted(signal);
 		return (await this.receiptState(id)) ?? receipt;
 	}
-	async holdMessage(message: PeerMessage): Promise<boolean> {
+	async holdMessage(message: PeerMessage, signal?: AbortSignal): Promise<boolean> {
 		return this.withQuotaLock(async () => {
+			throwIfAborted(signal);
 			const target = join(this.root, "held", `${safe(message.messageId)}.json`);
-			await this.ready(dirname(target));
+			await this.ready(dirname(target), signal);
+			throwIfAborted(signal);
 			const inboxFile = join(
 				this.root,
 				"inbox",
@@ -334,38 +403,46 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			)
 				return false;
 			const temp = `${target}.${randomUUID()}.tmp`;
-			await writeFile(temp, JSON.stringify(message), { flag: "wx", mode: 0o600 });
+			throwIfAborted(signal);
 			try {
+				await writeFile(temp, JSON.stringify(message), { flag: "wx", mode: 0o600 });
+				throwIfAborted(signal);
 				await link(temp, target);
 			} catch (e) {
 				if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
 			} finally {
 				await rm(temp, { force: true });
 			}
-			await this.removeFromInbox(message.messageId, message.recipient);
+			throwIfAborted(signal);
+			await this.removeFromInbox(message.messageId, message.recipient, signal);
 			return true;
-		});
+		}, signal);
 	}
-	private async pendingCount(recipient: PeerAddress): Promise<number> {
+	private async pendingCount(recipient: PeerAddress, signal?: AbortSignal): Promise<number> {
 		let count = 0;
 		const inbox = join(this.root, "inbox", safe(recipient.peerSessionId), safe(recipient.runtimeId));
 		for (const file of await safeReadDir(inbox)) {
+			throwIfAborted(signal);
 			if (!file.endsWith(".json")) continue;
 			const path = join(inbox, file);
 			try {
 				const m: unknown = JSON.parse(await readFile(path, "utf8"));
 				if (validatePeerMessage(m) && m.expiresAt > Date.now()) count++;
 				else {
-					if (validatePeerMessage(m)) await this.setReceiptUnlocked(m.messageId, "expired", peerMessageFingerprint(m));
+					if (validatePeerMessage(m))
+						await this.setReceiptUnlocked(m.messageId, "expired", peerMessageFingerprint(m), signal);
+					throwIfAborted(signal);
 					await rm(path, { force: true });
 				}
 			} catch {
+				throwIfAborted(signal);
 				await rm(path, { force: true });
 			}
 		}
 		const held = join(this.root, "held");
 		try {
 			for (const f of await readdir(held)) {
+				throwIfAborted(signal);
 				if (!f.endsWith(".json")) continue;
 				try {
 					const m: unknown = JSON.parse(await readFile(join(held, f), "utf8"));
@@ -376,29 +453,47 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 					) {
 						if (m.expiresAt > Date.now()) count++;
 						else {
-							await this.setReceiptUnlocked(m.messageId, "expired", peerMessageFingerprint(m));
+							await this.setReceiptUnlocked(m.messageId, "expired", peerMessageFingerprint(m), signal);
+							throwIfAborted(signal);
 							await rm(join(held, f), { force: true });
 						}
 					}
-				} catch {}
+				} catch {
+					throwIfAborted(signal);
+				}
 			}
-		} catch {}
+		} catch {
+			throwIfAborted(signal);
+		}
 		return count;
 	}
-	private async withQuotaLock<T>(fn: () => Promise<T>): Promise<T> {
+	private async withQuotaLock<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		throwIfAborted(signal);
 		const dir = join(this.root, "locks");
-		await this.ready(dir);
+		await this.ready(dir, signal);
+		throwIfAborted(signal);
 		const lock = join(dir, "quota.lock");
 		let token = "";
+		let acquired = false;
 		for (;;) {
+			throwIfAborted(signal);
 			try {
 				token = randomUUID();
 				const h = await open(lock, "wx", 0o600);
-				await h.writeFile(JSON.stringify({ token, pid: process.pid }));
-				await h.close();
+				acquired = true;
+				try {
+					await h.writeFile(JSON.stringify({ token, pid: process.pid }));
+				} finally {
+					await h.close();
+				}
+				throwIfAborted(signal);
 				break;
-			} catch (e) {
-				if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+			} catch (error) {
+				if (acquired) {
+					await this.releaseQuotaLock(lock, token);
+					throw error;
+				}
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 				try {
 					const s = await stat(lock);
 					if (Date.now() - s.mtimeMs > 30_000) {
@@ -407,41 +502,54 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 							const value = JSON.parse(await readFile(lock, "utf8")) as { pid?: unknown };
 							if (typeof value.pid === "number") pid = value.pid;
 						} catch {}
+						throwIfAborted(signal);
 						if (pid === undefined || !pidIsAlive(pid)) await rm(lock, { force: true });
 					}
-				} catch {}
-				await new Promise((r) => setTimeout(r, 5));
+				} catch {
+					throwIfAborted(signal);
+				}
+				await abortableDelay(5, signal);
 			}
 		}
 		try {
+			throwIfAborted(signal);
 			return await fn();
 		} finally {
-			try {
-				const current = JSON.parse(await readFile(lock, "utf8")) as { token?: unknown };
-				if (current.token === token) await rm(lock, { force: true });
-			} catch {}
+			await this.releaseQuotaLock(lock, token);
 		}
 	}
-	async removeFromInbox(messageId: string, recipient: PeerAddress): Promise<void> {
+	private async releaseQuotaLock(lock: string, token: string): Promise<void> {
+		try {
+			const current = JSON.parse(await readFile(lock, "utf8")) as { token?: unknown };
+			if (current.token === token) await rm(lock, { force: true });
+		} catch {}
+	}
+	async removeFromInbox(messageId: string, recipient: PeerAddress, signal?: AbortSignal): Promise<void> {
+		throwIfAborted(signal);
 		await rm(
 			join(this.root, "inbox", safe(recipient.peerSessionId), safe(recipient.runtimeId), `${safe(messageId)}.json`),
 			{ force: true },
 		);
 	}
-	async pending(address: PeerAddress): Promise<PeerMessage[]> {
+	async pending(address: PeerAddress, signal?: AbortSignal): Promise<PeerMessage[]> {
+		throwIfAborted(signal);
 		const dir = join(this.root, "inbox", safe(address.peerSessionId), safe(address.runtimeId));
-		await this.ready(dir);
+		await this.ready(dir, signal);
+		throwIfAborted(signal);
 		const out: PeerMessage[] = [];
 		for (const f of await readdir(dir)) {
+			throwIfAborted(signal);
 			if (!f.endsWith(".json")) continue;
 			try {
 				const v: unknown = JSON.parse(await readFile(join(dir, f), "utf8"));
 				if (validatePeerMessage(v) && v.expiresAt > Date.now()) out.push(v);
 				else {
-					if (validatePeerMessage(v)) await this.setReceipt(v.messageId, "expired", peerMessageFingerprint(v));
+					if (validatePeerMessage(v)) await this.setReceipt(v.messageId, "expired", peerMessageFingerprint(v), signal);
+					throwIfAborted(signal);
 					await rm(join(dir, f), { force: true });
 				}
 			} catch {
+				throwIfAborted(signal);
 				await rm(join(dir, f), { force: true });
 			}
 		}
@@ -455,34 +563,40 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			return undefined;
 		}
 	}
-	async listHeld(): Promise<PeerMessage[]> {
+	async listHeld(signal?: AbortSignal): Promise<PeerMessage[]> {
+		throwIfAborted(signal);
 		const dir = join(this.root, "held");
-		await this.ready(dir);
+		await this.ready(dir, signal);
+		throwIfAborted(signal);
 		const out: PeerMessage[] = [];
 		for (const f of await readdir(dir)) {
+			throwIfAborted(signal);
 			if (!f.endsWith(".json")) continue;
 			const id = f.slice(0, -5),
 				m = await this.getHeld(id);
 			if (!m) {
+				throwIfAborted(signal);
 				await rm(join(dir, f), { force: true });
 				continue;
 			}
 			if (m.expiresAt <= Date.now()) {
-				await this.setReceipt(id, "expired", peerMessageFingerprint(m));
-				await this.removeHeld(id);
-				await this.removeFromInbox(id, m.recipient);
+				await this.setReceipt(id, "expired", peerMessageFingerprint(m), signal);
+				await this.removeHeld(id, signal);
+				await this.removeFromInbox(id, m.recipient, signal);
 				continue;
 			}
 			out.push(m);
 		}
 		return out;
 	}
-	async removeHeld(messageId: string): Promise<void> {
+	async removeHeld(messageId: string, signal?: AbortSignal): Promise<void> {
+		throwIfAborted(signal);
 		await rm(join(this.root, "held", `${safe(messageId)}.json`), { force: true });
 	}
-	private async pruneClaims(now: number): Promise<void> {
+	private async pruneClaims(now: number, signal?: AbortSignal): Promise<void> {
 		const dir = join(this.root, "claims");
 		for (const file of await safeReadDir(dir)) {
+			throwIfAborted(signal);
 			if (!file.endsWith(".lock")) continue;
 			const path = join(dir, file);
 			try {
@@ -493,49 +607,101 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 					const value = JSON.parse(await readFile(path, "utf8")) as { pid?: unknown };
 					if (typeof value.pid === "number") pid = value.pid;
 				} catch {}
+				throwIfAborted(signal);
 				if (pid === undefined || !pidIsAlive(pid)) await rm(path, { force: true });
-			} catch {}
+			} catch {
+				throwIfAborted(signal);
+			}
 		}
 	}
-	async prune(now = Date.now()): Promise<void> {
-		await this.listHeld();
-		for (const sub of await safeReadDir(join(this.root, "inbox")))
+	async prune(now = Date.now(), signal?: AbortSignal): Promise<void> {
+		throwIfAborted(signal);
+		await this.listHeld(signal);
+		for (const sub of await safeReadDir(join(this.root, "inbox"))) {
+			throwIfAborted(signal);
 			for (const runtime of await safeReadDir(join(this.root, "inbox", sub))) {
 				const dir = join(this.root, "inbox", sub, runtime);
 				for (const f of await safeReadDir(dir)) {
+					throwIfAborted(signal);
 					try {
 						const m: unknown = JSON.parse(await readFile(join(dir, f), "utf8"));
 						if (validatePeerMessage(m) && m.expiresAt <= now) {
-							await this.setReceipt(m.messageId, "expired", peerMessageFingerprint(m));
+							await this.setReceipt(m.messageId, "expired", peerMessageFingerprint(m), signal);
+							throwIfAborted(signal);
 							await rm(join(dir, f), { force: true });
 						}
 					} catch {
+						throwIfAborted(signal);
 						await rm(join(dir, f), { force: true });
 					}
 				}
 			}
-		await this.pruneClaims(now);
+		}
+		await this.pruneClaims(now, signal);
 		for (const category of ["bindings", "receipts", "rates", "authenticated", "seen"] as const) {
+			throwIfAborted(signal);
 			const dir = join(this.root, category);
 			for (const f of await safeReadDir(dir)) {
+				throwIfAborted(signal);
 				try {
 					const path = join(dir, f),
 						s = await stat(path);
 					if (category === "bindings" || (category === "receipts" && f.endsWith(".terminal.json"))) {
 						const record = JSON.parse(await readFile(path, "utf8")) as { expiresAt?: unknown };
 						if (typeof record.expiresAt === "number") {
-							if (now > record.expiresAt + PEER_LIMITS.retentionMs) await rm(path, { force: true });
-						} else if (now - s.mtimeMs > PEER_LIMITS.retentionMs) await rm(path, { force: true });
-					} else if (now - s.mtimeMs > PEER_LIMITS.retentionMs) await rm(path, { force: true });
+							if (now > record.expiresAt + PEER_LIMITS.retentionMs) {
+								throwIfAborted(signal);
+								await rm(path, { force: true });
+							}
+						} else if (now - s.mtimeMs > PEER_LIMITS.retentionMs) {
+							throwIfAborted(signal);
+							await rm(path, { force: true });
+						}
+					} else if (now - s.mtimeMs > PEER_LIMITS.retentionMs) {
+						throwIfAborted(signal);
+						await rm(path, { force: true });
+					}
 				} catch {
+					throwIfAborted(signal);
 					try {
 						const path = join(dir, f);
 						if (now - (await stat(path)).mtimeMs > PEER_LIMITS.retentionMs) await rm(path, { force: true });
-					} catch {}
+					} catch {
+						throwIfAborted(signal);
+					}
 				}
 			}
 		}
 	}
+}
+function throwIfAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	if (signal.reason instanceof Error) throw signal.reason;
+	const error = new Error("Peer ingress operation aborted");
+	error.name = "AbortError";
+	throw error;
+}
+function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+	throwIfAborted(signal);
+	if (!signal) return new Promise((resolve) => setTimeout(resolve, milliseconds));
+	return new Promise((resolve, reject) => {
+		const cleanup = () => signal.removeEventListener("abort", abort);
+		const timer = setTimeout(() => {
+			cleanup();
+			resolve();
+		}, milliseconds);
+		const abort = () => {
+			clearTimeout(timer);
+			cleanup();
+			try {
+				throwIfAborted(signal);
+			} catch (error) {
+				reject(error);
+			}
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		if (signal.aborted) abort();
+	});
 }
 function safe(value: string): string {
 	if (!/^[\w.-]{1,128}$/.test(value)) throw new Error("Invalid peer identifier");

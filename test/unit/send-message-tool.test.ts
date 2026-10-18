@@ -56,7 +56,7 @@ function leadTool(
 	names: readonly string[],
 	getStatus?: (name: string) =>
 		| {
-				state: "idle" | "busy" | "released" | "retired";
+				state: "idle" | "busy" | "released";
 				availability: "available" | "unavailable";
 				recoveryError?: string;
 				operation?: "shutting_down";
@@ -116,9 +116,9 @@ describe("lead send_message", () => {
 		]);
 	});
 
-	it("rejects released, retired and unavailable teammates without queueing", async () => {
+	it("rejects released and unavailable teammates without queueing", async () => {
 		const lead = new MailboxService({ teamDir: root, teamKey: TEAM_KEY, self: "lead" });
-		for (const state of ["released", "retired", "unavailable"] as const) {
+		for (const state of ["released", "unavailable"] as const) {
 			const tool = leadTool(
 				() => lead,
 				["worker"],
@@ -185,10 +185,9 @@ describe("teammate send_message", () => {
 		expect(await send(tool, "reviewer", "late message")).toContain("Message not sent");
 	});
 
-	it("rejects released, retired and explicitly unavailable roster members", async () => {
+	it("rejects released and explicitly unavailable roster members", async () => {
 		for (const [name, state] of [
 			["released", { lifecycle: "released" }],
-			["retired", { lifecycle: "retired" }],
 			["uncertain", { availability: "unavailable", recoveryError: "cleanup uncertain" }],
 		] as const) {
 			const tool = teammateTool("worker", ["worker", name], { [name]: state });

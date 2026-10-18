@@ -1,5 +1,4 @@
 import { generateKeyPairSync, randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, MessageStartEvent } from "@earendil-works/pi-coding-agent";
 import { PeerDiscoveryService } from "../app/peer-discovery-service.js";
@@ -111,21 +110,20 @@ export async function startPeerRuntime(options: PeerRuntimeOptions): Promise<Pee
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let busy = false;
 	let disposed = false;
+	let ingressFailed = false;
 	let deliveryAdapter: PeerSdkDeliveryAdapter | undefined;
+	const activeUpdateControllers = new Set<AbortController>();
+	const activeUpdates = new Set<Promise<void>>();
 	try {
-		if (process.platform === "win32") {
-			throw new Error(
-				"Peer capability is disabled on Windows: per-user named-pipe/storage ACL verification is not available in this host.",
-			);
-		}
 		const sessionCwd = options.ctx.sessionManager.getCwd();
 		const projectId = await resolveSessionProjectId(sessionCwd, options.scope);
 		const privateRoot = join(options.root, "peer");
-		await mkdir(privateRoot, { recursive: true, mode: 0o700 });
 		const address = { peerSessionId: options.ctx.sessionManager.getSessionId(), runtimeId: randomUUID() };
 		const { privateKey, publicKey } = generateKeyPairSync("ed25519");
 		const host = new LocalPeerHost(privateRoot);
 		const endpoint = createPeerEndpointPath(privateRoot);
+		// Force storage ACL provisioning/verification before opening any ingress endpoint.
+		await host.list(projectId);
 		ingress = await startPeerIngress({
 			address,
 			socketPath: endpoint,
@@ -142,9 +140,43 @@ export async function startPeerRuntime(options: PeerRuntimeOptions): Promise<Pee
 			updatedAt: Date.now(),
 			capabilities: ["messaging"],
 			identityPublicKey: publicPem,
-			endpoint: { kind: "unix", path: endpoint },
+			endpoint: { kind: process.platform === "win32" ? "named_pipe" : "unix", path: endpoint },
 		};
 		await host.publish(advertisement);
+		void ingress.failure.then(async (error) => {
+			if (disposed) return;
+			ingressFailed = true;
+			try {
+				options.onError?.(error);
+			} catch {
+				/* Diagnostics must not prevent fail-closed cleanup. */
+			}
+			if (timer) clearInterval(timer);
+			for (const controller of activeUpdateControllers) controller.abort(error);
+			await Promise.allSettled([...activeUpdates]);
+			try {
+				await ingress?.close();
+			} catch (cleanupError) {
+				try {
+					options.onError?.(cleanupError);
+				} catch {
+					/* Preserve cleanup progress. */
+				}
+			}
+			const failedAdvertisement = advertisement;
+			advertisement = undefined;
+			if (failedAdvertisement) {
+				try {
+					await host.remove(failedAdvertisement);
+				} catch (cleanupError) {
+					try {
+						options.onError?.(cleanupError);
+					} catch {
+						/* Preserve cleanup progress. */
+					}
+				}
+			}
+		});
 		options.pi.on("turn_start", () => {
 			busy = true;
 		});
@@ -175,13 +207,26 @@ export async function startPeerRuntime(options: PeerRuntimeOptions): Promise<Pee
 		);
 		const discovery = new PeerDiscoveryService(host);
 		const update = async () => {
+			if (disposed || ingressFailed) return;
+			const controller = new AbortController();
+			activeUpdateControllers.add(controller);
+			const work = (async () => {
+				try {
+					for (const message of await host.pending(address, controller.signal))
+						await service.receive(message, controller.signal);
+					if (!advertisement || ingressFailed || controller.signal.aborted) return;
+					advertisement = { ...advertisement, status: busy ? "busy" : "idle", updatedAt: Date.now() };
+					await host.publish(advertisement);
+				} catch (error) {
+					if (!controller.signal.aborted) options.onError?.(error);
+				}
+			})();
+			activeUpdates.add(work);
 			try {
-				for (const message of await host.pending(address)) await service.receive(message);
-				if (!advertisement) return;
-				advertisement = { ...advertisement, status: busy ? "busy" : "idle", updatedAt: Date.now() };
-				await host.publish(advertisement);
-			} catch (error) {
-				options.onError?.(error);
+				await work;
+			} finally {
+				activeUpdates.delete(work);
+				activeUpdateControllers.delete(controller);
 			}
 		};
 		timer = setInterval(() => void update(), 1000);
@@ -190,7 +235,7 @@ export async function startPeerRuntime(options: PeerRuntimeOptions): Promise<Pee
 			messaging: service,
 			projectId,
 			async setActivity(activity) {
-				if (!advertisement) throw new Error("Peer runtime is not published");
+				if (!advertisement || ingressFailed) throw new Error("Peer runtime is not published");
 				const { activity: _previous, ...rest } = advertisement;
 				advertisement = { ...rest, ...(activity ? { activity: activity.slice(0, 160) } : {}), updatedAt: Date.now() };
 				await host.publish(advertisement);
@@ -200,6 +245,8 @@ export async function startPeerRuntime(options: PeerRuntimeOptions): Promise<Pee
 				disposed = true;
 				deliveryAdapter?.dispose();
 				if (timer) clearInterval(timer);
+				for (const controller of activeUpdateControllers) controller.abort(new Error("Peer runtime disposed"));
+				await Promise.allSettled([...activeUpdates]);
 				await ingress?.close();
 				if (advertisement) await host.remove(advertisement);
 			},

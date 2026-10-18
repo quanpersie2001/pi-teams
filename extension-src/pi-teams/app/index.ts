@@ -14,7 +14,7 @@ import { AgentRegistry, type RawAgentLoader } from "./agent-registry.js";
 import { type DeliveryHost, DeliveryService, type DeliveryServiceOptions } from "./delivery-service.js";
 import { MailboxService } from "./mailbox-service.js";
 import { archiveRegistryRuns, partitionOwnedEntries } from "./registry-archive.js";
-import type { SubagentRunStore } from "./run-registry.js";
+import { isIncompatibleRegistryEntry, type SubagentRunStore } from "./run-registry.js";
 import { TeamService, type TeamStore } from "./team-service.js";
 import type { WorktreeService } from "./worktree-service.js";
 
@@ -170,17 +170,90 @@ export function createPiSubagentsApp(options: PiSubagentsAppOptions): PiSubagent
 				return isConversationOwner(owner) && owner.sessionId === sessionId;
 			});
 			manager.setForeignRegistryEntries(foreign);
-			await archiveRegistryRuns([...incompatible, ...owned], {
-				dispose: (entry) => manager.attemptStaleDisposal(entry),
-				recordCompleted: (entry) => store.recordCompleted(entry),
-				persist: (kept) => {
-					manager.setPreservedRegistryEntries(kept);
-					store.writeRegistry([...kept, ...foreign]);
+			const members = teams?.current?.members ?? [];
+			// An exact ID belongs to that identity even if the optional/name field is
+			// missing or contradictory. Keep contradictory rows intact and unresolved.
+			const conflictingReceipts = owned
+				.filter(
+					(entry) =>
+						entry.membershipId !== undefined &&
+						members.some((member) => member.membershipId === entry.membershipId && entry.teammateName !== member.name),
+				)
+				.map((entry) => ({
+					...entry,
+					recoveryError:
+						entry.recoveryError ?? "Registry receipt membership ID/name conflict; ownership remains unresolved.",
+				}));
+			const conflictIds = new Set(conflictingReceipts.map((entry) => entry.id));
+			const archiveResult = await archiveRegistryRuns(
+				[...incompatible, ...owned.filter((entry) => !conflictIds.has(entry.id))],
+				{
+					dispose: (entry) => manager.attemptStaleDisposal(entry),
+					recordCompleted: (entry) => store.recordCompleted(entry),
+					persist: (kept) => {
+						const preserved = [...kept, ...conflictingReceipts];
+						manager.setPreservedRegistryEntries(preserved);
+						store.writeRegistry([...preserved, ...foreign]);
+					},
+					rememberAgents: options.settings.rememberAgents,
+					warn: (message) => console.warn(`[pi-teams] ${message}`),
+					now: () => Date.now(),
 				},
-				rememberAgents: options.settings.rememberAgents,
-				warn: (message) => console.warn(`[pi-teams] ${message}`),
-				now: () => Date.now(),
-			});
+			);
+			if (teams) {
+				const teamService = teams;
+				const unresolved = [...archiveResult.unresolved, ...conflictingReceipts];
+				const hasOpaqueUnresolved = unresolved.some(isIncompatibleRegistryEntry);
+				const requireFence = (
+					member: (typeof members)[number],
+					fence: NonNullable<(typeof members)[number]["recoveryFence"]>,
+					reason: string,
+				) => {
+					if (!member.membershipId) return;
+					if (teamService.setRecoveryFence(member.name, member.membershipId, fence, reason)) return;
+					const error = `Could not persist cleanup fence for @${member.name}; session startup and admissions are disabled.`;
+					manager.blockAdmissions(error);
+					throw new Error(error);
+				};
+				for (const entry of unresolved) {
+					if (isIncompatibleRegistryEntry(entry)) {
+						for (const member of members)
+							requireFence(
+								member,
+								"registry-receipt-unresolved",
+								"An incompatible persisted run receipt prevents verified teammate cleanup.",
+							);
+						continue;
+					}
+					const candidates = entry.membershipId
+						? members.filter((member) => member.membershipId === entry.membershipId)
+						: entry.teammateName
+							? members.filter((member) => member.name === entry.teammateName)
+							: [];
+					for (const member of candidates)
+						requireFence(
+							member,
+							"registry-receipt-unresolved",
+							entry.recoveryError ??
+								"A persisted run receipt remains unresolved or cannot be correlated to an incarnation.",
+						);
+				}
+				if (!hasOpaqueUnresolved) {
+					for (const member of members) {
+						if (member.recoveryFence !== "legacy-retired-unverified" || !member.membershipId) continue;
+						const matching = owned.filter(
+							(entry) =>
+								entry.membershipId === member.membershipId ||
+								(entry.membershipId === undefined && entry.teammateName === member.name),
+						);
+						if (
+							matching.length > 0 &&
+							matching.every((entry) => archiveResult.verifiedDisposed.some((disposed) => disposed.id === entry.id))
+						)
+							teamService.archiveVerifiedLegacyMember(member.name, member.membershipId);
+					}
+				}
+			}
 		},
 
 		async sessionShutdown() {

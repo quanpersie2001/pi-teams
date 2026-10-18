@@ -42,12 +42,7 @@ export function registerLeadSendMessageTool(
 			const status = getTeammateStatus?.(args.target);
 			if (getTeammateStatus && !isTeammateMessageAvailable(status)) {
 				const reason = status?.recoveryError ? `: ${status.recoveryError}` : "";
-				const blockedAs =
-					status?.state === "released" || status?.state === "retired"
-						? status.state === "retired"
-							? "legacy-archived"
-							: status.state
-						: "unavailable";
+				const blockedAs = status?.state === "released" ? status.state : "unavailable";
 				const stateNote = status ? ` (state ${status.state})` : "";
 				return {
 					content: [

@@ -54,20 +54,19 @@ function assertWidthSafe(lines: readonly string[], width: number): void {
 const NOW = 61_000; // elapsed 60s
 
 describe("team hub rendering", () => {
-	it("hides retired teammates from Hub counts, rows and hit maps without mutating history", () => {
-		const retired = row({ id: "retired", teammateName: "old-peer", teammateState: "retired" });
+	it("renders released historical teammate rows without a retired lifecycle marker", () => {
+		const released = row({ id: "released", teammateName: "old-peer", teammateState: "released" });
 		const active = row({ id: "active", teammateName: "peer" });
-		const source = view([retired, active]);
+		const source = view([released, active]);
 		const result = renderAgentHub(
-			{ view: source, selection: "retired", stopArmedFor: null, focus: null },
+			{ view: source, selection: "released", stopArmedFor: null, focus: null },
 			fg,
 			100,
 			20,
 			NOW,
 		);
-		expect(result.lines[0]).toContain("Team Hub (1)");
-		expect(result.lines.join("\\n")).not.toContain("old-peer");
-		expect([...result.targets.values()]).not.toContain("retired");
+		expect(result.lines[0]).toContain("Team Hub (2)");
+		expect(result.lines.join("\\n")).toContain("old-peer");
 		expect(source.rows).toHaveLength(2);
 	});
 

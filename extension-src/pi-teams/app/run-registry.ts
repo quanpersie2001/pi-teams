@@ -57,6 +57,13 @@ export interface AgentRegistryEntry {
 	resultOriginalLength?: number;
 	error?: string;
 	recoveryError?: string;
+	/** Durable proof that the concrete serialized process handle was disposed. */
+	cleanupProof?: {
+		kind: "verified-process-disposal";
+		runId: string;
+		membershipId?: string;
+		verifiedAt: number;
+	};
 	cwd: string;
 	configCwd: string;
 	owner: AgentOwner;
@@ -121,6 +128,23 @@ export type HandleProjector = (
 
 export function isIncompatibleRegistryEntry(entry: PersistedRegistryEntry): entry is IncompatibleRegistryEntry {
 	return "kind" in entry && entry.kind === "incompatible";
+}
+
+/** True only for a well-formed proof bound to this exact handle-less run row. */
+export function hasVerifiedCleanupProof(entry: AgentRegistryEntry): boolean {
+	const proof = entry.cleanupProof;
+	return (
+		entry.handle === undefined &&
+		(entry.status === "completed" ||
+			entry.status === "stopped" ||
+			entry.status === "aborted" ||
+			entry.status === "error") &&
+		proof?.kind === "verified-process-disposal" &&
+		proof.runId === entry.id &&
+		proof.membershipId === entry.membershipId &&
+		Number.isFinite(proof.verifiedAt) &&
+		proof.verifiedAt >= 0
+	);
 }
 
 /** Project an in-memory run into its process-only durable representation. */
@@ -232,7 +256,10 @@ export function coerceRegistryEntry(raw: unknown): PersistedRegistryEntry {
 	if (candidate.handle !== undefined && !isSerializableBackendHandle(candidate.handle)) {
 		return { kind: "incompatible", raw, reason: "registry row has no valid process control identity" };
 	}
-	return candidate as unknown as AgentRegistryEntry;
+	const entry = candidate as unknown as AgentRegistryEntry;
+	if (candidate.cleanupProof !== undefined && !hasVerifiedCleanupProof(entry))
+		return { kind: "incompatible", raw, reason: "registry row has an invalid verified-cleanup proof" };
+	return entry;
 }
 
 export function isSerializableBackendHandle(raw: unknown): raw is SerializableBackendHandle {

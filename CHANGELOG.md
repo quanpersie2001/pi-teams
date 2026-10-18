@@ -116,4 +116,4 @@
 
 ## Unreleased
 
-- Integrate membership shutdown with verified cleanup/task reconciliation and expose peer discovery, send, activity, and receiver-controlled inbound policy in the Pi host. Peer support is opt-in; Unix transport is process-tested. Native independent Pi-session/TUI behavior and Windows ACL verification remain unverified.
+- Complete lifecycle identity migration fences and verified shutdown cleanup; add opt-in peer discovery/messaging with receiver-controlled policy. Unix transport and independent SDK/production-loader/busy-safe-point plus rendered TUI flows have automated coverage. Windows uses protected per-user ACLs and a pwsh 7+ `CurrentUserOnly` pipe helper; native Windows verification remains pending.

@@ -28,7 +28,7 @@ export interface TeamStore {
 	writeRoster(roster: TeamRoster): void;
 }
 
-export type PendingMailboxDiscardReason = "release" | "retire" | "shutdown" | "fresh" | "context-reset";
+export type PendingMailboxDiscardReason = "release" | "shutdown" | "fresh" | "context-reset";
 
 export interface TeamServiceOptions {
 	sessionId: string;
@@ -84,23 +84,34 @@ export class TeamService {
 		if (existing) {
 			// A persisted roster is identity/history, never a live child receipt.
 			const migrationRequired =
-				existing.members.some((member) => !member.membershipId) ||
 				existing.members.some(
-					(member) => member.lifecycle === "retired" && member.availability !== "unavailable" && !member.recoveryError,
-				);
-			const migratedMembers = existing.members.map((member) => ({
+					(member) => !member.membershipId || (member as { lifecycle?: string }).lifecycle === "retired",
+				) ||
+				existing.archivedMembers?.some((member) => (member as { lifecycle?: string }).lifecycle === "retired") === true;
+			const migratedMembers = existing.members.map((member) => {
+				const legacyRetired = (member as { lifecycle?: string }).lifecycle === "retired";
+				return {
+					...member,
+					// Backfill once. Legacy retired is never cleanup proof; keep its alias fenced until verified disposal.
+					membershipId: member.membershipId ?? randomBytes(16).toString("hex"),
+					lifecycle: "released" as const,
+					...(legacyRetired
+						? {
+								availability: "unavailable" as const,
+								recoveryError: member.recoveryError ?? "Legacy retired membership has unverified cleanup ownership.",
+								recoveryFence: "legacy-retired-unverified" as const,
+							}
+						: {}),
+				};
+			});
+			const archivedMembers = (existing.archivedMembers ?? []).map((member) => ({
 				...member,
-				// One-time backfill: persisted before membership incarnations existed.
-				membershipId: member.membershipId ?? randomBytes(16).toString("hex"),
-				lifecycle: member.lifecycle === "retired" ? ("retired" as const) : ("released" as const),
+				lifecycle: "released" as const,
 			}));
-			const archived = migratedMembers.filter(
-				(member) => member.lifecycle === "retired" && member.availability !== "unavailable" && !member.recoveryError,
-			);
 			this.roster = {
 				...existing,
-				members: migratedMembers.filter((member) => !archived.includes(member)),
-				...(archived.length > 0 ? { archivedMembers: [...(existing.archivedMembers ?? []), ...archived] } : {}),
+				members: migratedMembers,
+				...(archivedMembers.length > 0 ? { archivedMembers } : {}),
 			};
 			if (!this.persist() && migrationRequired)
 				throw new Error(`Cannot persist teammate identity migration in ${this.store.teamDir}.`);
@@ -179,13 +190,24 @@ export class TeamService {
 		return result.acquired && result.value;
 	}
 
-	removeMember(name: string, membershipId?: string): boolean {
+	removeMember(name: string, membershipId?: string, verifiedCleanup = false): boolean {
 		const result = withMailboxMutationLock(this.store.teamDir, () => {
 			if (!this.roster) return false;
 			const member = this.roster.members.find((candidate) => candidate.name === name);
-			if (!member || (membershipId !== undefined && member.membershipId !== membershipId)) return false;
+			if (
+				!member ||
+				(member.recoveryFence && !verifiedCleanup) ||
+				(membershipId !== undefined && member.membershipId !== membershipId)
+			)
+				return false;
 			const previous = this.roster;
-			const { operation: _operation, ...archivedMember } = member;
+			const archivedMember = { ...member };
+			delete archivedMember.operation;
+			if (verifiedCleanup) {
+				delete archivedMember.recoveryFence;
+				delete archivedMember.recoveryError;
+				archivedMember.availability = "available";
+			}
 			this.roster = {
 				...previous,
 				members: previous.members.filter((candidate) => candidate !== member),
@@ -220,6 +242,64 @@ export class TeamService {
 			}),
 		};
 		this.persist();
+	}
+
+	setRecoveryFence(
+		name: string,
+		membershipId: string,
+		fence: NonNullable<TeamRoster["members"][number]["recoveryFence"]>,
+		reason: string,
+	): boolean {
+		if (!this.roster) return false;
+		const member = this.roster.members.find(
+			(candidate) => candidate.name === name && candidate.membershipId === membershipId,
+		);
+		if (!member) return false;
+		const previous = this.roster;
+		this.roster = {
+			...previous,
+			members: previous.members.map((candidate) =>
+				candidate === member
+					? {
+							...candidate,
+							recoveryFence: candidate.recoveryFence ?? fence,
+							availability: "unavailable",
+							recoveryError: reason,
+						}
+					: candidate,
+			),
+		};
+		if (this.persist()) return true;
+		this.roster = previous;
+		return false;
+	}
+
+	/** Archive a legacy-fenced identity only after caller proves every correlated receipt disposed. */
+	archiveVerifiedLegacyMember(name: string, membershipId: string): boolean {
+		if (!this.roster) return false;
+		const result = withMailboxMutationLock(this.store.teamDir, () => {
+			if (!this.roster) return false;
+			const member = this.roster.members.find(
+				(candidate) => candidate.name === name && candidate.membershipId === membershipId,
+			);
+			if (member?.recoveryFence !== "legacy-retired-unverified") return false;
+			const previous = this.roster;
+			const {
+				operation: _operation,
+				recoveryError: _recoveryError,
+				recoveryFence: _recoveryFence,
+				...archived
+			} = member;
+			this.roster = {
+				...previous,
+				members: previous.members.filter((candidate) => candidate !== member),
+				archivedMembers: [...(previous.archivedMembers ?? []), { ...archived, lifecycle: "released" }],
+			};
+			if (this.persist()) return true;
+			this.roster = previous;
+			return false;
+		});
+		return result.acquired && result.value;
 	}
 
 	setLifecycle(

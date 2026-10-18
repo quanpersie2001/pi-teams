@@ -1,11 +1,12 @@
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { access, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PeerAdvertisement } from "../../extension-src/pi-teams/domain/peer.js";
 import { type PeerMessage, peerMessageFingerprint } from "../../extension-src/pi-teams/domain/peer-message.js";
 import { LocalPeerHost } from "../../extension-src/pi-teams/pi/peer-host.js";
+import * as windowsPeerAcl from "../../extension-src/pi-teams/pi/windows-peer-acl.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -38,6 +39,104 @@ const makeMessage = (id: string, body = "hello"): PeerMessage => ({
 	expiresAt: Date.now() + 10_000,
 });
 describe("local peer host durability, quotas and receipt state", () => {
+	it("aborts quota-lock wait without late binding, rate, receipt, or inbox writes", async () => {
+		const h = await host();
+		await h.list("project");
+		const root = (h as unknown as { root: string }).root;
+		const lockDir = join(root, "locks");
+		await mkdir(lockDir, { recursive: true, mode: 0o700 });
+		await writeFile(join(lockDir, "quota.lock"), JSON.stringify({ token: "barrier", pid: process.pid }));
+		(h as unknown as { lastPruneAt: number }).lastPruneAt = Date.now();
+		const controller = new AbortController();
+		const stop = new Error("close while waiting for quota lock");
+		const operation = h.acceptIngress(makeMessage("cancelled-ingress"), controller.signal);
+		const rejected = expect(operation).rejects.toBe(stop);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		controller.abort(stop);
+		await rm(join(lockDir, "quota.lock"), { force: true });
+		await rejected;
+		expect(await h.getBinding("cancelled-ingress")).toBeUndefined();
+		await expect(access(join(root, "rates", "s1-r1.json"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await h.receiptState("cancelled-ingress")).toBeUndefined();
+		expect(await h.pending({ peerSessionId: "session", runtimeId: "run1" })).toEqual([]);
+	});
+
+	it("completes the enqueue receipt when abort races after the real inbox hard link commits", async () => {
+		const root = await mkdtemp(join(tmpdir(), "peer-host-link-commit-"));
+		roots.push(root);
+		let reached!: () => void;
+		let release!: () => void;
+		const linkCommitted = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		class LinkBarrierHost extends LocalPeerHost {
+			protected override async linkInboxEntry(temp: string, target: string): Promise<void> {
+				await link(temp, target);
+				reached();
+				await gate;
+			}
+		}
+		const h = new LinkBarrierHost(root);
+		(h as unknown as { lastPruneAt: number }).lastPruneAt = Date.now();
+		const m = makeMessage("abort-after-link");
+		const controller = new AbortController();
+		const operation = h.acceptIngress(m, controller.signal);
+		try {
+			await linkCommitted;
+			const target = join(root, "inbox", m.recipient.peerSessionId, m.recipient.runtimeId, `${m.messageId}.json`);
+			await expect(access(target)).resolves.toBeUndefined();
+			controller.abort(new Error("shutdown after inbox link commit"));
+			release();
+			await expect(operation).resolves.toEqual({ status: "queued" });
+		} finally {
+			release();
+		}
+		expect(await h.receiptState(m.messageId)).toBe("queued");
+		expect(await h.getBinding(m.messageId)).toMatchObject({
+			sender: m.sender,
+			fingerprint: peerMessageFingerprint(m),
+		});
+		expect(await h.pending(m.recipient)).toEqual([m]);
+	});
+
+	it("honors cancellation before creating a per-message claim", async () => {
+		const h = await host();
+		const controller = new AbortController();
+		const stop = new Error("session stopped");
+		controller.abort(stop);
+		await expect(h.claim("cancelled-claim", controller.signal)).rejects.toBe(stop);
+	});
+
+	it.skipIf(process.platform !== "win32")("propagates held-pruning cancellation into ACL validation", async () => {
+		let started!: () => void;
+		const aclStarted = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const controller = new AbortController();
+		const reason = new Error("cancel during held-prune ACL validation");
+		const aclSpy = vi.spyOn(windowsPeerAcl, "ensureWindowsPeerStorage").mockImplementation(async (_path, signal) => {
+			started();
+			if (!signal) throw new Error("ACL validation lost the abort signal");
+			return new Promise<boolean>((_resolve, reject) => {
+				signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+			});
+		});
+		try {
+			const root = join("C:\\", "peer-acl-cancel-test");
+			const h = new LocalPeerHost(root);
+			const operation = h.listHeld(controller.signal);
+			await aclStarted;
+			controller.abort(reason);
+			await expect(operation).rejects.toBe(reason);
+			expect(aclSpy).toHaveBeenCalledWith(root, controller.signal);
+		} finally {
+			aclSpy.mockRestore();
+		}
+	});
+
 	it("filters malformed registrations and scopes ads", async () => {
 		const h = await host();
 		await h.publish(ad);

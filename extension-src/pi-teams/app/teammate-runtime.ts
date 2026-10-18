@@ -1,7 +1,7 @@
 import type { AgentBackendHandle, AgentExecutionBackend } from "../domain/backend.js";
 import type { WorktreeInfo } from "../domain/worktree.js";
 
-export type TeammateLifecycle = "idle" | "busy" | "released" | "retired";
+export type TeammateLifecycle = "idle" | "busy" | "released";
 
 /** Session-owned teammate identity and child context. Runs contain outcomes; this owns live child resources. */
 export interface TeammateRuntimeEntry {
@@ -37,8 +37,6 @@ export class TeammateRuntime {
 				throw new Error(
 					`Teammate "@${identity.name}" already has color ${entry.color ?? "the default"}; its identity color cannot change.`,
 				);
-			if (entry.state === "retired")
-				throw new Error(`Teammate "@${identity.name}" is retired and cannot be reassigned.`);
 			return entry;
 		}
 		const created: TeammateRuntimeEntry = {
@@ -92,7 +90,6 @@ export class TeammateRuntime {
 	reserve(name: string, runId: string): void {
 		const entry = this.entries.get(name);
 		if (!entry) throw new Error(`Unknown teammate runtime: "${name}".`);
-		if (entry.state === "retired") throw new Error(`Teammate "@${name}" is retired and cannot be reassigned.`);
 		if (entry.state === "busy") throw new Error(`Teammate "@${name}" is already busy.`);
 		entry.state = "busy";
 		if (entry.handle === undefined) entry.currentRunId = runId;
@@ -106,14 +103,14 @@ export class TeammateRuntime {
 		else if (state === "released" || state === "idle") delete entry.recoveryError;
 	}
 
-	clearChild(name: string, state: "released" | "retired" = "released"): void {
+	clearChild(name: string): void {
 		const entry = this.entries.get(name);
 		if (!entry) return;
 		delete entry.backend;
 		delete entry.handle;
 		delete entry.currentRunId;
 		delete entry.sessionFile;
-		entry.state = state;
+		entry.state = "released";
 		delete entry.recoveryError;
 	}
 

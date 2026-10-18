@@ -16,12 +16,11 @@ describe("teammate composer routing availability", () => {
 			["idle", status("idle", "idle")],
 			["busy", status("busy", "busy")],
 			["released", status("released", "released")],
-			["retired", status("retired", "retired")],
 			["unavailable", status("unavailable", "idle", "unavailable")],
 		]);
 		expect(
 			eligibleTeammateNames(
-				["idle", "busy", "released", "retired", "unavailable", "unknown"].map((name) => ({ name })),
+				["idle", "busy", "released", "unavailable", "unknown"].map((name) => ({ name })),
 				(name) => statuses.get(name),
 			),
 		).toEqual(["idle", "busy"]);
@@ -37,7 +36,6 @@ describe("teammate composer routing availability", () => {
 	it("fails closed when a status is missing or unavailable", () => {
 		expect(isTeammateMessageAvailable(undefined)).toBe(false);
 		expect(isTeammateMessageAvailable(status("released", "released"))).toBe(false);
-		expect(isTeammateMessageAvailable(status("retired", "retired"))).toBe(false);
 		expect(isTeammateMessageAvailable(status("worker", "busy", "unavailable"))).toBe(false);
 	});
 });

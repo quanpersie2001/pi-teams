@@ -4,7 +4,7 @@ import type {
 	IncompatibleRegistryEntry,
 	PersistedRegistryEntry,
 } from "./run-registry.js";
-import { isIncompatibleRegistryEntry } from "./run-registry.js";
+import { hasVerifiedCleanupProof, isIncompatibleRegistryEntry } from "./run-registry.js";
 
 export interface PartitionedRegistryEntries {
 	owned: AgentRegistryEntry[];
@@ -37,11 +37,19 @@ export interface ArchiveRegistryDeps {
 }
 
 /** Archive stale registry receipts without reconnecting children into this session. */
+export interface ArchiveRegistryResult {
+	/** Entries for which a concrete handle was disposed successfully. */
+	verifiedDisposed: AgentRegistryEntry[];
+	/** Rows retained because ownership or disposal remains unresolved. */
+	unresolved: PersistedRegistryEntry[];
+}
+
 export async function archiveRegistryRuns(
 	entries: readonly PersistedRegistryEntry[],
 	deps: ArchiveRegistryDeps,
-): Promise<void> {
+): Promise<ArchiveRegistryResult> {
 	const kept: PersistedRegistryEntry[] = [];
+	const verifiedDisposed: AgentRegistryEntry[] = [];
 	for (const entry of entries) {
 		if (isIncompatibleRegistryEntry(entry)) {
 			kept.push(entry);
@@ -49,6 +57,9 @@ export async function archiveRegistryRuns(
 			continue;
 		}
 		let cleanupError: string | undefined;
+		const previouslyVerified = hasVerifiedCleanupProof(entry);
+		if (previouslyVerified) verifiedDisposed.push(entry);
+		else if (!entry.handle) cleanupError = "verified disposal unavailable because the process identity is missing";
 		if (entry.handle) {
 			try {
 				if (!(await deps.dispose(entry))) cleanupError = "verified disposal could not be confirmed";
@@ -56,14 +67,23 @@ export async function archiveRegistryRuns(
 				cleanupError = `verified disposal failed: ${error instanceof Error ? error.message : String(error)}`;
 			}
 		}
+		if (!cleanupError && entry.handle) verifiedDisposed.push(entry);
+		const history = { ...entry };
+		delete history.handle;
+		if (entry.handle && !cleanupError) {
+			history.cleanupProof = {
+				kind: "verified-process-disposal",
+				runId: entry.id,
+				...(entry.membershipId !== undefined ? { membershipId: entry.membershipId } : {}),
+				verifiedAt: deps.now(),
+			};
+		}
 		if (
 			entry.status === "completed" ||
 			entry.status === "stopped" ||
 			entry.status === "aborted" ||
 			entry.status === "error"
 		) {
-			const history = { ...entry };
-			delete history.handle;
 			if (cleanupError) {
 				history.recoveryError = [entry.recoveryError, cleanupError].filter(Boolean).join("; ");
 				kept.push({ ...entry, recoveryError: history.recoveryError });
@@ -81,12 +101,19 @@ export async function archiveRegistryRuns(
 		if (cleanupError) recoveryError += `; ${cleanupError}`;
 		else if (!entry.handle)
 			recoveryError += "; verified disposal was unavailable because the process identity is missing";
-		const history = { ...entry };
-		delete history.handle;
 		const completedAt = deps.now();
-		if (cleanupError && entry.handle) kept.push({ ...entry, status: "stopped", completedAt, recoveryError });
+		if (cleanupError) kept.push({ ...entry, recoveryError });
 		deps.recordCompleted({ ...history, status: "stopped", completedAt, recoveryError });
 		deps.warn(`run "${entry.id}" archived stopped at startup: ${recoveryError}`);
 	}
 	deps.persist(kept);
+	const verifiedIds = new Set(verifiedDisposed.map((entry) => entry.id));
+	const unresolved = kept.filter((entry) => {
+		if (isIncompatibleRegistryEntry(entry)) return true;
+		if (verifiedIds.has(entry.id)) return false;
+		// A handle-less history row retained solely because rememberAgents is off
+		// records an outcome, not an unresolved process/resource receipt.
+		return entry.handle !== undefined || entry.recoveryError !== undefined;
+	});
+	return { verifiedDisposed, unresolved };
 }

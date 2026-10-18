@@ -12,18 +12,21 @@ export interface PeerMessageBinding {
 	fingerprint: string;
 }
 export interface PeerMailbox {
-	acceptIngress(message: PeerMessage): Promise<{
+	acceptIngress(
+		message: PeerMessage,
+		signal?: AbortSignal,
+	): Promise<{
 		status: "queued" | "held" | "delivered" | "refused" | "expired" | "unavailable" | "conflict" | "rate_limited";
 	}>;
 	getBinding(messageId: string): Promise<PeerMessageBinding | undefined>;
-	claim(messageId: string): Promise<(() => Promise<void>) | undefined>;
+	claim(messageId: string, signal?: AbortSignal): Promise<(() => Promise<void>) | undefined>;
 	receiptState(messageId: string): Promise<PeerReceipt | undefined>;
-	setReceipt(messageId: string, receipt: PeerReceipt, fingerprint?: string): Promise<PeerReceipt>;
-	removeFromInbox(messageId: string, recipient: PeerAddress): Promise<void>;
-	holdMessage(message: PeerMessage): Promise<boolean>;
+	setReceipt(messageId: string, receipt: PeerReceipt, fingerprint?: string, signal?: AbortSignal): Promise<PeerReceipt>;
+	removeFromInbox(messageId: string, recipient: PeerAddress, signal?: AbortSignal): Promise<void>;
+	holdMessage(message: PeerMessage, signal?: AbortSignal): Promise<boolean>;
 	getHeld(messageId: string): Promise<PeerMessage | undefined>;
 	listHeld(): Promise<PeerMessage[]>;
-	removeHeld(messageId: string): Promise<void>;
+	removeHeld(messageId: string, signal?: AbortSignal): Promise<void>;
 }
 export interface PeerOutboundTransport {
 	send(message: PeerMessage): Promise<PeerReceipt>;
@@ -68,12 +71,14 @@ export class PeerMessagingService {
 			receipt: await this.mailbox.setReceipt(message.messageId, receipt, peerMessageFingerprint(message)),
 		};
 	}
-	async receive(value: unknown): Promise<PeerSendResult> {
+	async receive(value: unknown, signal?: AbortSignal): Promise<PeerSendResult> {
+		throwIfAborted(signal);
 		if (!validatePeerMessage(value)) throw new Error("Invalid peer envelope");
 		const message = value;
-		const release = await this.mailbox.claim(message.messageId);
+		const release = await this.mailbox.claim(message.messageId, signal);
 		if (!release) return this.resultFor(message.messageId, "queued");
 		try {
+			throwIfAborted(signal);
 			const binding = await this.mailbox.getBinding(message.messageId),
 				fingerprint = peerMessageFingerprint(message);
 			if (
@@ -85,35 +90,43 @@ export class PeerMessagingService {
 				throw new Error("Peer message lacks matching immutable authenticated ingress evidence");
 			if (!this.isLocalRecipient(message)) return { messageId: message.messageId, receipt: "unavailable" };
 			const terminal = await this.mailbox.receiptState(message.messageId);
+			throwIfAborted(signal);
 			if (isTerminal(terminal)) {
-				await this.mailbox.removeHeld(message.messageId);
-				await this.mailbox.removeFromInbox(message.messageId, message.recipient);
+				await this.mailbox.removeHeld(message.messageId, signal);
+				await this.mailbox.removeFromInbox(message.messageId, message.recipient, signal);
 				return this.resultFor(message.messageId, terminal);
 			}
 			if (message.expiresAt <= this.now()) {
-				const receipt = await this.mailbox.setReceipt(message.messageId, "expired", fingerprint);
-				await this.mailbox.removeHeld(message.messageId);
-				await this.mailbox.removeFromInbox(message.messageId, message.recipient);
+				const receipt = await this.mailbox.setReceipt(message.messageId, "expired", fingerprint, signal);
+				await this.mailbox.removeHeld(message.messageId, signal);
+				await this.mailbox.removeFromInbox(message.messageId, message.recipient, signal);
 				return this.resultFor(message.messageId, receipt);
 			}
 			if (await this.mailbox.getHeld(message.messageId)) {
-				const receipt = await this.mailbox.setReceipt(message.messageId, "held", fingerprint);
+				throwIfAborted(signal);
+				const receipt = await this.mailbox.setReceipt(message.messageId, "held", fingerprint, signal);
 				return this.resultFor(message.messageId, receipt);
 			}
 			if (this.policy() === "refuse") {
-				const receipt = await this.mailbox.setReceipt(message.messageId, "refused", fingerprint);
-				await this.mailbox.removeFromInbox(message.messageId, message.recipient);
+				throwIfAborted(signal);
+				const receipt = await this.mailbox.setReceipt(message.messageId, "refused", fingerprint, signal);
+				await this.mailbox.removeFromInbox(message.messageId, message.recipient, signal);
 				return this.resultFor(message.messageId, receipt);
 			}
 			if (this.policy() === "hold") {
-				if (!(await this.mailbox.holdMessage(message))) return this.resultFor(message.messageId, "unavailable");
-				const receipt = await this.mailbox.setReceipt(message.messageId, "held", fingerprint);
+				throwIfAborted(signal);
+				if (!(await this.mailbox.holdMessage(message, signal))) return this.resultFor(message.messageId, "unavailable");
+				throwIfAborted(signal);
+				const receipt = await this.mailbox.setReceipt(message.messageId, "held", fingerprint, signal);
+				throwIfAborted(signal);
 				await this.delivery.hold(message);
 				return this.resultFor(message.messageId, receipt);
 			}
+			throwIfAborted(signal);
 			await this.serialDeliver(message);
-			const receipt = await this.mailbox.setReceipt(message.messageId, "delivered", fingerprint);
-			await this.mailbox.removeFromInbox(message.messageId, message.recipient);
+			throwIfAborted(signal);
+			const receipt = await this.mailbox.setReceipt(message.messageId, "delivered", fingerprint, signal);
+			await this.mailbox.removeFromInbox(message.messageId, message.recipient, signal);
 			return this.resultFor(message.messageId, receipt);
 		} finally {
 			await release();
@@ -204,6 +217,13 @@ export class PeerMessagingService {
 	private async resultFor(messageId: string, fallback: PeerReceipt): Promise<PeerSendResult> {
 		return { messageId, receipt: (await this.mailbox.receiptState(messageId)) ?? fallback };
 	}
+}
+function throwIfAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	if (signal.reason instanceof Error) throw signal.reason;
+	const error = new Error("Peer message processing aborted");
+	error.name = "AbortError";
+	throw error;
 }
 function isTerminal(receipt: PeerReceipt | undefined): receipt is "delivered" | "refused" | "expired" {
 	return receipt === "delivered" || receipt === "refused" || receipt === "expired";

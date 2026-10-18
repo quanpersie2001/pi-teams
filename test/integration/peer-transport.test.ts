@@ -1,11 +1,12 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
-import { PeerMessagingService } from "../../extension-src/pi-teams/app/peer-messaging-service.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { type PeerMailbox, PeerMessagingService } from "../../extension-src/pi-teams/app/peer-messaging-service.js";
 import type { PeerAddress } from "../../extension-src/pi-teams/domain/peer.js";
 import type { PeerMessage } from "../../extension-src/pi-teams/domain/peer-message.js";
 import { LocalPeerHost } from "../../extension-src/pi-teams/pi/peer-host.js";
@@ -15,6 +16,7 @@ import {
 	sendPeerMessage,
 	startPeerIngress,
 } from "../../extension-src/pi-teams/pi/peer-transport.js";
+import { ensureWindowsPeerStorage } from "../../extension-src/pi-teams/pi/windows-peer-acl.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -75,8 +77,90 @@ async function advertiseSender(
 	});
 }
 describe("authenticated peer ingress across processes", () => {
+	it("aborts and joins in-flight mailbox work before ingress close completes on Unix and Windows", async () => {
+		const root = await mkdtemp(join(tmpdir(), "peer-abort-"));
+		roots.push(root);
+		const socketPath = process.platform === "win32" ? createPeerEndpointPath(root) : join(root, "abort.sock"),
+			sender = addr("abort-sender", "sender-run"),
+			receiver = addr("receiver", "abort-run");
+		if (process.platform === "win32") expect(await ensureWindowsPeerStorage(root)).toBe(true);
+		const keys = generateKeyPairSync("ed25519");
+		let entered!: () => void;
+		let aborted!: () => void;
+		let handlerEntered = false;
+		let handlerAborted = false;
+		let release!: () => void;
+		const enteredWait = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const abortedWait = new Promise<void>((resolve) => {
+			aborted = resolve;
+		});
+		const barrier = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let lateMutation = false;
+		const mailbox = {
+			async acceptIngress(_message: PeerMessage, signal?: AbortSignal) {
+				handlerEntered = true;
+				entered();
+				await new Promise<void>((resolve) =>
+					signal?.addEventListener(
+						"abort",
+						() => {
+							handlerAborted = true;
+							aborted();
+							resolve();
+						},
+						{ once: true },
+					),
+				);
+				await barrier;
+				if (signal?.aborted) throw signal.reason;
+				lateMutation = true;
+				return { status: "queued" as const };
+			},
+		} as unknown as PeerMailbox;
+		const ingress = await startPeerIngress({
+			address: receiver,
+			socketPath,
+			resolveSenderKey: async () => keys.publicKey,
+			mailbox,
+		});
+		let sendError: unknown;
+		const send = sendPeerMessage({
+			socketPath,
+			message: message(sender, receiver, "abort-work"),
+			privateKey: keys.privateKey,
+		}).catch((error) => {
+			sendError = error;
+		});
+		let closing: Promise<void> | undefined;
+		try {
+			await vi.waitFor(() => expect(handlerEntered || sendError).toBeTruthy(), { timeout: 5000 });
+			if (sendError) throw sendError;
+			await enteredWait;
+			let closed = false;
+			closing = ingress.close().then(() => {
+				closed = true;
+			});
+			await vi.waitFor(() => expect(handlerAborted).toBe(true), { timeout: 5000 });
+			await abortedWait;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(closed).toBe(false);
+			release();
+			await closing;
+			await send;
+			expect(lateMutation).toBe(false);
+		} finally {
+			release();
+			if (closing) await closing;
+			else await ingress.close();
+		}
+	}, 30_000);
+
 	it("accepts signed durable enqueue, rejects spoof/replay/stale runtime, and refuses closed targets", async () => {
-		if (process.platform === "win32") return; // Separate Windows named-pipe conditional test below; ACL verifier remains external.
+		if (process.platform === "win32") return; // Windows exercises the source helper in a conditional integration below.
 		const root = await mkdtemp(join(tmpdir(), "peer-ipc-"));
 		roots.push(root);
 		const socketPath = join(root, "runtime.sock"),
@@ -234,15 +318,115 @@ describe("authenticated peer ingress across processes", () => {
 		).rejects.toThrow();
 	}, 15_000);
 	it.skipIf(process.platform !== "win32")(
-		"uses signed named-pipe ingress in a child process (ACL verifier is a host prerequisite)",
+		"closes the Windows helper while accepted ingress waits on the real quota lock",
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), "peer-win-lock-close-"));
+			roots.push(root);
+			expect(await ensureWindowsPeerStorage(root)).toBe(true);
+			const socketPath = createPeerEndpointPath(root);
+			const sender = addr("lock-sender", "windows-run");
+			const receiver = addr("lock-receiver", "windows-run");
+			const keys = generateKeyPairSync("ed25519");
+			const mailbox = new LocalPeerHost(join(root, "data"));
+			await advertiseSender(
+				mailbox,
+				sender,
+				"project",
+				keys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+				socketPath,
+			);
+			const lockDir = join(root, "data", "locks");
+			await mkdir(lockDir, { recursive: true });
+			await writeFile(join(lockDir, "quota.lock"), JSON.stringify({ token: "test-barrier", pid: process.pid }));
+			let entered!: () => void;
+			let hasEntered = false;
+			const lockWait = new Promise<void>((resolve) => {
+				entered = () => {
+					hasEntered = true;
+					resolve();
+				};
+			});
+			type WithQuotaLock = <T>(fn: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
+			const internals = mailbox as unknown as { withQuotaLock: WithQuotaLock };
+			const original = internals.withQuotaLock.bind(mailbox);
+			internals.withQuotaLock = (fn, signal) => {
+				entered();
+				return original(fn, signal);
+			};
+			const ingress = await startPeerIngress({
+				address: receiver,
+				socketPath,
+				resolveSenderKey: createPeerKeyResolver(mailbox, "project"),
+				mailbox,
+			});
+			try {
+				const send = sendPeerMessage({
+					socketPath,
+					message: message(sender, receiver, "windows-lock-close"),
+					privateKey: keys.privateKey,
+				});
+				await vi.waitFor(() => expect(hasEntered).toBe(true), { timeout: 10_000 });
+				await lockWait;
+				await ingress.close();
+				await expect(send).rejects.toThrow();
+				expect(await mailbox.getBinding("windows-lock-close")).toBeUndefined();
+				expect(await mailbox.receiptState("windows-lock-close")).toBeUndefined();
+				expect(await mailbox.pending(receiver)).toEqual([]);
+			} finally {
+				await ingress.close();
+			}
+		},
+	);
+	it.skipIf(process.platform !== "win32")("closes the Windows helper with a partial pipe frame", async () => {
+		const root = await mkdtemp(join(tmpdir(), "peer-partial-frame-"));
+		roots.push(root);
+		expect(await ensureWindowsPeerStorage(root)).toBe(true);
+		const socketPath = createPeerEndpointPath(root);
+		const receiver = addr("partial-frame-receiver", "windows-run");
+		const keys = generateKeyPairSync("ed25519");
+		const ingress = await startPeerIngress({
+			address: receiver,
+			socketPath,
+			resolveSenderKey: async () => keys.publicKey,
+			mailbox: { acceptIngress: async () => ({ status: "queued" }) } as unknown as PeerMailbox,
+		});
+		const client = createConnection(socketPath);
+		try {
+			await new Promise<void>((resolve, reject) => {
+				client.once("connect", resolve);
+				client.once("error", reject);
+			});
+			client.write('{"partial":');
+			await ingress.close();
+		} finally {
+			client.destroy();
+		}
+	});
+	it.skipIf(process.platform !== "win32")("rejects unsafe storage descendants and reparse ancestors", async () => {
+		const root = await mkdtemp(join(tmpdir(), "peer-acl-"));
+		const outside = await mkdtemp(join(tmpdir(), "peer-acl-outside-"));
+		roots.push(root, outside);
+		const protectedFile = join(root, "protected-broad.txt");
+		await writeFile(protectedFile, "must not be silently accepted");
+		execFileSync("icacls.exe", [protectedFile, "/inheritance:r", "/grant:r", "*S-1-1-0:(F)"], {
+			timeout: 5000,
+			windowsHide: true,
+		});
+		expect(await ensureWindowsPeerStorage(root)).toBe(false);
+		await symlink(outside, join(root, "junction"), "junction");
+		expect(await ensureWindowsPeerStorage(join(root, "junction", "redirected"))).toBe(false);
+	});
+	it.skipIf(process.platform !== "win32")(
+		"provisions user-only storage and accepts signed ingress through CurrentUserOnly pipe helper",
 		async () => {
 			const root = await mkdtemp(join(tmpdir(), "peer-ipc-"));
 			roots.push(root);
+			expect(await ensureWindowsPeerStorage(root)).toBe(true);
 			const socketPath = createPeerEndpointPath(root),
 				receiver = addr("receiver", "windows-run"),
 				sender = addr("sender", "windows-run");
 			const keys = generateKeyPairSync("ed25519"),
-				mailbox = new LocalPeerHost(join(root, "data"), async () => true);
+				mailbox = new LocalPeerHost(join(root, "data"));
 			await advertiseSender(
 				mailbox,
 				sender,
@@ -255,7 +439,6 @@ describe("authenticated peer ingress across processes", () => {
 				socketPath,
 				resolveSenderKey: createPeerKeyResolver(mailbox, "project"),
 				mailbox,
-				verifyWindowsStorage: async () => true,
 			});
 			try {
 				const result = JSON.parse(
@@ -267,6 +450,27 @@ describe("authenticated peer ingress across processes", () => {
 				);
 				expect(result.receipt).toBe("queued");
 				expect((await mailbox.getBinding("win-message"))?.sender).toEqual(sender);
+				const deliveries: string[] = [];
+				const receiverService = new PeerMessagingService(
+					receiver,
+					mailbox,
+					{
+						deliver: async (m) => {
+							deliveries.push(m.messageId);
+						},
+						hold: async () => {},
+					},
+					() => "hold",
+				);
+				const [pending] = await mailbox.pending(receiver);
+				expect(pending).toBeDefined();
+				if (!pending) throw new Error("Windows ingress did not persist the message");
+				expect((await receiverService.receive(pending)).receipt).toBe("held");
+				expect((await receiverService.heldMessages()).map((m) => m.messageId)).toContain("win-message");
+				expect((await receiverService.approveHeld("win-message")).receipt).toBe("delivered");
+				expect(deliveries).toEqual(["win-message"]);
+				expect(await mailbox.receiptState("win-message")).toBe("delivered");
+				expect(await receiverService.heldMessages()).toHaveLength(0);
 			} finally {
 				await ingress.close();
 			}

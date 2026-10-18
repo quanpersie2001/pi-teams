@@ -39,11 +39,101 @@ describe("TeamService", () => {
 		original.recordAssignment({ name: "scout", type: "scout", runId: "run-1" });
 		original.setLifecycle("scout", "busy");
 		original.recordAssignment({ name: "retired", type: "scout", runId: "run-2" });
-		original.setLifecycle("retired", "retired");
-		const restarted = new TeamService({ sessionId: "sess-a", store });
-		const migrated = restarted.sessionStart();
-		expect(migrated.members).toMatchObject([{ name: "scout", lifecycle: "released" }]);
-		expect(migrated.archivedMembers).toMatchObject([{ name: "retired", lifecycle: "retired" }]);
+		const legacyRoster = original.current;
+		if (!legacyRoster) throw new Error("Team roster was not initialized.");
+		const legacyStore: TeamStore = {
+			teamDir: store.teamDir,
+			readRoster: () => ({
+				...legacyRoster,
+				members: legacyRoster.members.map((member) =>
+					member.name === "retired" ? ({ ...member, lifecycle: "retired" } as never) : member,
+				),
+			}),
+			writeRoster: (roster) => {
+				store.written.push(roster);
+			},
+		};
+		const migrated = new TeamService({ sessionId: "sess-a", store: legacyStore }).sessionStart();
+		expect(migrated.members).toMatchObject([
+			{ name: "scout", lifecycle: "released" },
+			{
+				name: "retired",
+				lifecycle: "released",
+				availability: "unavailable",
+				recoveryFence: "legacy-retired-unverified",
+			},
+		]);
+		expect(migrated.archivedMembers).toBeUndefined();
+		expect(JSON.stringify(migrated)).not.toContain('"lifecycle":"retired"');
+	});
+
+	it("keeps legacy retired identities fenced when cleanup ownership is unresolved", () => {
+		const base = {
+			version: 1 as const,
+			teamId: "sess-a",
+			sessionId: "sess-a",
+			createdAt: 1,
+			teamKey: "key",
+			members: [
+				{
+					name: "orphan",
+					type: "scout",
+					membershipId: "legacy-id",
+					lifecycle: "retired",
+					availability: "unavailable" as const,
+				},
+			],
+		};
+		let saved: unknown = base;
+		const store: TeamStore = {
+			teamDir: "/tmp/legacy",
+			readRoster: () => saved as ReturnType<TeamStore["readRoster"]>,
+			writeRoster: (next) => {
+				saved = next;
+			},
+		};
+		const roster = new TeamService({ sessionId: "sess-a", store }).sessionStart();
+		expect(roster.members).toMatchObject([
+			{
+				name: "orphan",
+				membershipId: "legacy-id",
+				lifecycle: "released",
+				availability: "unavailable",
+				recoveryFence: "legacy-retired-unverified",
+				recoveryError: expect.any(String),
+			},
+		]);
+		expect(roster.archivedMembers).toBeUndefined();
+		expect(new TeamService({ sessionId: "sess-a", store }).sessionStart().members[0]?.membershipId).toBe("legacy-id");
+	});
+
+	it("does not archive a retired legacy identity whose resource receipt cannot be correlated", () => {
+		let saved: unknown = {
+			version: 1,
+			teamId: "sess-a",
+			sessionId: "sess-a",
+			createdAt: 1,
+			teamKey: "key",
+			members: [{ name: "ambiguous", type: "scout", lifecycle: "retired" }],
+		};
+		const store: TeamStore = {
+			teamDir: "/tmp/legacy",
+			readRoster: () => saved as ReturnType<TeamStore["readRoster"]>,
+			writeRoster: (next) => {
+				saved = next;
+			},
+		};
+		const roster = new TeamService({ sessionId: "sess-a", store }).sessionStart();
+		expect(roster.members).toMatchObject([
+			{
+				name: "ambiguous",
+				lifecycle: "released",
+				availability: "unavailable",
+				recoveryFence: "legacy-retired-unverified",
+				recoveryError: expect.any(String),
+			},
+		]);
+		expect(roster.archivedMembers).toBeUndefined();
 	});
 
 	it("backfills legacy membership IDs once and preserves them across reload", () => {

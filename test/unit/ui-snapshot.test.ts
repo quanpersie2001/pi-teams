@@ -48,9 +48,9 @@ describe("buildAgentListView", () => {
 		const record = makeRun({ teammateName: "review-api", status: "completed" });
 		const view = buildAgentListView({
 			...managerOf([record]),
-			teammateStatus: () => ({ state: "retired" as const, availability: "available" as const }),
+			teammateStatus: () => ({ state: "released" as const, availability: "available" as const }),
 		});
-		expect(view.rows[0]).toMatchObject({ status: "completed", teammateState: "retired" });
+		expect(view.rows[0]).toMatchObject({ status: "completed", teammateState: "released" });
 		expect(view.rows[0]?.capabilities.resumable).toBe(false);
 	});
 

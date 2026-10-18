@@ -1,6 +1,6 @@
 import type { PeerAdvertisement } from "../domain/peer.js";
 export interface PeerRegistry {
-	list(projectId: string): Promise<PeerAdvertisement[]>;
+	list(projectId: string, signal?: AbortSignal): Promise<PeerAdvertisement[]>;
 	publish(ad: PeerAdvertisement): Promise<void>;
 	remove(address: PeerAdvertisement): Promise<void>;
 }

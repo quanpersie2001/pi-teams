@@ -1,215 +1,138 @@
 # Configuration
 
+This guide covers specialist definitions, invocation behavior, and operational settings. For runtime boundaries see [Architecture](./ARCHITECTURE.md); for public request fields and delivery see [Integration](./INTEGRATION.md); for user-facing basics see [README](../README.md).
+
 ## 1. Agent definitions
 
-A definition describes a specialist, not a Task. Define work requirements and context on session-scoped Tasks with `tasks_create`; agent definitions continue to describe execution roles.
+Definitions describe reusable specialist roles; Tasks describe work requirements. Bundled agents are documented in the [README](../README.md#bundled-specialists).
 
-Bundled specialists:
-
-| Name | Scope | Tools | Model / thinking pins |
-|---|---|---|---|
-| `general-purpose` | Bounded multi-step research and implementation | Default built-in toolset | None |
-| `explore` | Fast local file/symbol lookup, not review or open-ended auditing | `read`, `bash`, `grep`, `find`, `ls` | Model unpinned; `off` thinking |
-| `scout` | External docs/API research with retrieved source citations | `read`, `bash`, `grep`, `find`, `ls` | Model unpinned; `high` thinking |
-| `reviewer` | Independent correctness/security/regression review of recent named changes | `read`, `grep`, `find`, `ls` | Model unpinned; `max` thinking |
-
-`scout` uses stdout-only `curl` through `bash` to fetch supplied URLs and source links; it has no web-search or browser-rendering tool. `reviewer` cannot run Git or tests: provide the diff/base context and verification evidence in the handoff. Shell-enabled specialists are instructed not to mutate state, but are not sandboxed.
-
-`general-purpose` appends to the native coding prompt; the other bundled roles replace it. All defer background mode and turn limits to configuration unless overridden, and default to shared-workspace execution. Bundled agents do not pin models: model selection follows the invocation or captured parent, with normal admission/fallback. Custom definition model pins remain authoritative when usable.
-
-Use the packaged [`create-agent` skill](../skills/create-agent/SKILL.md) via `/skill:create-agent <requirements>` to author a supported definition. New/changed files load at `session_start`: start a new session or restart Pi, and confirm the canonical type appears before dispatching. The example below intentionally overrides the bundled `reviewer` when saved under that name:
+Create a Markdown file with YAML frontmatter in a supported agent directory:
 
 ```md
 ---
 name: reviewer
-description: Read-only code review specialist
+description: Read-only code reviewer
 tools: read, grep, find, ls
 thinking: low
 max_turns: 20
 prompt_mode: replace
-run_in_background: true
-isolation: off
 ---
-
-Inspect the repository without editing. Return concise findings with evidence.
+Review the requested changes. Return concise findings with evidence.
 ```
 
-Omit `model` to use the invocation model or captured parent model. To pin a model, use a reference from the native Pi model registry, preferably its canonical `provider/id`.
+Omit `model` to use the invocation or parent model; use canonical `provider/modelId` to pin one.
 
 ## 2. Frontmatter
 
-| Field | Contract |
+| Field | Default / meaning |
 |---|---|
-| `name` | Specialist dispatch identity; omitted/empty uses the filename stem. `:` is reserved. |
-| `description` | Model/UI description; defaults to the name. |
-| `tools` | Built-in allowlist, CSV or array. Omitted uses the default toolset; empty/`none` means no built-ins; `*`/`all` expands built-ins. |
-| `model` | Preferred model pin/fuzzy reference; omitted leaves model selection to invocation/parent. |
-| `thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; actual availability depends on the native model. |
-| `max_turns` | Nonnegative integer. Explicit `0` pins unlimited; omitted defers to invocation, then `defaultMaxTurns`. |
-| `timeout` | Optional run budget in seconds: a positive whole safe integer that bounds the entire run. Omitted defers to settings unless the invocation overrides (invocation > definition > settings). Malformed values fail the definition load, not an unlimited fallback. |
-| `idle_timeout` | Optional idle budget in seconds: a positive whole safe integer measured without child output. Same precedence and load-failure behavior as `timeout`. `idle-timeout` is accepted as a frontmatter alias; specifying both spellings fails the load. |
+| `name` | Filename stem; dispatch identity. `:` is reserved. |
+| `description` | Name if omitted; shown to model/UI. |
+| `tools` | Default built-in toolset if omitted; CSV or array. Empty/`none` disables built-ins; `*`/`all` enables all built-ins. |
+| `model` | Unpinned if omitted. A definition pin is preferred but can fall back if unavailable. |
+| `thinking` | Optional: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; model availability varies. |
+| `max_turns` | Omitted: invocation value, then `defaultMaxTurns`; explicit `0`: unlimited. Nonnegative integer. |
+| `timeout` | Optional positive whole seconds; wall-clock run limit. |
+| `idle_timeout` | Optional positive whole seconds without child output. `idle-timeout` is an alias; do not specify both. |
 | `prompt_mode` | `replace` (default) or `append`. |
-| `run_in_background` | Default mode for this specialist; omitted uses `backgroundByDefault`. An explicit invocation mode wins. |
-| `isolation` | `off` (default) or `worktree`; the latter also requires the master switch. |
-| `enabled` | Defaults to `true`; `false` excludes the specialist from dispatch/discovery. |
+| `run_in_background` | Omitted: `backgroundByDefault`; explicit invocation mode wins. |
+| `isolation` | `off` (default) or `worktree`; requires `worktreeIsolation: true`. |
+| `enabled` | `true`; `false` removes the definition from dispatch/discovery. |
 
-Built-ins are `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Children also receive scoped messaging tools, but never parent orchestration tools. The allowlist is not an OS security sandbox.
-
-Not implemented: `memory`, `allowed_subagents`, `schedule`, join modes.
+Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Children also get scoped messaging tools, not parent orchestration tools; allowlists are not OS sandboxes. Unsupported fields include `memory`, `allowed_subagents`, `schedule`, and join modes.
 
 ## 3. Agent source precedence
 
+Definitions load in ascending precedence; later files replace a same-named definition:
+
 ```text
 bundled defaults
-    < ~/.pi/agent/agents/*.md
-    < <configCwd>/.agents/agents/*.md
-    < <configCwd>/.pi/agents/*.md
+< ~/.pi/agent/agents/*.md
+< <configCwd>/.agents/agents/*.md
+< <configCwd>/.pi/agents/*.md
 ```
 
-Later sources override the same specialist name. The global path follows Pi's agent directory if it is overridden. `configCwd` is the original parent working directory, not an isolated execution checkout. Reloading definitions does not mutate an already admitted run's resolved snapshot.
+The global location follows Pi's configured agent directory. `configCwd` is the original parent working directory (not an isolated worktree). Existing admitted runs retain their resolved definition after reload. New or changed files load at `session_start`.
 
 ## 4. Invocation precedence
 
-For model, thinking, tools and turn limit:
+For model, thinking, tools, and turn limit, a definition pin wins over invocation values; otherwise invocation values win over applicable settings/defaults. Background mode is separate: invocation mode wins over the definition default.
+
+An invocation model (such as `Agent`'s `model`) must resolve uniquely when `strictModelAdmission` is enabled (default): ambiguous or unregistered references fail admission. This strict rule applies to invocation requests, **not** definition model pins. Pins and models without usable authentication may fall back to the caller/parent model or authenticated candidates. Use `provider/modelId` to avoid ambiguous bare names.
+
+Time budgets use the opposite precedence:
 
 ```text
-pinned specialist definition
-    > invocation override
-    > applicable operational setting
-    > built-in default
+invocation timeout / idle_timeout > definition frontmatter > defaultTimeout / defaultIdleTimeout
 ```
 
-Public `Agent`/spawn RPC expose only their documented inputs; internal invocation fields are not automatically public options. Background mode is separate: explicit invocation mode overrides the specialist default. Description can also be supplied per invocation.
+Settings budgets default to `0` (unlimited); `0` is valid only for settings. Invocation and frontmatter limits must be positive whole seconds. `timeout` bounds the run; `idle_timeout` measures time without child output. See [Integration](./INTEGRATION.md) for available invocation fields and [Architecture](./ARCHITECTURE.md) for lifecycle details.
 
-Model admission first tries the resolved primary. If it cannot resolve a native model/auth, it tries the caller model ignored by a pin, captured parent model, then authenticated native candidates in stable `provider/id` order — unless the primary is a model requested explicitly in the invocation (`Agent`'s `model`) and `strictModelAdmission` is on (default), in which case an ambiguous request fails admission listing the candidate models and an unregistered request fails admission naming the reference, instead of falling back. A definition/agent-file pin is not subject to strict admission and keeps this fallback. With neither a pin nor invocation model, the parent model is primary. No usable model rejects before run ID, queue slot, worktree or child/pane creation.
-
-Pass model references canonically as `provider/modelId` — to `Agent`, in a definition `model` pin, or wherever a model is requested. A bare name is accepted only while it resolves to exactly one registered model: `glm-5.3-flash` exists in five providers (`opencode`, `opencode-go`, `radius`, `zai`, `zai-coding-cn`), so requesting it is ambiguous, whereas `zai/glm-5.3-flash` resolves exactly. Use the read-only `list_models` tool to query the current Pi session's `/models` list before spawning (it does not list the entire registered catalog). With `strictModelAdmission` on (default), an ambiguous model passed in the invocation (`Agent`'s `model`) fails admission listing the candidate models, and an unregistered one fails admission with a distinct message naming the reference, instead of falling back; a definition/agent-file pin is unaffected and still falls back with a recorded note, as does a model that resolves but has no usable authentication. See [Operational settings](#5-operational-settings).
-
-Admission uses the native child's `ModelRuntime`, `models.json` and `auth.json` in Pi's agent directory. Catalog refresh is offline; native auth may refresh OAuth. This does **not** check provider availability, remote key acceptance, billing or quota. Launch rechecks after queueing and the child guards dispatch. `model` and optional `modelFallback` in replies/status/lifecycle/history describe the actual selection.
-
-Isolation is configuration-only. Enable `worktreeIsolation` and set the specialist's `isolation: worktree`; with the master switch off, it runs in the shared workspace. Neither `Agent` nor spawn RPC accepts an isolation override. `Agent` does not accept `inherit_context`; supply needed context in `prompt`.
-
-`Agent(name: "review-api", color: "#e879f9")` creates a current-team identity. New model-facing `Agent` spawns require both fields; `resume` inherits the original identity. RPC integrations may still launch anonymous runs. Color accepts `#RGB` or `#RRGGBB`, normalizes to lowercase six-digit hex, and belongs to the teammate instance, not specialist frontmatter. A color requires a name. The roster freezes the creation-time color; later `Agent` assignments must pass the same color, and a different color is rejected before model admission or execution allocation. Cold continuation takes identity only from the current team's roster, never automatically from the old team.
-
-### Time budgets
-
-`timeout` and `idle_timeout` (Agent parameters; frontmatter uses `timeout`/`idle_timeout` with `idle-timeout` accepted as an alias, but never both spellings) are optional hard limits in whole seconds. Precedence is deliberately the reverse of model/turn pinning:
-
-```text
-invocation override (timeout, idle_timeout)
-    > specialist definition frontmatter
-    > defaultTimeout / defaultIdleTimeout settings
-    > unlimited (off)
-```
-
-Semantics:
-
-- `timeout` bounds the entire run on wall clock; `idle_timeout` bounds the span without child output. Both timers start immediately before backend launch (or resume), not at admission, queueing or worktree preparation. If both expire in the same check, the wall-clock `timeout` wins.
-- Only arrivals of the child's own output reset the idle clock: a new assistant message (or a newer revision of one currently streaming) and completed tool results. Partial tool updates, tool-call starts, empty assistant upserts, steering, user/inbox messages, state refreshes and usage updates do not. The clock is re-derived from transcript item timestamps after launch or reconnect, so long-running tools need a larger `idle_timeout` (or none).
-- Expiry first triggers the cooperative abort with a 2-second grace window for the child to settle on the ordinary path. Past that window, enforcement force-terminates the owned child process group through a verified-identity backend path: a graceful signal, then a forced kill if the owned group survives. Termination is verified — the run never settles as stopped until the process group's exit is proven. A successful enforcement settles the run exactly like an ordinary stop, keeping `budgetExhausted`/`budgetSeconds` and the partial session/transcript. Refused enforcement (foreign/quarantined child identity, multiplexer transports without an owned PID group, unverifiable termination) is a visible failure: the run stays active with a recovery error and retained registry receipt, never a fabricated outcome. Ordinary user stop keeps abort-only semantics. There are no soft warnings or wrap-up grace for budgets (unlike turn limits).
-- On expiry the parent-facing result identifies the exhausted budget (`timeout` or `idle_timeout`) and its limit in seconds, and warns that partial work may be incomplete. Durable history preserves the same record.
-- Effective budgets and activity timestamps persist with registry/history metadata. Explicit cold continuation re-applies the source limits on fresh clocks, including unlimited; invocation overrides win per field. Transient authenticated connection recovery within the owning session retains its clocks. Startup never restores live child clocks or processes.
+Isolation is configuration-only: enable `worktreeIsolation` and set definition `isolation: worktree`. There is no per-invocation isolation override. Worktrees preserve changes and are not automatically integrated; inspect and review before release. Agent sessions use native history, but do not inherit the parent's conversation context automatically—include necessary context in the prompt. See [Integration](./INTEGRATION.md) for named continuation/context controls.
 
 ## 5. Operational settings
 
-```text
-~/.pi/agent/teams.json       global defaults (Pi agent directory)
-<configCwd>/.pi/teams.json  project overrides
-```
+Global settings: `~/.pi/agent/teams.json` (Pi agent directory). Project settings: `<configCwd>/.pi/teams.json`. Files are merged per key, project over global; nested `tasks` and `peers` keys also merge individually. Missing/unreadable files are ignored; invalid JSON warns and is ignored. The merged result is sanitized, with unsupported or mistyped values falling back to defaults. These files are read-only to the runtime.
 
-Defaults:
+Starter configuration:
 
 ```json
 {
-  "tasks": { "autoCascade": false, "reminders": false },
   "maxConcurrent": 4,
   "defaultMaxTurns": 30,
   "defaultTimeout": 0,
-  "defaultIdleTimeout": 0,
-  "graceTurns": 3,
   "backgroundByDefault": true,
   "worktreeIsolation": false,
-  "rememberAgents": true,
-  "strictAgentFiles": false,
-  "strictModelAdmission": true,
-  "fallbackSubagent": "none",
-  "agentPanel": true,
-  "agentInlinePanel": true,
   "backend": "auto"
 }
 ```
 
-| Setting | Behavior |
-|---|---|
-| `tasks.autoCascade` | Default `false`. Enables microtask-deferred cascade after accepted task completion, for pending dependents with an explicit `executionPlan` and no remaining blockers. Only dependents whose prerequisites include a newly completed task ID/code are considered; prior completions are not replayed at startup. Execution uses normal TaskExecutionService admission and launches each planned task at most once per service. Only typed reservation-lock conflicts get bounded async retries (100/250/500 ms) before launch; spawn failures are not retried. Teardown cancels queued cascade/retry work before freezing task-execution admissions and shutting down children. |
-| `tasks.reminders` | Default `false`. Enables a hidden transient lead-context summary every four lead turns; any `tasks_*` tool result resets the cadence. Relevant tasks are unassigned/lead-assigned pending, lead-owned in-progress, or review-requested in-review. Summaries are limited to 10 items / 1,700 serialized JSON characters; no reminder is added when none are relevant. Children do not receive reminders. |
-| `maxConcurrent` | One active-run capacity for foreground and background; excess runs queue. Floored/clamped to 1–1024. |
-| `defaultMaxTurns` | Default turn limit when not pinned/requested; `0` means unlimited. Floored/clamped to >=0. |
-| `defaultTimeout` | Default whole-run budget in seconds for runs without an invocation/definition budget; `0` means unlimited (default). Negative values clamp to `0`; positive non-integers are invalid and fall back to `0`; values above 2147483 clamp to that cap. |
-| `defaultIdleTimeout` | Default idle budget in seconds under the same sanitization rules as `defaultTimeout`. |
-| `graceTurns` | Wrap-up turns after soft-limit steering before hard abort; floored/clamped to >=0. A natural final answer is completion even at the limit. |
-| `backgroundByDefault` | Default mode for definitions that omit `run_in_background`; foreground still uses an independent child. |
-| `worktreeIsolation` | Enables managed-worktree capability; default shared workspace. |
-| `rememberAgents` | Preserves settled run/session history for explicit cold continuation. It never re-adopts live children. Startup archives stale owned active rows as stopped with recovery metadata; foreign-owner rows remain untouched. |
-| `strictAgentFiles` | Strict mode fails loading on malformed files or validated invalid fields, naming the source path. Lenient mode skips unreadable/unparseable files, but corrects invalid fields with warnings while retaining the specialist. |
-| `strictModelAdmission` | Default `true`. A model passed explicitly in the spawn invocation (`Agent`'s `model`) must resolve to exactly one registered native model; an ambiguous invocation reference fails admission with an error listing the sorted candidate models, and an unregistered one fails admission with a distinct message naming the reference and no candidates, instead of falling back to the parent's model. A model pinned in a definition/agent-file is unaffected: it keeps its documented fallback to the caller/definition/parent model with a recorded note. Auth-based fallback is unaffected too: a model that resolves but has no usable authentication still falls back with a recorded note. With `false`, the old behavior is restored for the invocation `model` as well: fall back to the caller/definition/parent model and record `Model fallback: ...` in the agent result. |
-| `fallbackSubagent` | Specialist name to use when requested type is unknown/disabled/ambiguous; `none` rejects. Empty/mistyped values default to `none`. |
-| `agentPanel` | Legacy master switch for all Team UI: inline Agents, inline Tasks, Hub and remote child focus. Setting it to `false` disables broader UI; it is not an inline-only switch. No effect on lifecycle or automatic cleanup. |
-| `agentInlinePanel` | Default `true`. Enables only the inline Agents panel at session startup; Tasks inline rendering remains independently available. `/agents panel [show|hide|toggle]` overrides Agents visibility for the current session only (no argument toggles); it does not persist to `teams.json`. Configure this key to change the startup default. |
-| `backend` | Presentation mode: `auto` (default) detects HerdR → tmux, otherwise no viewer; `headless` never attaches a multiplexer. Execution always uses independent native SDK workers. Explicit `herdr`/`tmux` forcing is env-only. `/teams-backend [auto\|headless]` switches selection for future children in the current session. |
+| Setting | Default | Meaning |
+|---|---:|---|
+| `tasks.autoCascade` | `false` | Automatically launch eligible planned dependent Tasks after completion. |
+| `tasks.reminders` | `false` | Add periodic task summaries to lead context. |
+| `peers.enabled` | `false` | Opt in to peer messaging. Windows peer support requires `pwsh` (PowerShell 7+) for the named-pipe helper, a protected per-user ACL, and .NET `CurrentUserOnly`; unsupported hosts fail closed and native Windows verification remains pending. |
+| `peers.scope` | `project` | `project` or `all`; project setting may narrow scope but cannot broaden it beyond global scope. |
+| `peers.policy` | `hold` | Receiver approval policy: `hold`, `accept`, or `refuse`. Project settings cannot override global/user policy. Held messages require user approval; queued receipt is not proof of acceptance, and missing acknowledgement is ambiguous. |
+| `maxConcurrent` | `4` | Shared foreground/background active-run capacity; clamped to 1–1024. |
+| `defaultMaxTurns` | `30` | Default turn limit; `0` means unlimited. |
+| `defaultTimeout` | `0` | Default wall-clock seconds; `0` means unlimited. |
+| `defaultIdleTimeout` | `0` | Default idle seconds; `0` means unlimited. |
+| `graceTurns` | `3` | Turns allowed for wrap-up after turn-limit steering. |
+| `backgroundByDefault` | `true` | Default for definitions omitting `run_in_background`. |
+| `worktreeIsolation` | `false` | Enables worktree isolation for definitions that request it. |
+| `rememberAgents` | `true` | Retain settled history for explicit continuation; does not restore live children. |
+| `strictAgentFiles` | `false` | Strictly fail on malformed/invalid definition files instead of warning and correcting/skipping. |
+| `strictModelAdmission` | `true` | Enforce unique registration for invocation model requests; definition pins still may fall back. |
+| `fallbackSubagent` | `none` | Specialist used for unknown/disabled/ambiguous requests; `none` rejects. |
+| `agentPanel` | `true` | Master switch for Team UI; `false` disables broader UI. |
+| `agentInlinePanel` | `true` | Startup default for inline Agents panel; does not persist session `/agents panel` changes. |
+| `backend` | `auto` | `auto` detects a viewer; `headless` never attaches a multiplexer. |
 
-Both settings files are read at each `session_start`, merged per key (`project > global`), then sanitized. Missing/unreadable files contribute nothing; corrupt JSON warns and contributes nothing. Unknown keys are dropped and mistyped values use built-in defaults. Project values are not sanitized independently before overriding global values. The runtime only reads these files; operators own edits.
+Numeric settings are clamped where appropriate; default time budgets accept nonnegative whole seconds, with zero unlimited. See [README](../README.md#everyday-controls) for backend overview.
 
 ## 6. Backend selection
 
-Selection precedence for new launches:
+For new children, selection precedence is:
 
 ```text
-/teams-backend <mode>   (runtime, current session; auto | headless)
-    > PI_TEAMS_BACKEND   (env; auto | herdr | tmux | headless)
-    > settings "backend"    (project > global; auto | headless)
-    > auto
+/teams-backend (current session) > PI_TEAMS_BACKEND > settings backend > auto
 ```
 
-`auto` selects the first available presentation launcher — HerdR, then tmux, otherwise no pane. On native Windows no multiplexer is available in this increment, so `auto` always resolves to headless execution without a viewer. Every assignment executes through native SDK in its own independent child, never the parent. Multiplexer-configured workers host Pi's actual interactive UI; explicit headless workers remain SDK-only. `/teams-backend` without arguments reports the current mode, auto detection and any env override; switching affects future children and resets at the next session start. Existing children keep their selected presentation launcher. Idle settlement closes the pane while retaining named execution/context/style; a new assignment reopens it. Above six live runtime-owned children (including idle teammates), every pane closes; returning to at most six reattaches only running assignments to the same execution and native UI without replaying input. A forced unavailable launcher fails explicitly.
-
-Requires Node >=22.19 and Pi >=1.0.4 <1.1.0. The control transport is an owner-only Unix domain socket on Unix; on native Windows it is a named pipe (`\\.\pipe\pi-teams-<childId>\control`), with headless children managed through a `taskkill /T` process-tree lifecycle and identified by CIM CreationDate plus an argv `--launch-owner` token, exercised by the windows-latest CI job. HerdR/tmux viewers are not available on Windows in this increment. Pi SDK/TUI packages and TypeBox are host-provided peers; standalone children resolve them through a Node module hook from the running Pi installation. Interactive presentation uses the installed SDK's public `InteractiveMode` APIs and the packaged raw terminal client, not global `pi` from PATH or a second Pi CLI session. Headless supports the same parent Hub/focus without terminal attachment.
-
-Optional `pi-style`: native children reuse its actual loaded Main source (installed/configured packages or temporary `-e` sources), not a hardcoded installation path. Other Main extensions are excluded. Standalone backend callers without a Main source snapshot resolve enabled configured `pi-style` resources locally; missing packages are not installed. SDK-only/headless children stay unstyled. Child tool pins remain authoritative even when `pi-style` normally enables its read-only tools.
+The command and setting accept `auto` or `headless`; the environment variable additionally accepts `herdr` or `tmux` to force a viewer. `auto` selects HerdR, then tmux, then headless with no viewer. Native Windows runs headless (no multiplexer viewer). Peer messaging is separately opt-in and fails closed unless `pwsh` (PowerShell 7+) and .NET security prerequisites are available; native Windows verification remains pending. Every assignment executes in an independent native SDK worker, regardless of presentation. Session command changes affect future children; existing children retain their selected mode. See [Architecture](./ARCHITECTURE.md#9-launcher-selection) for implementation and platform details.
 
 ## 7. Persistence artifacts
 
-Artifacts use the nearest `.pi/` from the original configuration cwd (or its `.pi/` when none exists), not the execution worktree:
+Persistent registry, history, and child session artifacts live under `.pi/teams/` nearest the original configuration working directory, not the execution worktree. Settled history may be explicitly continued using its native session; startup does not re-adopt live child processes. See [Integration](./INTEGRATION.md) for messaging and [Architecture](./ARCHITECTURE.md#10-durable-registry-and-recovery) for recovery and cleanup invariants.
 
-```text
-.pi/teams/registry.json
-.pi/teams/history.json
-.pi/teams/sessions/<child-id>/bootstrap.json
-.pi/teams/sessions/<child-id>/*.jsonl
-```
-
-Child ID differs from run ID. Cold continuation validates the saved bootstrap, prefers its saved model and opens the original native JSONL in a new child/run. Missing/corrupt bootstrap is an error, not a fallback to new context. Only a materialized JSONL is advertised as resumable history.
-
-After durable finalization, anonymous settlement closes verified execution/viewer resources; named teammates retain idle execution until explicit release or session teardown. Pending/failed cleanup must resolve before cold resume. Bootstrap/registry contain authentication metadata, including separate optional viewer receipts: private directories use `0700`, control/bootstrap/registry files use `0600`, and sockets use short private OS-temp paths. On Windows the control endpoints are named pipes with unguessable per-child UUID names and no filesystem artifact: security there relies on the pipe-name UUID, childId/token authentication and NTFS ACL inheritance from the creating user's directories — POSIX mode bits are no-ops on Windows (chmod only toggles the read-only attribute). Live state/transcript/completion use RPC/events, never JSONL polling; JSONL supplies closed history/recovery.
-
-Worktree completion preserves commits/dirty changes and retains the checkout. Review, test and manually cherry-pick before `/agents release <id> --worktree`. Release refuses dirty/unpreserved changes and retains preserved branches. A released/missing worktree is not silently recreated by resume.
-
-Inbox and consumed-message history are bounded parent-process memory, not durable registry data. Closed-child messages wait for cold continuation; they do not launch children. Reload/restart loses inbox state. Focus `/model` and `/thinking` alter only the live child, not Main's settings.
+Worktree isolation retains the checkout and its changes. Review, test, and manually integrate them before releasing the worktree; do not assume automatic merge or cleanup. A released/missing worktree is not recreated on continuation.
 
 ## 8. Owner and delivery request
 
-An extension can explicitly assign ownership and notification routing:
+Extensions may explicitly assign ownership and delivery routing:
 
 ```ts
-{
-  owner: { kind: "extension", id: "pi-tasks", ref: "task-123" },
-  delivery: "event"
-}
+{ owner: { kind: "extension", id: "pi-tasks", ref: "task-123" }, delivery: "event" }
 ```
 
-Direct model-facing `Agent` calls receive conversation ownership and `delivery: "conversation"`. See [Integration](./INTEGRATION.md) for request fields and delivery policies, and [Architecture](./ARCHITECTURE.md) for cleanup/security invariants.
-
-
-## Independent peer messaging (implementation status)
-
-Peer settings are `peers.enabled` (default `false`), `peers.scope` (default `project`), and receiver-controlled `peers.policy` (default `hold`). The Pi host registers peer tools and inbound approval controls when enabled. Peer messages are untrusted input, cannot grant permissions, and do not confer lifecycle or task ownership. A `queued` receipt means durable enqueue only; it is not proof of injection or model comprehension. An automated offline-provider smoke covers signed delivery between two independent Pi SDK sessions, held privacy, approval and correlated SDK acceptance; it does not verify production loader registration, interactive TUI behavior, or busy SDK steering. Missing SDK acceptance is ambiguous and preserves pending mail, so retry can duplicate delivery. Windows remains disabled/fail-closed until a real per-user storage ACL verifier is implemented.
+Direct model-facing `Agent` calls use conversation ownership and delivery by default. See [Integration](./INTEGRATION.md) for request fields and delivery policies.

@@ -21,7 +21,7 @@ export interface TeamMember {
 	/** Latest admitted run carrying this teammate name. */
 	lastRunId?: string;
 	/** Lifecycle state; absent in older persisted rosters means idle/released by runtime. */
-	lifecycle?: "idle" | "busy" | "released" | "retired";
+	lifecycle?: "idle" | "busy" | "released";
 	availability?: "available" | "unavailable";
 	/** Durable in-progress shutdown receipt; live membership remains fenced until removed. */
 	operation?: {
@@ -30,6 +30,8 @@ export interface TeamMember {
 		phase: "requested" | "settled" | "tasks_reconciled" | "resources_disposed";
 	};
 	recoveryError?: string;
+	/** Durable fence when legacy/registry ownership cannot yet be verified. */
+	recoveryFence?: "legacy-retired-unverified" | "registry-receipt-unresolved";
 	firstAssignedAt?: number;
 	lastAssignedAt?: number;
 }

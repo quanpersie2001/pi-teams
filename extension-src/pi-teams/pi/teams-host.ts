@@ -37,6 +37,12 @@ function isTeamMember(value: unknown): value is TeamMember {
 	)
 		return false;
 	if (!isOptionalString(value, "recoveryError")) return false;
+	if (
+		value.recoveryFence !== undefined &&
+		value.recoveryFence !== "legacy-retired-unverified" &&
+		value.recoveryFence !== "registry-receipt-unresolved"
+	)
+		return false;
 	if (!isOptionalFiniteNumber(value, "firstAssignedAt") || !isOptionalFiniteNumber(value, "lastAssignedAt"))
 		return false;
 	if (value.lifecycle !== undefined && !["idle", "busy", "released", "retired"].includes(String(value.lifecycle)))
