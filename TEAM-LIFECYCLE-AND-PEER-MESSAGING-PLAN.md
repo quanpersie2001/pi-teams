@@ -1,6 +1,6 @@
 # Comprehensive implementation plan: teammate shutdown và cross-session messaging
 
-> **Status (final local audit):** lifecycle and peer implementation changes are present in the current working tree; this is not a committed release. Local `npm run check` passed after implementation branches; Windows peer native verification is still pending because this host is macOS. See §16 for latest counts and exact evidence.
+> **Status:** lifecycle and peer implementation are present at commit `cf75b1cfa0b3395aa43b9ddb8ae9abfe8028b924`. All three CI jobs passed in [run 39117028479](https://github.com/quanpersie2001/pi-teams/actions/runs/39117028479); this includes native Windows peer and lifecycle backend evidence. See §16 for latest counts and exact evidence.
 >
 > | Phase | Status | Evidence / remaining limitation |
 > | --- | --- | --- |
@@ -8,13 +8,13 @@
 > | 1 Identity | DONE | Membership fencing and conservative legacy migration (`app-lifecycle-migration.test.ts`, lifecycle ADR); ambiguous old resources remain fenced for manual recovery. |
 > | 2 Shutdown | DONE | Cleanup/reconciliation and native lifecycle coverage (`native-shutdown-manager-smoke.test.ts`, `agent-manager.test.ts`). |
 > | 3 Public lifecycle | DONE | Production registration, command/tools and rendered TUI exercised by automated tests; no human manual claim. |
-> | 4 Discovery | IMPLEMENTED; WINDOWS PROOF PENDING | Unix tests pass; Windows ACL + pwsh/CurrentUserOnly implementation and conditional tests exist; native Windows CI handshake not yet run. |
+> | 4 Discovery | DONE (AUTOMATED WINDOWS CI) | Windows ACL/pipe handshake and packaged helper exercised in CI; evidence and limits in §16. |
 > | 5 Messaging | DONE (AUTOMATED EVIDENCE) | Production loader, SDK busy safe point, independent sessions and rendered TUI tested. Delivery is at-least-once; missing acknowledgement may be ambiguous and retry can duplicate. |
-> | 6 Integration/release | IMPLEMENTED; WINDOWS PROOF PENDING | Full local package checks pass; platform proof requires authorized CI run. No green run for current unpushed workflow is claimed. |
+> | 6 Integration/release | DONE (AUTOMATED CI) | Full Linux check and Windows native/package jobs passed in CI; evidence and remaining scope limits in §16. |
 >
-> **Checklist tally:** calculated directly from current Phase 0–6 and DoD checkboxes: see §16. Unchecked items are genuine evidence gaps, not implied implementation failures.
+> **Checklist tally:** 57/57 Phase 0–6 and DoD items are checked (verified in §16). Evidence boundaries remain explicit below; checked documentation criteria do not imply human manual or broad SDK-range verification.
 >
-> **Remaining external proof:** native Windows peer ACL/pipe handshake requires Windows CI after authorized push. SDK behavior was verified against installed Pi 1.0.4; the declared range is not comprehensively proven. Automated actual-TUI PTY coverage is not human manual verification. Acknowledgement timeout and possible duplicate retry are an explicit at-least-once limitation, not an exactly-once requirement.
+> **Evidence limits:** Windows CI verifies the native peer ACL/pipe handshake and lifecycle backend, but does not prove every SDK version or human manual TUI behavior. SDK behavior was verified against installed Pi 1.0.4; the declared range is not comprehensively proven. Automated actual-TUI PTY coverage is not human manual verification. Acknowledgement timeout and possible duplicate retry are an explicit at-least-once limitation, not an exactly-once requirement.
 >
 > Checklist below preserves the normative design contract and identifies implementation evidence separately.
 > Ngôn ngữ normative: **MUST** là invariant bắt buộc; **SHOULD** là mặc định có thể điều chỉnh nếu ghi lại lý do.
@@ -420,7 +420,7 @@ Guidance MUST nói rõ:
 - [x] Durable enqueue, truthful receipts, retry/expiry và no-revive rule. — immutable fingerprint binding, durable receipts/TTL/quota/claims in `pi/peer-host.ts`; peer host/transport tests. Delivery is at-least-once.
 - [x] Implement inbound accept/hold/refuse and held-message approval controls — `pi/peer-host.ts`, `pi/peer-tools.ts`; two-session smoke `test/integration/peer-sdk-native-smoke.test.ts`.
 - [x] Verify held-message UI approval flow — automated actual-TUI smoke renders held approval/refusal; human manual verification remains pending (`test/integration/actual-tui-peer-inbox.test.ts`).
-- [x] SDK safe delivery cho busy/idle; không overlap turns hoặc interrupt tool. — production loader registration and real SDK busy safe-point exercised (`test/integration/native-loader-registration.test.ts`, `peer-sdk-busy-smoke.test.ts`); Windows platform proof remains pending.
+- [x] SDK safe delivery cho busy/idle; không overlap turns hoặc interrupt tool. — production loader registration and real SDK busy safe-point exercised (`test/integration/native-loader-registration.test.ts`, `peer-sdk-busy-smoke.test.ts`); native Windows backend evidence is separately covered by CI, not SDK-range proof.
 - [x] Register `peer_sessions`, `peer_send`, `peer_activity`. — `pi/peer-tools.ts`, `pi/index.ts`; `test/unit/tool-catalog.test.ts`.
 - [x] Thêm agent guidance về relevance, security và tránh ping-pong. — `skills/team-lead/SKILL.md` lines 26–30 covers lifecycle/cold resume, blockers/shared contracts/handoff, scoped messages, no repeated ping/broadcast/secrets.
 
@@ -429,10 +429,10 @@ Guidance MUST nói rõ:
 ### Phase 6 — Integration, documentation và release
 
 - [x] End-to-end kết hợp teammate shutdown, name reuse và peer messaging. — combined native child lifecycle and independent peer SDK flow (`test/integration/lifecycle-peer-e2e.test.ts`).
-- [x] Native process tests and actual TUI smoke — macOS native child/peer and rendered TUI hold/approval/refusal/busy-child shutdown automated evidence (`test/integration/actual-tui-peer-inbox.test.ts`). Windows native peer proof remains pending.
+- [x] Native process tests and actual TUI smoke — macOS native child/peer and rendered TUI hold/approval/refusal/busy-child shutdown automated evidence (`test/integration/actual-tui-peer-inbox.test.ts`); native Windows peer/lifecycle evidence is in CI run 39117028479.
 - [x] Update configuration reference, architecture/glossary/integration docs và skill. — facts reconciled in `docs/CONFIGURATION.md`, `docs/ARCHITECTURE.md`, `docs/INTEGRATION.md`, `docs/GLOSSARY.md`, `skills/team-lead/SKILL.md`, and ADRs.
 - [x] Check package distribution đủ host/child code cần thiết; không edit generated dist bằng tay. — recorded package smoke in `npm run check`; generated dist not edited manually.
-- [x] Chạy full checks, ghi rõ automated/native/manual evidence và platform chưa verify. — latest local `npm run check`: 834 passed, 9 skipped (80 files passed, 1 skipped), package smoke passed; Windows peer native proof pending.
+- [x] Chạy full checks, ghi rõ automated/native/manual evidence và platform chưa verify. — CI run 39117028479: Linux 836 passed/17 skipped (80 files passed/2 skipped); Windows native integration 43 passed/2 skipped (7 files).
 
 **Exit:** đạt toàn bộ acceptance criteria ở mục 13.
 
@@ -529,8 +529,8 @@ Native smoke phải có hai independent Pi sessions, không chỉ fake SDK host.
 
 ### Delivery quality
 
-- [x] Full automated checks pass; baseline regressions được ghi rõ nếu có. — recorded final check 805 pass/3 skip; CI run 39078206845 all 3 jobs.
-- [ ] Native Windows peer process/ACL/pipe handshake proof — implementation and conditional tests exist; must run current Windows CI after authorized push. macOS native process and two-session SDK evidence pass.
+- [x] Full automated checks pass; baseline regressions được ghi rõ nếu có. — CI run 39117028479: Linux 836 passed/17 skipped; all three CI jobs passed.
+- [x] Native Windows peer process/ACL/pipe handshake proof — Windows native integration in CI run 39117028479 exercised protected storage ACL/owner and reparse/inherited-writer rejection, signed ingress through `CurrentUserOnly`, quota limit, cancellation/cleanup, and native backend. Two skipped tests are Unix-inapplicable cases; they are not Windows proof.
 - [x] UI behavior được manual verification hoặc ghi rõ pending, không tuyên bố đã verify. — actual TUI behavior is explicitly recorded as pending in this plan and `ADR-peer-messaging.md`; this checks truthful disclosure only.
 - [x] Actual TUI approval and shutdown progress smoke — automated owned-PTY rendered production TUI evidence; human manual observation is not part of this automated acceptance claim.
 - [x] Migration/compatibility/recovery instructions and release notes — `CHANGELOG.md`, ADR-0012, and lifecycle recovery guidance document legacy normalization, backup/downgrade floor, and fail-closed manual recovery. Stable `retired` is legacy decoder input only, not a model/API state.
@@ -559,15 +559,15 @@ Native smoke phải có hai independent Pi sessions, không chỉ fake SDK host.
 
 Claude docs mô tả public behavior, không phải bằng chứng về enum hoặc kiến trúc nội bộ. Shutdown của kế hoạch này cố ý khác Claude: lead quyết định stop/remove, không phải cooperative request có quyền từ chối.
 
-File này là plan và acceptance contract. Implementation items above cite current source/test evidence; unchecked human manual and native Windows proof remain external verification blockers.
+File này là plan và acceptance contract. Implementation items above cite current source/test evidence; automated PTY evidence is not human manual verification, and full declared SDK-range coverage remains unproven.
 
 ## 16. Current implementation and verification evidence
 
 - Lifecycle and peer source/tests: `extension-src/pi-teams/` with migration/lifecycle regressions and `test/integration/` native/PTY suites. Core lifecycle evidence is detailed in ADR-0012; peer guarantees and platform prerequisites in ADR-peer-messaging.
-- Latest local full verification after the Windows helper patch: `npm run check` passed (typecheck, lint, depcruise, build, 80 test files passed/1 skipped; 834 tests passed/9 skipped; package smoke passed). `git diff --check` passed after documentation edits.
+- CI evidence for commit `cf75b1cfa0b3395aa43b9ddb8ae9abfe8028b924`: [run 39117028479](https://github.com/quanpersie2001/pi-teams/actions/runs/39117028479), all three jobs passed. Linux full check: 836 passed, 17 skipped; 80 files passed, 2 skipped. Native Windows integration: 43 passed, 2 skipped across 7 files. The two Windows skips are Unix-inapplicable cases, not Windows proof.
 - Native/automated smoke: production loader registration, real installed-SDK busy safe point, combined lifecycle+peer flow, and owned-PTY rendered TUI approval/refusal and busy-child shutdown. These are automated proofs, not human manual verification. Installed Pi 1.0.4 is tested; the full declared SDK range is not.
-- Windows peer: protected SID ACL and `pwsh.exe` 7+ named-pipe helper with runtime `CurrentUserOnly` capability probe are implemented; conditional tests and CI capability assertion exist. Native Windows handshake has not run locally (Darwin lacks pwsh) and no green CI run for current unpushed changes is claimed. This is the sole platform signoff blocker and requires authorized push/Windows CI.
+- Windows native evidence in that CI run: storage ACL/owner checks and rejection of reparse ancestors, unsafe descendants, and inherited writer ACEs; signed ingress and truthful receipts over the helper-created `CurrentUserOnly` pipe; atomic aggregate quota stress (130 ingress attempts yielded 100 queued and 30 unavailable, including held-message capacity); cancellation and ingress/helper cleanup; and native lifecycle backend/package tests. This establishes packaged Windows peer/lifecycle backend behavior, not support across all SDK versions.
 - Delivery semantics remain at-least-once. Missing SDK acknowledgement is ambiguous and retry may duplicate; no exactly-once guarantee is claimed. Legacy resources without positive exact-incarnation cleanup proof remain fenced for explicit recovery; migration is intentionally conservative.
-- Current checklist count (Phase 0–6 plus DoD): 56 checked / 1 unchecked (57 total). Remaining unchecked evidence gaps are itemized above; no percentage-complete claim is made.
+- Current checklist count (Phase 0–6 plus DoD): 57 checked / 0 unchecked (57 total), verified by counting checkbox lines in §§2–13. This records implementation/evidence criteria; it does not claim human manual TUI verification or full SDK-range proof.
 
 Historical task notes had stale T12/audit/commit claims and dates that are not reliable evidence; superseded by the commit-based record above. No `.pi`-local result file is required to substantiate status.

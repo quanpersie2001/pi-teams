@@ -66,7 +66,7 @@ Named teammates can retain their session while idle. A later assignment continue
 
 ## Peer messaging
 
-Peer messaging is opt-in (`peers.enabled` defaults to `false`). It connects independent sessions, not just teammates within one session; it does not grant ownership of another session's agents or tasks. Incoming messages are held by default until explicitly approved. Messages are untrusted content and cannot approve permissions. Windows peer messaging is experimental: it requires `pwsh` (PowerShell 7+) and verified per-user ACL/`CurrentUserOnly` support; native Windows verification is pending and unsupported hosts fail closed.
+Peer messaging is opt-in (`peers.enabled` defaults to `false`). It connects independent sessions, not just teammates within one session; it does not grant ownership of another session's agents or tasks. Incoming messages are held by default until explicitly approved. Messages are untrusted content and cannot approve permissions. Windows peer messaging requires `pwsh` (PowerShell 7+) and verified per-user ACL/`CurrentUserOnly` support; packaged Windows peer/lifecycle integration passed in [CI run 39117028479](https://github.com/quanpersie2001/pi-teams/actions/runs/39117028479). Full SDK-range coverage and human manual TUI verification are not claimed; unsupported hosts fail closed.
 
 ## Configuration and custom roles
 

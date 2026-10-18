@@ -91,7 +91,7 @@ Starter configuration:
 |---|---:|---|
 | `tasks.autoCascade` | `false` | Automatically launch eligible planned dependent Tasks after completion. |
 | `tasks.reminders` | `false` | Add periodic task summaries to lead context. |
-| `peers.enabled` | `false` | Opt in to peer messaging. Windows peer support requires `pwsh` (PowerShell 7+) for the named-pipe helper, a protected per-user ACL, and .NET `CurrentUserOnly`; unsupported hosts fail closed and native Windows verification remains pending. |
+| `peers.enabled` | `false` | Opt in to peer messaging. Windows peer support requires `pwsh` (PowerShell 7+) for the named-pipe helper, a protected per-user ACL, and .NET `CurrentUserOnly`; packaged Windows integration passed in [CI run 39117028479](https://github.com/quanpersie2001/pi-teams/actions/runs/39117028479). Unsupported hosts fail closed. |
 | `peers.scope` | `project` | `project` or `all`; project setting may narrow scope but cannot broaden it beyond global scope. |
 | `peers.policy` | `hold` | Receiver approval policy: `hold`, `accept`, or `refuse`. Project settings cannot override global/user policy. Held messages require user approval; queued receipt is not proof of acceptance, and missing acknowledgement is ambiguous. |
 | `maxConcurrent` | `4` | Shared foreground/background active-run capacity; clamped to 1–1024. |
@@ -119,7 +119,7 @@ For new children, selection precedence is:
 /teams-backend (current session) > PI_TEAMS_BACKEND > settings backend > auto
 ```
 
-The command and setting accept `auto` or `headless`; the environment variable additionally accepts `herdr` or `tmux` to force a viewer. `auto` selects HerdR, then tmux, then headless with no viewer. Native Windows runs headless (no multiplexer viewer). Peer messaging is separately opt-in and fails closed unless `pwsh` (PowerShell 7+) and .NET security prerequisites are available; native Windows verification remains pending. Every assignment executes in an independent native SDK worker, regardless of presentation. Session command changes affect future children; existing children retain their selected mode. See [Architecture](./ARCHITECTURE.md#9-launcher-selection) for implementation and platform details.
+The command and setting accept `auto` or `headless`; the environment variable additionally accepts `herdr` or `tmux` to force a viewer. `auto` selects HerdR, then tmux, then headless with no viewer. Native Windows runs headless (no multiplexer viewer). Peer messaging is separately opt-in and fails closed unless `pwsh` (PowerShell 7+) and .NET security prerequisites are available; packaged Windows peer/lifecycle integration passed in [CI run 39117028479](https://github.com/quanpersie2001/pi-teams/actions/runs/39117028479). Every assignment executes in an independent native SDK worker, regardless of presentation. Session command changes affect future children; existing children retain their selected mode. See [Architecture](./ARCHITECTURE.md#9-launcher-selection) for implementation and platform details.
 
 ## 7. Persistence artifacts
 
