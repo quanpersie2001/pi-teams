@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $stage = 'initialize'
 $currentSid = $null
 $ownerSid = $null
+$securityModulePath = $null
 function Get-Sid([object]$Identity) {
   if ($Identity -is [string]) { $Identity = [Security.Principal.NTAccount]::new($Identity) }
   if ($Identity -is [Security.Principal.SecurityIdentifier]) { return $Identity.Value }
@@ -47,6 +48,12 @@ function Read-PrivateAcl([string]$Target, [string]$CurrentSid, [bool]$RequirePro
   return $acl
 }
 try {
+  $stage = 'initialize-security-module'
+  $trustedModules = Join-Path $PSHOME 'Modules'
+  $securityModulePath = Join-Path $trustedModules 'Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1'
+  if (-not (Test-Path -LiteralPath $securityModulePath -PathType Leaf)) { throw 'trusted-security-module-missing' }
+  $env:PSModulePath = $trustedModules
+  Import-Module -Name $securityModulePath -ErrorAction Stop -Force
   $stage = 'normalize-path'
   $fullPath = [IO.Path]::GetFullPath($Path)
   $stage = 'create-and-check-ancestors'
@@ -113,6 +120,9 @@ try {
     reason = $message
     currentSid = $currentSid
     ownerSid = $ownerSid
+    psVersion = $PSVersionTable.PSVersion.ToString()
+    psHome = $PSHOME
+    securityModule = $securityModulePath
   } | ConvertTo-Json -Compress
   [Console]::Error.WriteLine($diagnostic)
   exit 1
