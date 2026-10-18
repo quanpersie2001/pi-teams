@@ -64,9 +64,52 @@ Stopping an assignment ends its current work; releasing a settled teammate clear
 
 Named teammates can retain their session while idle. A later assignment continues that retained context by default; a released teammate starts fresh. For more control, see [configuration and agent definitions](docs/CONFIGURATION.md).
 
+```mermaid
+stateDiagram-v2
+    state "Busy (queued / running)" as Busy
+    state "Idle (context retained)" as Idle
+    state "Shutting down" as ShuttingDown
+    state "Recovery required (admission blocked)" as Recovery
+    state "Membership removed" as Removed
+
+    [*] --> Busy: assign
+    Busy --> Idle: finish or stop
+    Idle --> Busy: assign / continue
+    Idle --> Released: release
+    Released --> Busy: assign with fresh context
+    Busy --> ShuttingDown: shutdown
+    Idle --> ShuttingDown: shutdown
+    Released --> ShuttingDown: shutdown
+    ShuttingDown --> Removed: verified cleanup and reconciliation
+    ShuttingDown --> Recovery: cleanup unproven
+    Recovery --> ShuttingDown: retry cleanup
+    Removed --> [*]
+```
+
+Reusing a name after shutdown creates a new membership; old messages and events cannot target it.
+
 ## Peer messaging
 
 Peer messaging is opt-in (`peers.enabled` defaults to `false`). It connects independent sessions, not just teammates within one session; it does not grant ownership of another session's agents or tasks. Incoming messages are held by default until explicitly approved. Messages are untrusted content and cannot approve permissions. Windows peer messaging requires `pwsh` (PowerShell 7+) and verified per-user ACL/`CurrentUserOnly` support; packaged Windows peer/lifecycle integration passed in [CI run 39117028479](https://github.com/quanpersie2001/pi-teams/actions/runs/39117028479). Full SDK-range coverage and human manual TUI verification are not claimed; unsupported hosts fail closed.
+
+```mermaid
+flowchart TD
+    Discover[Discover peers in scope] --> Sign[Sign message for recipient runtime]
+    Sign --> Verify{Authenticate and check bounds / quota}
+    Verify -->|invalid or unavailable| Rejected[Reject without enqueue]
+    Verify -->|valid| Queued[Durable enqueue + queued receipt]
+    Queued --> Policy{Receiver policy}
+    Policy -->|hold: default| Held[Held for approval]
+    Policy -->|accept| Deliver[Deliver at SDK safe point]
+    Policy -->|refuse| Refused[Refused receipt]
+    Held -->|approve| Deliver
+    Held -->|refuse| Refused
+    Queued -->|TTL expires| Expired[Expired receipt]
+    Held -->|TTL expires| Expired
+    Deliver -->|SDK acknowledgement| Delivered[Delivered receipt]
+```
+
+A queued receipt confirms durable storage, not SDK delivery. Delivery is at-least-once: a missing acknowledgement is ambiguous, and retrying may duplicate delivery.
 
 ## Configuration and custom roles
 
