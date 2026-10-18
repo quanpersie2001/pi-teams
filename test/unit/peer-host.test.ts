@@ -1,5 +1,5 @@
 import { generateKeyPairSync } from "node:crypto";
-import { access, link, mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, mkdtemp, open, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -232,8 +232,10 @@ describe("local peer host durability, quotas and receipt state", () => {
 		"atomically enforces aggregate inbox+held quota under concurrent ingress",
 		async () => {
 			const h = await host(),
+				quotaExpiresAt = Date.now() + 120_000,
 				messages = Array.from({ length: 130 }, (_, i) => ({
 					...makeMessage(`quota-${i}`),
+					expiresAt: quotaExpiresAt,
 					sender: { peerSessionId: `sender-${Math.floor(i / 10)}`, runtimeId: "runtime" },
 				}));
 			const operations = messages.map((m) => h.acceptIngress(m));
@@ -272,7 +274,7 @@ describe("local peer host durability, quotas and receipt state", () => {
 			}
 			const h = new OpenHookHost(root);
 			await h.list("project");
-			const lockDir = join(root, "locks");
+			const lockDir = join(await realpath(root), "locks");
 			const lockPath = join(lockDir, "quota.lock");
 			(h as unknown as { lastPruneAt: number }).lastPruneAt = Date.now();
 
