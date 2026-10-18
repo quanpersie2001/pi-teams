@@ -87,37 +87,42 @@ describe("peer runtime host integration", () => {
 		},
 	);
 
-	it("withdraws its advertisement and closes ingress after a listener failure", async () => {
-		const previous = process.env.PI_TEAMS_CHILD;
-		delete process.env.PI_TEAMS_CHILD;
-		const root = await runtimeTempRoot("pt-failure-");
-		let fail!: (error: Error) => void;
-		const failure = new Promise<Error>((resolve) => {
-			fail = resolve;
-		});
-		const close = vi.fn(async () => {});
-		const ingressSpy = vi.spyOn(peerTransport, "startPeerIngress").mockResolvedValue({ failure, close });
-		const ctx = {
-			sessionManager: { getSessionId: () => "failure-session", getCwd: () => process.cwd() },
-			ui: { notify: vi.fn() },
-		} as never;
-		const pi = { on: () => () => {}, sendUserMessage: vi.fn() } as unknown as ExtensionAPI;
-		const runtime = await startPeerRuntime({ pi, ctx, root, enabled: true, policy: "hold" });
-		try {
-			if (!runtime) throw new Error("runtime should start with mocked ingress");
-			expect(await new LocalPeerHost(join(root, "peer")).list(runtime.projectId)).toHaveLength(1);
-			fail(new Error("pipe helper exited"));
-			await vi.waitFor(async () =>
-				expect(await new LocalPeerHost(join(root, "peer")).list(runtime.projectId)).toHaveLength(0),
-			);
-			expect(close).toHaveBeenCalledOnce();
-		} finally {
-			ingressSpy.mockRestore();
-			await runtime?.dispose();
-			await rm(root, { recursive: true, force: true });
-			if (previous !== undefined) process.env.PI_TEAMS_CHILD = previous;
-		}
-	});
+	it(
+		"withdraws its advertisement and closes ingress after a listener failure",
+		async () => {
+			const previous = process.env.PI_TEAMS_CHILD;
+			delete process.env.PI_TEAMS_CHILD;
+			const root = await runtimeTempRoot("pt-failure-");
+			let fail!: (error: Error) => void;
+			const failure = new Promise<Error>((resolve) => {
+				fail = resolve;
+			});
+			const close = vi.fn(async () => {});
+			const ingressSpy = vi.spyOn(peerTransport, "startPeerIngress").mockResolvedValue({ failure, close });
+			const ctx = {
+				sessionManager: { getSessionId: () => "failure-session", getCwd: () => process.cwd() },
+				ui: { notify: vi.fn() },
+			} as never;
+			const pi = { on: () => () => {}, sendUserMessage: vi.fn() } as unknown as ExtensionAPI;
+			const runtime = await startPeerRuntime({ pi, ctx, root, enabled: true, policy: "hold" });
+			try {
+				if (!runtime) throw new Error("runtime should start with mocked ingress");
+				const observer = new LocalPeerHost(join(root, "peer"));
+				expect(await observer.list(runtime.projectId)).toHaveLength(1);
+				fail(new Error("pipe helper exited"));
+				await vi.waitFor(async () => expect(await observer.list(runtime.projectId)).toHaveLength(0), {
+					timeout: process.platform === "win32" ? 5_000 : undefined,
+				});
+				expect(close).toHaveBeenCalledOnce();
+			} finally {
+				ingressSpy.mockRestore();
+				await runtime?.dispose();
+				await rm(root, { recursive: true, force: true });
+				if (previous !== undefined) process.env.PI_TEAMS_CHILD = previous;
+			}
+		},
+		process.platform === "win32" ? 30_000 : undefined,
+	);
 
 	it.skipIf(process.platform !== "win32")(
 		"starts and cleanly disposes a healthy Windows peer runtime",
