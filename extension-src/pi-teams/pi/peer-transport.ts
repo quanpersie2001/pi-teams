@@ -238,6 +238,7 @@ export async function startPeerIngress(options: PeerIngressOptions): Promise<Pee
 			{ windowsHide: true, stdio: "pipe" },
 		);
 		const child = pipeHelper;
+		let helperDiagnostics = "";
 		const lines = createInterface({ input: child.stdout });
 		let readyResolve!: () => void;
 		let readyReject!: (error: Error) => void;
@@ -271,10 +272,16 @@ export async function startPeerIngress(options: PeerIngressOptions): Promise<Pee
 			activeControllers.add(controller);
 			activeRequests.add(task);
 			void task
-				.catch((error: unknown) => {
-					if (!helperClosing) {
-						failHelper(error instanceof Error ? error : new Error(String(error)));
+				.catch(async (error: unknown) => {
+					if (!helperClosing && !helperClosed) {
+						const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
 						child.kill();
+						await closed;
+						if (!helperFailureHandled) {
+							const detail = helperDiagnostics.trim();
+							const failure = error instanceof Error ? error : new Error(String(error));
+							failHelper(new Error(`${failure.message}${detail ? `; helper: ${detail}` : ""}`));
+						}
 					}
 				})
 				.finally(() => {
@@ -290,24 +297,27 @@ export async function startPeerIngress(options: PeerIngressOptions): Promise<Pee
 		});
 		child.stdin.on("error", (error) => {
 			readyReject(error);
-			failHelper(error);
+		});
+		child.stderr.setEncoding("utf8");
+		child.stderr.on("data", (chunk: string) => {
+			helperDiagnostics = `${helperDiagnostics}${chunk}`.slice(-2_000);
 		});
 		child.stderr.on("error", (error) => {
 			readyReject(error);
 			failHelper(error);
 		});
-		child.stderr.resume();
 		child.once("error", (error) => {
 			readyReject(error);
 			failHelper(error);
 		});
-		child.once("exit", (code, signal) => {
-			const error = new Error(`Windows peer pipe helper exited (${code ?? signal ?? "unknown"})`);
+		child.once("close", (code, signal) => {
+			helperClosed = true;
+			const detail = helperDiagnostics.trim();
+			const error = new Error(
+				`Windows peer pipe helper exited (${code ?? signal ?? "unknown"})${detail ? `: ${detail}` : ""}`,
+			);
 			if (!helperReady) readyReject(error);
 			else failHelper(error);
-		});
-		child.once("close", () => {
-			helperClosed = true;
 		});
 		let startupTimer: ReturnType<typeof setTimeout> | undefined;
 		try {

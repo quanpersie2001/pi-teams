@@ -24,6 +24,9 @@ const runPowerShell = (args: string[], options: Parameters<typeof execFileAsync>
 		...options,
 		env: { ...process.env, PSModulePath: trustedModulePath, ...options.env },
 	});
+const trustedSecurityModuleBootstrap = `$ErrorActionPreference = 'Stop'
+$trustedSecurityModule = Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'
+Import-Module -Name $trustedSecurityModule -ErrorAction Stop -Force`;
 
 const safe = {
 	ownerSid: "S-1-5-21-1",
@@ -64,7 +67,7 @@ describe("Windows peer ACL evidence", () => {
 			await writeFile(
 				fixtureScript,
 				`param([string]$Root)
-$ErrorActionPreference = 'Stop'
+${trustedSecurityModuleBootstrap}
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $adminSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -119,7 +122,7 @@ Write-Output '{"eligible":true}'
 				await writeFile(
 					verifyScript,
 					`param([string]$Root)
-$ErrorActionPreference = 'Stop'
+${trustedSecurityModuleBootstrap}
 $result = @()
 foreach ($path in @($Root, (Join-Path $Root 'child'), (Join-Path $Root 'child/file.txt'))) {
   $acl = Get-Acl -LiteralPath $path
@@ -142,7 +145,7 @@ $result | ConvertTo-Json -Compress`,
 				await writeFile(
 					tamperScript,
 					`param([string]$Root)
-$ErrorActionPreference = 'Stop'
+${trustedSecurityModuleBootstrap}
 $path = Join-Path $Root 'child/file.txt'
 $acl = Get-Acl -LiteralPath $path
 $acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-18'))
@@ -188,7 +191,7 @@ Set-Acl -LiteralPath $path -AclObject $acl`,
 			await writeFile(
 				fixtureScript,
 				`param([string]$Parent, [string]$Root)
-$ErrorActionPreference = 'Stop'
+${trustedSecurityModuleBootstrap}
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $adminSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)

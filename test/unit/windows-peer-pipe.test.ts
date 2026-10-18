@@ -23,7 +23,13 @@ describe("Windows peer pipe runtime capability probe", () => {
 			new URL("../../extension-src/pi-teams/pi/windows-peer-pipe.ps1", import.meta.url),
 			"utf8",
 		);
-		expect(helper).toContain("[Enum]::Parse([IO.Pipes.PipeOptions], 'CurrentUserOnly', $false)");
+		expect(helper).toContain("[Enum]::Parse([IO.Pipes.PipeOptions], 'CurrentUserOnly, Asynchronous', $false)");
+		expect(helper).toContain(
+			"$server.ReadAsync($readBuffer, [int]0, [int]1, [Threading.CancellationToken]$readDeadline.Token)",
+		);
+		expect(helper).toContain("$readTask.GetAwaiter().GetResult()");
+		expect(helper).not.toContain("$server.ReadTimeout");
+		expect(helper).toContain("stage=$stage");
 		expect(helper).not.toContain("[IO.Pipes.PipeOptions]::CurrentUserOnly");
 	});
 });

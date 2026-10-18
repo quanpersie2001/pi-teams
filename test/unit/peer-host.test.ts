@@ -137,11 +137,58 @@ describe("local peer host durability, quotas and receipt state", () => {
 			await aclStarted;
 			controller.abort(reason);
 			await expect(operation).rejects.toBe(reason);
-			expect(aclSpy).toHaveBeenCalledWith(root, controller.signal);
+			const verificationSignal = aclSpy.mock.calls[0]?.[1];
+			expect(verificationSignal).toBeInstanceOf(AbortSignal);
+			expect(verificationSignal).not.toBe(controller.signal);
+			expect(verificationSignal?.aborted).toBe(true);
+			expect(verificationSignal?.reason).toBe(reason);
 		} finally {
 			aclSpy.mockRestore();
 		}
 	});
+
+	it.skipIf(process.platform !== "win32")(
+		"isolates aborting waiters and cancels the shared verifier only after its last waiter leaves",
+		async () => {
+			const h = await host();
+			const root = (h as unknown as { root: string }).root;
+			await mkdir(join(root, "held"));
+			let markStarted!: () => void;
+			let finishRootCheck!: () => void;
+			const started = new Promise<void>((resolve) => {
+				markStarted = resolve;
+			});
+			const rootCheckGate = new Promise<void>((resolve) => {
+				finishRootCheck = resolve;
+			});
+			let sharedSignal: AbortSignal | undefined;
+			const aclSpy = vi.spyOn(windowsPeerAcl, "ensureWindowsPeerStorage").mockImplementation(async (path, signal) => {
+				if (path === root) {
+					sharedSignal = signal;
+					markStarted();
+					await rootCheckGate;
+				}
+				return true;
+			});
+			const firstController = new AbortController();
+			const secondController = new AbortController();
+			const firstReason = new Error("first waiter canceled");
+			try {
+				const first = h.listHeld(firstController.signal);
+				const second = h.listHeld(secondController.signal);
+				await started;
+				firstController.abort(firstReason);
+				await expect(first).rejects.toBe(firstReason);
+				expect(sharedSignal?.aborted).toBe(false);
+				finishRootCheck();
+				await expect(second).resolves.toEqual([]);
+				expect(sharedSignal?.aborted).toBe(false);
+			} finally {
+				finishRootCheck();
+				aclSpy.mockRestore();
+			}
+		},
+	);
 
 	hostIt("filters malformed registrations and scopes ads", async () => {
 		const h = await host();

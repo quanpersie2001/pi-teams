@@ -12,6 +12,62 @@ const TERMINAL = new Set<PeerReceipt>(["delivered", "refused", "expired"]);
 const CLAIM_STALE_MS = 5 * 60_000;
 
 type DirectoryIdentity = { dev: number; ino: number };
+type SharedVerification<T> = {
+	controller: AbortController;
+	promise: Promise<T>;
+	waiters: number;
+	settled: boolean;
+};
+function createSharedVerification<T>(verify: (signal: AbortSignal) => Promise<T>): SharedVerification<T> {
+	const controller = new AbortController();
+	const entry = { controller, promise: undefined as unknown as Promise<T>, waiters: 0, settled: false };
+	entry.promise = Promise.resolve()
+		.then(() => verify(controller.signal))
+		.finally(() => {
+			entry.settled = true;
+		});
+	return entry;
+}
+function waitForSharedVerification<T>(entry: SharedVerification<T>, signal?: AbortSignal): Promise<T> {
+	throwIfAborted(signal);
+	entry.waiters++;
+	return new Promise<T>((resolve, reject) => {
+		let finished = false;
+		const cleanup = () => {
+			if (signal) signal.removeEventListener("abort", onAbort);
+			entry.waiters--;
+		};
+		const onAbort = () => {
+			if (finished) return;
+			finished = true;
+			cleanup();
+			const reason = signal?.reason ?? new Error("Peer storage verification aborted");
+			if (entry.waiters === 0 && !entry.settled) {
+				entry.controller.abort(reason);
+				entry.promise.then(
+					() => reject(reason),
+					() => reject(reason),
+				);
+			} else reject(reason);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		entry.promise.then(
+			(value) => {
+				if (finished) return;
+				finished = true;
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				if (finished) return;
+				finished = true;
+				cleanup();
+				reject(error);
+			},
+		);
+		if (signal?.aborted) onAbort();
+	});
+}
 function sameDirectoryIdentity(statResult: Awaited<ReturnType<typeof lstat>>, identity: DirectoryIdentity): boolean {
 	return statResult.dev === identity.dev && statResult.ino !== 0 && statResult.ino === identity.ino;
 }
@@ -33,9 +89,9 @@ async function assertNoWindowsReparseAncestors(path: string): Promise<void> {
 export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 	private lastPruneAt = 0;
 	private windowsRootIdentity: DirectoryIdentity | undefined;
-	private windowsRootInitialization: Promise<void> | undefined;
+	private windowsRootInitialization: SharedVerification<void> | undefined;
 	private readonly windowsDirectoryIdentities = new Map<string, DirectoryIdentity>();
-	private readonly windowsDirectoryChecks = new Map<string, Promise<DirectoryIdentity>>();
+	private readonly windowsDirectoryChecks = new Map<string, SharedVerification<DirectoryIdentity>>();
 	constructor(private root: string) {}
 	protected async linkInboxEntry(temp: string, target: string): Promise<void> {
 		await link(temp, target);
@@ -61,10 +117,12 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			this.windowsRootIdentity = undefined;
 			this.windowsDirectoryIdentities.clear();
 		}
-		if (!this.windowsRootInitialization) {
-			this.windowsRootInitialization = (async () => {
-				if (!(await ensureWindowsPeerStorage(this.root)))
+		let check = this.windowsRootInitialization;
+		if (!check) {
+			check = createSharedVerification(async (verificationSignal) => {
+				if (!(await ensureWindowsPeerStorage(this.root, verificationSignal)))
 					throw new Error("Windows peer storage root ACL validation/provisioning failed");
+				throwIfAborted(verificationSignal);
 				const canonicalRoot = await realpath(this.root);
 				await assertNoWindowsReparseAncestors(canonicalRoot);
 				const rootStat = await lstat(canonicalRoot);
@@ -72,13 +130,13 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 					throw new Error("Peer storage root must be a directory, not a reparse point");
 				this.root = canonicalRoot;
 				if (rootStat.ino !== 0) this.windowsRootIdentity = { dev: rootStat.dev, ino: rootStat.ino };
-			})();
+			});
+			this.windowsRootInitialization = check;
 		}
 		try {
-			await this.windowsRootInitialization;
-			throwIfAborted(signal);
+			await waitForSharedVerification(check, signal);
 		} finally {
-			this.windowsRootInitialization = undefined;
+			if (check.settled && this.windowsRootInitialization === check) this.windowsRootInitialization = undefined;
 		}
 	}
 	private async ensureWindowsDirectory(dir: string, signal?: AbortSignal): Promise<void> {
@@ -100,9 +158,10 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 		}
 		let check = this.windowsDirectoryChecks.get(dir);
 		if (!check) {
-			check = (async () => {
-				if (!(await ensureWindowsPeerStorage(dir)))
+			check = createSharedVerification(async (verificationSignal) => {
+				if (!(await ensureWindowsPeerStorage(dir, verificationSignal)))
 					throw new Error("Windows peer storage directory ACL validation/provisioning failed");
+				throwIfAborted(verificationSignal);
 				await assertNoWindowsReparseAncestors(dir);
 				const current = await lstat(dir);
 				if (!current.isDirectory() || current.isSymbolicLink())
@@ -110,14 +169,13 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 				const identity = { dev: current.dev, ino: current.ino };
 				if (identity.ino !== 0) this.windowsDirectoryIdentities.set(dir, identity);
 				return identity;
-			})();
+			});
 			this.windowsDirectoryChecks.set(dir, check);
 		}
 		try {
-			await check;
-			throwIfAborted(signal);
+			await waitForSharedVerification(check, signal);
 		} finally {
-			this.windowsDirectoryChecks.delete(dir);
+			if (check.settled && this.windowsDirectoryChecks.get(dir) === check) this.windowsDirectoryChecks.delete(dir);
 		}
 	}
 	private async ready(dir: string, signal?: AbortSignal): Promise<void> {

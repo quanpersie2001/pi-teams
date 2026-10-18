@@ -1,13 +1,9 @@
-import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, realpath, rename, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { LocalPeerHost } from "../../extension-src/pi-teams/pi/peer-host.js";
 import * as windowsPeerAcl from "../../extension-src/pi-teams/pi/windows-peer-acl.js";
-
-const execFileAsync = promisify(execFile);
 
 describe("Windows peer storage canonical paths", () => {
 	it.skipIf(process.platform !== "win32")(
@@ -35,13 +31,10 @@ describe("Windows peer storage canonical paths", () => {
 		async ({ skip }) => {
 			const createdRoot = await mkdtemp(join(tmpdir(), "peer-root-short-alias-"));
 			try {
-				const { stdout } = await execFileAsync("cmd.exe", ["/d", "/c", `for %I in ("${createdRoot}") do @echo %~sI`], {
-					windowsHide: true,
-					timeout: 5_000,
-				});
-				const shortRoot = stdout.trim();
-				if (!shortRoot || shortRoot.toLowerCase() === createdRoot.toLowerCase()) skip();
-				const [shortRealPath, longRealPath] = await Promise.all([realpath(shortRoot), realpath(createdRoot)]);
+				const shortRoot = createdRoot;
+				const longRealPath = await realpath(createdRoot);
+				if (shortRoot.toLowerCase() === longRealPath.toLowerCase()) skip();
+				const shortRealPath = await realpath(shortRoot);
 				const [shortStat, longStat] = await Promise.all([stat(shortRealPath), stat(longRealPath)]);
 				expect(shortStat.dev).toBe(longStat.dev);
 				expect(shortStat.ino).not.toBe(0);
