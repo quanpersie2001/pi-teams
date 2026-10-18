@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PeerAdvertisement } from "../../extension-src/pi-teams/domain/peer.js";
 import { type PeerMessage, peerMessageFingerprint } from "../../extension-src/pi-teams/domain/peer-message.js";
 import { LocalPeerHost } from "../../extension-src/pi-teams/pi/peer-host.js";
+import { createPeerEndpointPath } from "../../extension-src/pi-teams/pi/peer-transport.js";
 import * as windowsPeerAcl from "../../extension-src/pi-teams/pi/windows-peer-acl.js";
 
 const windowsAclTestTimeout = process.platform === "win32" ? 30_000 : 5_000;
@@ -31,7 +32,7 @@ const ad: PeerAdvertisement = {
 	identityPublicKey: generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }).toString(),
 	endpoint:
 		process.platform === "win32"
-			? { kind: "named_pipe", path: "\\\\.\\pipe\\peer.sock" }
+			? { kind: "named_pipe", path: createPeerEndpointPath("", "win32") }
 			: { kind: "unix", path: "/tmp/peer.sock" },
 };
 const makeMessage = (id: string, body = "hello"): PeerMessage => ({

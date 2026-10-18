@@ -1,6 +1,6 @@
 import { createPublicKey, randomUUID } from "node:crypto";
 import { link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { PeerRegistry } from "../app/peer-discovery-service.js";
 import type { PeerMailbox, PeerMessageBinding } from "../app/peer-messaging-service.js";
 import type { PeerAddress, PeerReceipt } from "../domain/peer.js";
@@ -11,27 +11,131 @@ import { ensureWindowsPeerStorage } from "./windows-peer-acl.js";
 const TERMINAL = new Set<PeerReceipt>(["delivered", "refused", "expired"]);
 const CLAIM_STALE_MS = 5 * 60_000;
 
+type DirectoryIdentity = { dev: number; ino: number };
+function sameDirectoryIdentity(statResult: Awaited<ReturnType<typeof lstat>>, identity: DirectoryIdentity): boolean {
+	return statResult.dev === identity.dev && statResult.ino !== 0 && statResult.ino === identity.ino;
+}
+// The PowerShell verifier performs the authoritative full reparse-attribute walk. This per-use check
+// protects cached identities against ordinary path replacement; malicious same-user ACL races are out of scope.
+async function assertNoWindowsReparseAncestors(path: string): Promise<void> {
+	let current = resolve(path);
+	for (;;) {
+		const item = await lstat(current);
+		if (item.isSymbolicLink() || !item.isDirectory())
+			throw new Error("Peer storage path must not traverse a reparse point");
+		const parent = dirname(current);
+		if (parent === current) return;
+		current = parent;
+	}
+}
+
 /** Per-user durable registry/inbox; Windows storage is provisioned and audited through the OS ACL adapter. */
 export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 	private lastPruneAt = 0;
+	private windowsRootIdentity: DirectoryIdentity | undefined;
+	private windowsRootInitialization: Promise<void> | undefined;
+	private readonly windowsDirectoryIdentities = new Map<string, DirectoryIdentity>();
+	private readonly windowsDirectoryChecks = new Map<string, Promise<DirectoryIdentity>>();
 	constructor(private root: string) {}
 	protected async linkInboxEntry(temp: string, target: string): Promise<void> {
 		await link(temp, target);
 	}
+	private async ensureWindowsRoot(signal?: AbortSignal): Promise<void> {
+		throwIfAborted(signal);
+		if (this.windowsRootIdentity) {
+			let current: Awaited<ReturnType<typeof lstat>> | undefined;
+			try {
+				await assertNoWindowsReparseAncestors(this.root);
+				current = await lstat(this.root);
+			} catch {
+				// Re-run the OS verifier below; never trust stale identity evidence.
+			}
+			if (
+				current?.isDirectory() &&
+				!current.isSymbolicLink() &&
+				sameDirectoryIdentity(current, this.windowsRootIdentity)
+			) {
+				throwIfAborted(signal);
+				return;
+			}
+			this.windowsRootIdentity = undefined;
+			this.windowsDirectoryIdentities.clear();
+		}
+		if (!this.windowsRootInitialization) {
+			this.windowsRootInitialization = (async () => {
+				if (!(await ensureWindowsPeerStorage(this.root)))
+					throw new Error("Windows peer storage root ACL validation/provisioning failed");
+				const canonicalRoot = await realpath(this.root);
+				await assertNoWindowsReparseAncestors(canonicalRoot);
+				const rootStat = await lstat(canonicalRoot);
+				if (!rootStat.isDirectory() || rootStat.isSymbolicLink())
+					throw new Error("Peer storage root must be a directory, not a reparse point");
+				this.root = canonicalRoot;
+				if (rootStat.ino !== 0) this.windowsRootIdentity = { dev: rootStat.dev, ino: rootStat.ino };
+			})();
+		}
+		try {
+			await this.windowsRootInitialization;
+			throwIfAborted(signal);
+		} finally {
+			this.windowsRootInitialization = undefined;
+		}
+	}
+	private async ensureWindowsDirectory(dir: string, signal?: AbortSignal): Promise<void> {
+		throwIfAborted(signal);
+		const cached = this.windowsDirectoryIdentities.get(dir);
+		if (cached) {
+			let current: Awaited<ReturnType<typeof lstat>> | undefined;
+			try {
+				await assertNoWindowsReparseAncestors(dir);
+				current = await lstat(dir);
+			} catch {
+				// A missing/replaced path loses its cached proof and must be revalidated by PowerShell.
+			}
+			if (current?.isDirectory() && !current.isSymbolicLink() && sameDirectoryIdentity(current, cached)) {
+				throwIfAborted(signal);
+				return;
+			}
+			this.windowsDirectoryIdentities.delete(dir);
+		}
+		let check = this.windowsDirectoryChecks.get(dir);
+		if (!check) {
+			check = (async () => {
+				if (!(await ensureWindowsPeerStorage(dir)))
+					throw new Error("Windows peer storage directory ACL validation/provisioning failed");
+				await assertNoWindowsReparseAncestors(dir);
+				const current = await lstat(dir);
+				if (!current.isDirectory() || current.isSymbolicLink())
+					throw new Error("Peer storage directory must be a directory, not a reparse point");
+				const identity = { dev: current.dev, ino: current.ino };
+				if (identity.ino !== 0) this.windowsDirectoryIdentities.set(dir, identity);
+				return identity;
+			})();
+			this.windowsDirectoryChecks.set(dir, check);
+		}
+		try {
+			await check;
+			throwIfAborted(signal);
+		} finally {
+			this.windowsDirectoryChecks.delete(dir);
+		}
+	}
 	private async ready(dir: string, signal?: AbortSignal): Promise<void> {
+		throwIfAborted(signal);
 		if (process.platform === "win32") {
-			if (!(await ensureWindowsPeerStorage(this.root, signal)))
-				throw new Error("Windows peer storage root ACL validation/provisioning failed");
+			const requestedRoot = resolve(this.root);
+			const relativeDir = relative(requestedRoot, resolve(dir));
+			if (!relativeDir || relativeDir === ".." || relativeDir.startsWith(`..\\`) || isAbsolute(relativeDir))
+				throw new Error("Peer storage directory must be beneath its root");
+			await this.ensureWindowsRoot(signal);
+			dir = resolve(this.root, relativeDir);
+			await this.ensureWindowsDirectory(dir, signal);
 		} else await mkdir(this.root, { recursive: true, mode: 0o700 });
 		const canonicalRoot = await realpath(this.root),
 			requestedRoot = resolve(this.root);
 		const macAlias =
 			process.platform === "darwin" && canonicalRoot === requestedRoot.replace(/^\/(var|tmp)(?=\/)/, "/private/$1");
-		if (
-			process.platform === "win32"
-				? canonicalRoot.toLowerCase() !== requestedRoot.toLowerCase()
-				: canonicalRoot !== requestedRoot && !macAlias
-		)
+		if (process.platform !== "win32" && canonicalRoot !== requestedRoot && !macAlias)
 			throw new Error("Peer storage root must not traverse symlink ancestors");
 		this.root = canonicalRoot;
 		const rootStat = await lstat(this.root);
@@ -42,10 +146,7 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			((typeof process.getuid === "function" && rootStat.uid !== process.getuid()) || (rootStat.mode & 0o077) !== 0)
 		)
 			throw new Error("Peer storage root must be current-user-owned and private (mode 0700)");
-		if (process.platform === "win32") {
-			if (!(await ensureWindowsPeerStorage(dir, signal)))
-				throw new Error("Windows peer storage directory ACL validation/provisioning failed");
-		} else await mkdir(dir, { recursive: true, mode: 0o700 });
+		if (process.platform !== "win32") await mkdir(dir, { recursive: true, mode: 0o700 });
 		const s = await lstat(dir);
 		if (!s.isDirectory() || s.isSymbolicLink()) throw new Error("Peer storage directory must not be a symlink");
 		if (
@@ -53,6 +154,7 @@ export class LocalPeerHost implements PeerRegistry, PeerMailbox {
 			((typeof process.getuid === "function" && s.uid !== process.getuid()) || (s.mode & 0o077) !== 0)
 		)
 			throw new Error("Peer storage directory must be current-user-owned and private");
+		throwIfAborted(signal);
 	}
 	async publish(ad: PeerAdvertisement): Promise<void> {
 		if (!validatePeerAdvertisement(ad)) throw new Error("Invalid peer advertisement");

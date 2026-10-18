@@ -12,6 +12,18 @@ import {
 } from "../../extension-src/pi-teams/pi/windows-peer-acl.js";
 
 const execFileAsync = promisify(execFile);
+const trustedModulePath = join(
+	process.env.SystemRoot ?? "C:\\Windows",
+	"System32",
+	"WindowsPowerShell",
+	"v1.0",
+	"Modules",
+);
+const runPowerShell = (args: string[], options: Parameters<typeof execFileAsync>[2] = {}) =>
+	execFileAsync("powershell.exe", args, {
+		...options,
+		env: { ...process.env, PSModulePath: trustedModulePath, ...options.env },
+	});
 
 const safe = {
 	ownerSid: "S-1-5-21-1",
@@ -52,6 +64,7 @@ describe("Windows peer ACL evidence", () => {
 			await writeFile(
 				fixtureScript,
 				`param([string]$Root)
+$ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $adminSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -76,14 +89,13 @@ Write-Output '{"eligible":true}'
 `,
 			);
 			try {
-				const fixture = await execFileAsync(
-					"powershell.exe",
+				const fixture = await runPowerShell(
 					["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", fixtureScript, root],
 					{ timeout: 15_000, windowsHide: true },
 				);
+				expect(fixture.stderr).toBe("");
 				if (!JSON.parse(fixture.stdout.trim()).eligible) skip();
-				const { stdout } = await execFileAsync(
-					"powershell.exe",
+				const { stdout, stderr } = await runPowerShell(
 					[
 						"-NoLogo",
 						"-NoProfile",
@@ -98,6 +110,7 @@ Write-Output '{"eligible":true}'
 					],
 					{ timeout: 15_000, windowsHide: true },
 				);
+				expect(stderr).toBe("");
 				const evidence = parseWindowsAclEvidence(stdout);
 				if (evidence === undefined) throw new Error("ACL helper did not return valid evidence");
 				expect(isPrivateWindowsAcl(evidence)).toBe(true);
@@ -105,28 +118,42 @@ Write-Output '{"eligible":true}'
 				const verifyScript = join(temp, "verify-descendants.ps1");
 				await writeFile(
 					verifyScript,
-					`$root = '${root}'; $result = @(); foreach ($path in @((Join-Path $root 'child'), (Join-Path $root 'child/file.txt'))) { $acl = Get-Acl -LiteralPath $path; $result += [pscustomobject]@{ owner=$acl.Owner.Translate([Security.Principal.SecurityIdentifier]).Value; protected=$acl.AreAccessRulesProtected; rules=@($acl.Access | ForEach-Object { [pscustomobject]@{ sid=$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; type=$_.AccessControlType.ToString(); full=(($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl) } }) } }; $result | ConvertTo-Json -Compress`,
+					`param([string]$Root)
+$ErrorActionPreference = 'Stop'
+$result = @()
+foreach ($path in @($Root, (Join-Path $Root 'child'), (Join-Path $Root 'child/file.txt'))) {
+  $acl = Get-Acl -LiteralPath $path
+  $owner = ([Security.Principal.NTAccount]::new($acl.Owner)).Translate([Security.Principal.SecurityIdentifier]).Value
+  $result += [pscustomobject]@{ owner=$owner; protected=$acl.AreAccessRulesProtected; rules=@($acl.Access | ForEach-Object { [pscustomobject]@{ sid=$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; type=$_.AccessControlType.ToString(); full=(($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl) } }) }
+}
+$result | ConvertTo-Json -Compress`,
 				);
-				const { stdout: verifiedDescendants } = await execFileAsync(
-					"powershell.exe",
-					["-NoLogo", "-NoProfile", "-NonInteractive", "-File", verifyScript],
+				const { stdout: verifiedDescendants, stderr: verifyStderr } = await runPowerShell(
+					["-NoLogo", "-NoProfile", "-NonInteractive", "-File", verifyScript, root],
 					{ timeout: 15_000, windowsHide: true },
 				);
+				expect(verifyStderr).toBe("");
 				for (const entry of JSON.parse(verifiedDescendants)) {
 					expect(entry.owner).toBe(evidence.currentSid);
+					expect(entry.protected).toBe(true);
 					expect(entry.rules).toEqual([{ sid: evidence.currentSid, type: "Allow", full: true }]);
 				}
 				const tamperScript = join(temp, "set-foreign-owner.ps1");
 				await writeFile(
 					tamperScript,
-					`$path = Join-Path '${root}' 'child/file.txt'; $acl = Get-Acl -LiteralPath $path; $acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-18')); Set-Acl -LiteralPath $path -AclObject $acl`,
+					`param([string]$Root)
+$ErrorActionPreference = 'Stop'
+$path = Join-Path $Root 'child/file.txt'
+$acl = Get-Acl -LiteralPath $path
+$acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-18'))
+Set-Acl -LiteralPath $path -AclObject $acl`,
 				);
-				await execFileAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", tamperScript], {
-					timeout: 15_000,
-					windowsHide: true,
-				});
-				const rejectsForeignOwner = await execFileAsync(
-					"powershell.exe",
+				const { stderr: tamperStderr } = await runPowerShell(
+					["-NoLogo", "-NoProfile", "-NonInteractive", "-File", tamperScript, root],
+					{ timeout: 15_000, windowsHide: true },
+				);
+				expect(tamperStderr).toBe("");
+				const foreignOwnerFailure = await runPowerShell(
 					[
 						"-NoLogo",
 						"-NoProfile",
@@ -141,10 +168,11 @@ Write-Output '{"eligible":true}'
 					],
 					{ timeout: 15_000, windowsHide: true },
 				).then(
-					() => false,
-					() => true,
+					() => undefined,
+					(cause: NodeJS.ErrnoException & { stderr?: string }) => cause,
 				);
-				expect(rejectsForeignOwner).toBe(true);
+				expect(foreignOwnerFailure).toBeDefined();
+				expect(JSON.parse(foreignOwnerFailure?.stderr?.trim() ?? "{}").reason).toBe("wrong-descendant-owner");
 			} finally {
 				await rm(temp, { recursive: true, force: true });
 			}
@@ -157,16 +185,10 @@ Write-Output '{"eligible":true}'
 			const fixtureScript = join(temp, "create-inherited-write-root.ps1");
 			const parent = join(temp, "parent");
 			const root = join(parent, "storage");
-			const trustedModulePath = join(
-				process.env.SystemRoot ?? "C:\\Windows",
-				"System32",
-				"WindowsPowerShell",
-				"v1.0",
-				"Modules",
-			);
 			await writeFile(
 				fixtureScript,
 				`param([string]$Parent, [string]$Root)
+$ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $adminSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -184,21 +206,20 @@ $acl.SetOwner($identity.User)
 Set-Acl -LiteralPath $Parent -AclObject $acl
 [void][IO.Directory]::CreateDirectory($Root)
 $rootAcl = Get-Acl -LiteralPath $Root
-$rootOwner = $rootAcl.Owner.Translate([Security.Principal.SecurityIdentifier]).Value
+$rootOwner = ([Security.Principal.NTAccount]::new($rootAcl.Owner)).Translate([Security.Principal.SecurityIdentifier]).Value
 $allowed = $identity.User.Value -eq $rootOwner -or ($principal.IsInRole($adminSid) -and $identity.Owner.Value -eq $adminSid.Value -and $rootOwner -eq $identity.Owner.Value)
 if (-not $allowed) { Write-Output ('eligible=false owner=' + $rootOwner); exit 0 }
 Write-Output ('eligible=true owner=' + $rootOwner)
 `,
 			);
 			try {
-				const fixture = await execFileAsync(
-					"powershell.exe",
+				const fixture = await runPowerShell(
 					["-NoLogo", "-NoProfile", "-NonInteractive", "-File", fixtureScript, parent, root],
 					{ env: { ...process.env, PSModulePath: trustedModulePath }, timeout: 15_000, windowsHide: true },
 				);
+				expect(fixture.stderr).toBe("");
 				if (!fixture.stdout.trim().startsWith("eligible=true")) skip();
-				const error = await execFileAsync(
-					"powershell.exe",
+				const error = await runPowerShell(
 					[
 						"-NoLogo",
 						"-NoProfile",
@@ -236,8 +257,7 @@ Write-Output ('eligible=true owner=' + $rootOwner)
 			);
 			try {
 				const script = resolveWindowsPeerAclScriptPath();
-				const { stdout } = await execFileAsync(
-					"powershell.exe",
+				const { stdout, stderr } = await runPowerShell(
 					[
 						"-NoLogo",
 						"-NoProfile",
@@ -252,6 +272,7 @@ Write-Output ('eligible=true owner=' + $rootOwner)
 					],
 					{ env: { ...process.env, PSModulePath: poisonedModules }, timeout: 15_000, windowsHide: true },
 				);
+				expect(stderr).toBe("");
 				const evidence = parseWindowsAclEvidence(stdout);
 				if (evidence === undefined) throw new Error("ACL helper did not return valid evidence");
 				expect(isPrivateWindowsAcl(evidence)).toBe(true);
