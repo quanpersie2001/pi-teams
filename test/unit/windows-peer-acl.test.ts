@@ -44,6 +44,186 @@ describe("Windows peer ACL evidence", () => {
 		expect(parseWindowsAclEvidence(JSON.stringify({ ...safe, unexpectedAccess: "false" }))).toBeUndefined();
 	});
 	it.skipIf(process.platform !== "win32")(
+		"normalizes token-default Administrators ownership only on private storage",
+		async ({ skip }) => {
+			const temp = await mkdtemp(join(tmpdir(), "peer-acl-admin-owner-"));
+			const root = join(temp, "storage");
+			const fixtureScript = join(temp, "create-admin-owned-tree.ps1");
+			await writeFile(
+				fixtureScript,
+				`param([string]$Root)
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$adminSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole($adminSid) -or $identity.Owner.Value -ne $adminSid.Value) { Write-Output '{"eligible":false}'; exit 0 }
+[void][IO.Directory]::CreateDirectory($Root)
+$acl = Get-Acl -LiteralPath $Root
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
+$user = $identity.User
+$rule = [Security.AccessControl.FileSystemAccessRule]::new($user, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+[void]$acl.AddAccessRule($rule)
+$acl.SetOwner($adminSid)
+Set-Acl -LiteralPath $Root -AclObject $acl
+[void][IO.Directory]::CreateDirectory((Join-Path $Root 'child'))
+[IO.File]::WriteAllText((Join-Path $Root 'child/file.txt'), 'private')
+foreach ($path in @((Join-Path $Root 'child'), (Join-Path $Root 'child/file.txt'))) {
+  $childAcl = Get-Acl -LiteralPath $path
+  $childAcl.SetOwner($adminSid)
+  Set-Acl -LiteralPath $path -AclObject $childAcl
+}
+Write-Output '{"eligible":true}'
+`,
+			);
+			try {
+				const fixture = await execFileAsync(
+					"powershell.exe",
+					["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", fixtureScript, root],
+					{ timeout: 15_000, windowsHide: true },
+				);
+				if (!JSON.parse(fixture.stdout.trim()).eligible) skip();
+				const { stdout } = await execFileAsync(
+					"powershell.exe",
+					[
+						"-NoLogo",
+						"-NoProfile",
+						"-NonInteractive",
+						"-ExecutionPolicy",
+						"Bypass",
+						"-File",
+						resolveWindowsPeerAclScriptPath(),
+						"-Path",
+						root,
+						"-ProvisionLeaf",
+					],
+					{ timeout: 15_000, windowsHide: true },
+				);
+				const evidence = parseWindowsAclEvidence(stdout);
+				if (evidence === undefined) throw new Error("ACL helper did not return valid evidence");
+				expect(isPrivateWindowsAcl(evidence)).toBe(true);
+				expect(evidence.ownerSid).toBe(evidence.currentSid);
+				const verifyScript = join(temp, "verify-descendants.ps1");
+				await writeFile(
+					verifyScript,
+					`$root = '${root}'; $result = @(); foreach ($path in @((Join-Path $root 'child'), (Join-Path $root 'child/file.txt'))) { $acl = Get-Acl -LiteralPath $path; $result += [pscustomobject]@{ owner=$acl.Owner.Translate([Security.Principal.SecurityIdentifier]).Value; protected=$acl.AreAccessRulesProtected; rules=@($acl.Access | ForEach-Object { [pscustomobject]@{ sid=$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; type=$_.AccessControlType.ToString(); full=(($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl) } }) } }; $result | ConvertTo-Json -Compress`,
+				);
+				const { stdout: verifiedDescendants } = await execFileAsync(
+					"powershell.exe",
+					["-NoLogo", "-NoProfile", "-NonInteractive", "-File", verifyScript],
+					{ timeout: 15_000, windowsHide: true },
+				);
+				for (const entry of JSON.parse(verifiedDescendants)) {
+					expect(entry.owner).toBe(evidence.currentSid);
+					expect(entry.rules).toEqual([{ sid: evidence.currentSid, type: "Allow", full: true }]);
+				}
+				const tamperScript = join(temp, "set-foreign-owner.ps1");
+				await writeFile(
+					tamperScript,
+					`$path = Join-Path '${root}' 'child/file.txt'; $acl = Get-Acl -LiteralPath $path; $acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-18')); Set-Acl -LiteralPath $path -AclObject $acl`,
+				);
+				await execFileAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", tamperScript], {
+					timeout: 15_000,
+					windowsHide: true,
+				});
+				const rejectsForeignOwner = await execFileAsync(
+					"powershell.exe",
+					[
+						"-NoLogo",
+						"-NoProfile",
+						"-NonInteractive",
+						"-ExecutionPolicy",
+						"Bypass",
+						"-File",
+						resolveWindowsPeerAclScriptPath(),
+						"-Path",
+						root,
+						"-ProvisionLeaf",
+					],
+					{ timeout: 15_000, windowsHide: true },
+				).then(
+					() => false,
+					() => true,
+				);
+				expect(rejectsForeignOwner).toBe(true);
+			} finally {
+				await rm(temp, { recursive: true, force: true });
+			}
+		},
+	);
+	it.skipIf(process.platform !== "win32")(
+		"rejects inherited write access from ordinary principals before provisioning the leaf",
+		async ({ skip }) => {
+			const temp = await mkdtemp(join(tmpdir(), "peer-acl-inherited-write-"));
+			const fixtureScript = join(temp, "create-inherited-write-root.ps1");
+			const parent = join(temp, "parent");
+			const root = join(parent, "storage");
+			const trustedModulePath = join(
+				process.env.SystemRoot ?? "C:\\Windows",
+				"System32",
+				"WindowsPowerShell",
+				"v1.0",
+				"Modules",
+			);
+			await writeFile(
+				fixtureScript,
+				`param([string]$Parent, [string]$Root)
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$adminSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+[void][IO.Directory]::CreateDirectory($Parent)
+$acl = Get-Acl -LiteralPath $Parent
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($oldRule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($oldRule) }
+$full = [Security.AccessControl.FileSystemRights]::FullControl
+$inherit = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+$userRule = [Security.AccessControl.FileSystemAccessRule]::new($identity.User, $full, $inherit, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+$everyoneRule = [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'), [Security.AccessControl.FileSystemRights]::WriteData, $inherit, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+[void]$acl.AddAccessRule($userRule)
+[void]$acl.AddAccessRule($everyoneRule)
+$acl.SetOwner($identity.User)
+Set-Acl -LiteralPath $Parent -AclObject $acl
+[void][IO.Directory]::CreateDirectory($Root)
+$rootAcl = Get-Acl -LiteralPath $Root
+$rootOwner = $rootAcl.Owner.Translate([Security.Principal.SecurityIdentifier]).Value
+$allowed = $identity.User.Value -eq $rootOwner -or ($principal.IsInRole($adminSid) -and $identity.Owner.Value -eq $adminSid.Value -and $rootOwner -eq $identity.Owner.Value)
+if (-not $allowed) { Write-Output ('eligible=false owner=' + $rootOwner); exit 0 }
+Write-Output ('eligible=true owner=' + $rootOwner)
+`,
+			);
+			try {
+				const fixture = await execFileAsync(
+					"powershell.exe",
+					["-NoLogo", "-NoProfile", "-NonInteractive", "-File", fixtureScript, parent, root],
+					{ env: { ...process.env, PSModulePath: trustedModulePath }, timeout: 15_000, windowsHide: true },
+				);
+				if (!fixture.stdout.trim().startsWith("eligible=true")) skip();
+				const error = await execFileAsync(
+					"powershell.exe",
+					[
+						"-NoLogo",
+						"-NoProfile",
+						"-NonInteractive",
+						"-ExecutionPolicy",
+						"Bypass",
+						"-File",
+						resolveWindowsPeerAclScriptPath(),
+						"-Path",
+						root,
+						"-ProvisionLeaf",
+					],
+					{ env: { ...process.env, PSModulePath: trustedModulePath }, timeout: 15_000, windowsHide: true },
+				).then(
+					() => undefined,
+					(cause: NodeJS.ErrnoException & { stderr?: string }) => cause,
+				);
+				expect(error).toBeDefined();
+				expect(JSON.parse(error?.stderr?.trim() ?? "{}").reason).toBe("untrusted-inherited-write-ace");
+			} finally {
+				await rm(temp, { recursive: true, force: true });
+			}
+		},
+	);
+	it.skipIf(process.platform !== "win32")(
 		"uses trusted Windows PowerShell security modules despite poisoned PSModulePath",
 		async () => {
 			const temp = await mkdtemp(join(tmpdir(), "peer-acl-module-path-"));
