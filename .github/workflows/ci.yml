@@ -77,7 +77,7 @@ jobs:
         run: pwsh -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; if ($PSVersionTable.PSVersion.Major -lt 7 -or [Enum]::GetNames([IO.Pipes.PipeOptions]) -notcontains "CurrentUserOnly") { throw "PowerShell 7+ with PipeOptions.CurrentUserOnly is required" }; [Console]::Out.WriteLine("PI_TEAMS_PIPE_RUNTIME_OK")'
 
       - name: Native Windows runtime and peer security integration
-        run: npx vitest run test/integration/windows-native.test.ts test/unit/windows-peer-acl.test.ts test/unit/windows-peer-pipe.test.ts test/unit/peer-host.test.ts test/integration/peer-transport.test.ts test/integration/peer-runtime.test.ts --no-file-parallelism
+        run: npx vitest run test/integration/windows-native.test.ts test/integration/windows-peer-storage-path.test.ts test/unit/windows-peer-acl.test.ts test/unit/windows-peer-pipe.test.ts test/unit/peer-host.test.ts test/integration/peer-transport.test.ts test/integration/peer-runtime.test.ts --no-file-parallelism
 
       - name: Upload Windows fixture artifacts on failure
         if: failure()
