@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { connect } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
@@ -12,13 +12,15 @@ import {
 } from "../../extension-src/pi-teams/pi/peer-runtime.js";
 import * as peerTransport from "../../extension-src/pi-teams/pi/peer-transport.js";
 
+const runtimeTempRoot = (prefix: string) => mkdtemp(join(process.platform === "win32" ? tmpdir() : "/tmp", prefix));
+
 describe("peer runtime host integration", () => {
 	it("suppresses independent peer runtimes in child sessions", async () => {
 		const previous = process.env.PI_TEAMS_CHILD;
 		process.env.PI_TEAMS_CHILD = "1";
 		try {
 			await expect(
-				startPeerRuntime({ pi: {} as ExtensionAPI, ctx: {} as never, root: "/tmp", enabled: true, policy: "hold" }),
+				startPeerRuntime({ pi: {} as ExtensionAPI, ctx: {} as never, root: tmpdir(), enabled: true, policy: "hold" }),
 			).resolves.toBeUndefined();
 		} finally {
 			if (previous === undefined) delete process.env.PI_TEAMS_CHILD;
@@ -28,8 +30,7 @@ describe("peer runtime host integration", () => {
 
 	it("resolves the active Git or non-Git session cwd rather than process cwd", async () => {
 		const gitProject = await resolveSessionProjectId(process.cwd());
-		const nonGit = join("/tmp", `session-${randomUUID()}`);
-		await mkdir(nonGit, { mode: 0o700 });
+		const nonGit = await mkdtemp(join(tmpdir(), "peer-session-"));
 		try {
 			expect(await resolveSessionProjectId(nonGit)).toBe(
 				`dir:${await import("node:fs/promises").then(({ realpath }) => realpath(nonGit))}`,
@@ -45,8 +46,7 @@ describe("peer runtime host integration", () => {
 		async () => {
 			const previous = process.env.PI_TEAMS_CHILD;
 			delete process.env.PI_TEAMS_CHILD;
-			const root = join("/tmp", `pt-${randomUUID()}`);
-			await mkdir(root, { mode: 0o700 });
+			const root = await runtimeTempRoot("pt-");
 			const handlers: Record<string, () => void> = {};
 			const ctx = {
 				sessionManager: { getSessionId: () => "test-session", getCwd: () => process.cwd() },
@@ -90,8 +90,7 @@ describe("peer runtime host integration", () => {
 	it("withdraws its advertisement and closes ingress after a listener failure", async () => {
 		const previous = process.env.PI_TEAMS_CHILD;
 		delete process.env.PI_TEAMS_CHILD;
-		const root = join("/tmp", `pt-failure-${randomUUID()}`);
-		await mkdir(root, { mode: 0o700 });
+		const root = await runtimeTempRoot("pt-failure-");
 		let fail!: (error: Error) => void;
 		const failure = new Promise<Error>((resolve) => {
 			fail = resolve;
@@ -125,7 +124,7 @@ describe("peer runtime host integration", () => {
 		async () => {
 			const previous = process.env.PI_TEAMS_CHILD;
 			delete process.env.PI_TEAMS_CHILD;
-			const root = join(process.env.TEMP ?? "C:\\temp", `pt-win-healthy-${randomUUID()}`);
+			const root = await runtimeTempRoot("pt-win-healthy-");
 			const ctx = {
 				sessionManager: { getSessionId: () => "windows-healthy-session", getCwd: () => process.cwd() },
 				ui: { notify: vi.fn() },
@@ -162,7 +161,7 @@ describe("peer runtime host integration", () => {
 		async () => {
 			const previous = process.env.PI_TEAMS_CHILD;
 			delete process.env.PI_TEAMS_CHILD;
-			const root = join(process.env.TEMP ?? "C:\\temp", `pt-win-${randomUUID()}`);
+			const root = await runtimeTempRoot("pt-win-");
 			const handlers: Record<string, () => void> = {};
 			const ctx = {
 				sessionManager: { getSessionId: () => "windows-session", getCwd: () => process.cwd() },

@@ -8,6 +8,8 @@ import { type PeerMessage, peerMessageFingerprint } from "../../extension-src/pi
 import { LocalPeerHost } from "../../extension-src/pi-teams/pi/peer-host.js";
 import * as windowsPeerAcl from "../../extension-src/pi-teams/pi/windows-peer-acl.js";
 
+const windowsAclTestTimeout = process.platform === "win32" ? 30_000 : 5_000;
+const hostIt = (name: string, fn: () => unknown, timeout = windowsAclTestTimeout) => it(name, fn, timeout);
 const roots: string[] = [];
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -27,7 +29,10 @@ const ad: PeerAdvertisement = {
 	updatedAt: 1,
 	capabilities: [],
 	identityPublicKey: generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }).toString(),
-	endpoint: { kind: "unix", path: "/tmp/peer.sock" },
+	endpoint:
+		process.platform === "win32"
+			? { kind: "named_pipe", path: "\\\\.\\pipe\\peer.sock" }
+			: { kind: "unix", path: "/tmp/peer.sock" },
 };
 const makeMessage = (id: string, body = "hello"): PeerMessage => ({
 	protocolVersion: 1,
@@ -39,7 +44,7 @@ const makeMessage = (id: string, body = "hello"): PeerMessage => ({
 	expiresAt: Date.now() + 10_000,
 });
 describe("local peer host durability, quotas and receipt state", () => {
-	it("aborts quota-lock wait without late binding, rate, receipt, or inbox writes", async () => {
+	hostIt("aborts quota-lock wait without late binding, rate, receipt, or inbox writes", async () => {
 		const h = await host();
 		await h.list("project");
 		const root = (h as unknown as { root: string }).root;
@@ -61,7 +66,7 @@ describe("local peer host durability, quotas and receipt state", () => {
 		expect(await h.pending({ peerSessionId: "session", runtimeId: "run1" })).toEqual([]);
 	});
 
-	it("completes the enqueue receipt when abort races after the real inbox hard link commits", async () => {
+	hostIt("completes the enqueue receipt when abort races after the real inbox hard link commits", async () => {
 		const root = await mkdtemp(join(tmpdir(), "peer-host-link-commit-"));
 		roots.push(root);
 		let reached!: () => void;
@@ -102,7 +107,7 @@ describe("local peer host durability, quotas and receipt state", () => {
 		expect(await h.pending(m.recipient)).toEqual([m]);
 	});
 
-	it("honors cancellation before creating a per-message claim", async () => {
+	hostIt("honors cancellation before creating a per-message claim", async () => {
 		const h = await host();
 		const controller = new AbortController();
 		const stop = new Error("session stopped");
@@ -137,26 +142,37 @@ describe("local peer host durability, quotas and receipt state", () => {
 		}
 	});
 
-	it("filters malformed registrations and scopes ads", async () => {
+	hostIt("filters malformed registrations and scopes ads", async () => {
 		const h = await host();
 		await h.publish(ad);
 		expect(await h.list("project")).toEqual([ad]);
 		expect(await h.list("other")).toEqual([]);
 	});
-	it("rejects malformed ads and symlinked storage directories", async () => {
-		const h = await host();
-		await expect(h.publish({ ...ad, displayName: "x".repeat(200) })).rejects.toThrow(/invalid/i);
-		const root = roots.at(-1);
-		if (!root) throw new Error("test root missing");
-		const outside = await mkdtemp(join(tmpdir(), "peer-outside-"));
-		try {
-			await symlink(outside, join(root, "registry"));
-			await expect(h.list("project")).rejects.toThrow(/symlink/i);
-		} finally {
-			await rm(outside, { recursive: true, force: true });
-		}
-	});
-	it("deduplicates concurrent identical ingress and rejects conflicting ID content", async () => {
+	hostIt(
+		"rejects malformed advertisements",
+		async () => {
+			const h = await host();
+			await expect(h.publish({ ...ad, displayName: "x".repeat(200) })).rejects.toThrow(/invalid/i);
+		},
+		windowsAclTestTimeout,
+	);
+	it.skipIf(process.platform === "win32")(
+		"rejects a symlinked storage directory on Unix",
+		async () => {
+			const h = await host();
+			const root = roots.at(-1);
+			if (!root) throw new Error("test root missing");
+			const outside = await mkdtemp(join(tmpdir(), "peer-outside-"));
+			try {
+				await symlink(outside, join(root, "registry"));
+				await expect(h.list("project")).rejects.toThrow(/symlink/i);
+			} finally {
+				await rm(outside, { recursive: true, force: true });
+			}
+		},
+		windowsAclTestTimeout,
+	);
+	hostIt("deduplicates concurrent identical ingress and rejects conflicting ID content", async () => {
 		const h = await host(),
 			m = makeMessage("racing-duplicate");
 		const results = await Promise.all([h.acceptIngress(m), h.acceptIngress(m)]);
@@ -164,27 +180,31 @@ describe("local peer host durability, quotas and receipt state", () => {
 		expect(await h.pending(m.recipient)).toHaveLength(1);
 		expect(await h.acceptIngress({ ...m, body: "different body" })).toEqual({ status: "conflict" });
 	});
-	it("atomically enforces aggregate inbox+held quota under concurrent ingress", async () => {
-		const h = await host(),
-			messages = Array.from({ length: 130 }, (_, i) => ({
-				...makeMessage(`quota-${i}`),
-				sender: { peerSessionId: `sender-${Math.floor(i / 10)}`, runtimeId: "runtime" },
-			}));
-		const results = await Promise.all(messages.map((m) => h.acceptIngress(m)));
-		expect(results.filter((r) => r.status === "queued")).toHaveLength(100);
-		expect(results.filter((r) => r.status === "unavailable")).toHaveLength(30);
-		const firstMessage = messages[0];
-		if (!firstMessage) throw new Error("test message missing");
-		const pending = await h.pending(firstMessage.recipient);
-		expect(pending).toHaveLength(100);
-		const firstPending = pending[0];
-		if (!firstPending) throw new Error("pending inbox unexpectedly empty");
-		expect(await h.holdMessage(firstPending)).toBe(true);
-		expect(await h.pending(firstMessage.recipient)).toHaveLength(99);
-		expect(await h.listHeld()).toHaveLength(1);
-		expect(await h.acceptIngress(makeMessage("after-held"))).toEqual({ status: "unavailable" });
-	}, 15_000);
-	it("binds message IDs immutably and keeps terminal receipts monotonic", async () => {
+	hostIt(
+		"atomically enforces aggregate inbox+held quota under concurrent ingress",
+		async () => {
+			const h = await host(),
+				messages = Array.from({ length: 130 }, (_, i) => ({
+					...makeMessage(`quota-${i}`),
+					sender: { peerSessionId: `sender-${Math.floor(i / 10)}`, runtimeId: "runtime" },
+				}));
+			const results = await Promise.all(messages.map((m) => h.acceptIngress(m)));
+			expect(results.filter((r) => r.status === "queued")).toHaveLength(100);
+			expect(results.filter((r) => r.status === "unavailable")).toHaveLength(30);
+			const firstMessage = messages[0];
+			if (!firstMessage) throw new Error("test message missing");
+			const pending = await h.pending(firstMessage.recipient);
+			expect(pending).toHaveLength(100);
+			const firstPending = pending[0];
+			if (!firstPending) throw new Error("pending inbox unexpectedly empty");
+			expect(await h.holdMessage(firstPending)).toBe(true);
+			expect(await h.pending(firstMessage.recipient)).toHaveLength(99);
+			expect(await h.listHeld()).toHaveLength(1);
+			expect(await h.acceptIngress(makeMessage("after-held"))).toEqual({ status: "unavailable" });
+		},
+		15_000,
+	);
+	hostIt("binds message IDs immutably and keeps terminal receipts monotonic", async () => {
 		const h = await host(),
 			m = makeMessage("bound");
 		expect(await h.acceptIngress(m)).toEqual({ status: "queued" });
@@ -200,7 +220,7 @@ describe("local peer host durability, quotas and receipt state", () => {
 		expect(["refused", "delivered"]).toContain(terminal);
 		expect(await h.setReceipt(m.messageId, "queued", peerMessageFingerprint(m))).toBe(terminal);
 	});
-	it("retains terminal fingerprint tombstones through message expiry plus retention", async () => {
+	hostIt("retains terminal fingerprint tombstones through message expiry plus retention", async () => {
 		const h = await host(),
 			now = Date.now(),
 			m = { ...makeMessage("retention"), createdAt: now, expiresAt: now + 60_000 };
@@ -213,7 +233,7 @@ describe("local peer host durability, quotas and receipt state", () => {
 		expect(await h.getBinding(m.messageId)).toBeUndefined();
 		expect(await h.receiptState(m.messageId)).toBeUndefined();
 	});
-	it("claims an ID atomically across service instances", async () => {
+	hostIt("claims an ID atomically across service instances", async () => {
 		const h = await host();
 		const first = await h.claim("cross-instance");
 		expect(first).toBeTypeOf("function");
@@ -221,7 +241,7 @@ describe("local peer host durability, quotas and receipt state", () => {
 		await first?.();
 		expect(await h.claim("cross-instance")).toBeTypeOf("function");
 	});
-	it("persists bindings, held messages, and terminal expiry tombstones", async () => {
+	hostIt("persists bindings, held messages, and terminal expiry tombstones", async () => {
 		const h = await host(),
 			m = makeMessage("expiry");
 		await h.acceptIngress(m);

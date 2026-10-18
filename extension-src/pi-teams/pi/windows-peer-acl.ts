@@ -57,9 +57,26 @@ export async function ensureWindowsPeerStorage(path: string, signal?: AbortSigna
 			{ timeout: 15_000, maxBuffer: MAX_BUFFER, windowsHide: true, signal },
 		);
 		const evidence = parseWindowsAclEvidence(stdout);
-		return evidence !== undefined && isPrivateWindowsAcl(evidence);
+		if (evidence === undefined || !isPrivateWindowsAcl(evidence)) {
+			console.error(
+				`Windows peer storage ACL verification failed (stage=verify-evidence): ${
+					evidence === undefined ? "invalid-helper-output" : JSON.stringify(evidence)
+				}`,
+			);
+			return false;
+		}
+		return true;
 	} catch (error) {
 		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : error;
+		const detail = error as NodeJS.ErrnoException & { stderr?: string };
+		const stderr = typeof detail.stderr === "string" ? detail.stderr.trim() : "";
+		const safeStderr = stderr
+			.replaceAll(path, "<peer-storage-path>")
+			.replaceAll(resolveWindowsPeerAclScriptPath(), "<acl-helper>")
+			.slice(0, 2_000);
+		console.error(
+			`Windows peer storage ACL preparation failed (${detail.code ?? detail.name ?? "unknown"})${safeStderr ? `: ${safeStderr}` : ""}`,
+		);
 		return false;
 	}
 }

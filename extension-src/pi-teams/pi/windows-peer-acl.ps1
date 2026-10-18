@@ -3,6 +3,9 @@ param(
   [switch]$ProvisionLeaf
 )
 $ErrorActionPreference = 'Stop'
+$stage = 'initialize'
+$currentSid = $null
+$ownerSid = $null
 function Get-Sid([object]$Identity) {
   if ($Identity -is [string]) { $Identity = [Security.Principal.NTAccount]::new($Identity) }
   if ($Identity -is [Security.Principal.SecurityIdentifier]) { return $Identity.Value }
@@ -13,7 +16,7 @@ function Assert-NoReparseAncestors([string]$FullPath) {
   if ([string]::IsNullOrWhiteSpace($volume)) { throw 'invalid-root' }
   $current = $volume
   $relative = $FullPath.Substring($volume.Length)
-  foreach ($part in $relative.Split([IO.Path]::DirectorySeparatorChar, [StringSplitOptions]::RemoveEmptyEntries)) {
+  foreach ($part in $relative.Split([char[]]@([IO.Path]::DirectorySeparatorChar), [StringSplitOptions]::RemoveEmptyEntries)) {
     $current = [IO.Path]::Combine($current, $part)
     if (Test-Path -LiteralPath $current) {
       $item = Get-Item -LiteralPath $current -Force
@@ -44,15 +47,21 @@ function Read-PrivateAcl([string]$Target, [string]$CurrentSid, [bool]$RequirePro
   return $acl
 }
 try {
+  $stage = 'normalize-path'
   $fullPath = [IO.Path]::GetFullPath($Path)
+  $stage = 'create-and-check-ancestors'
   Assert-NoReparseAncestors $fullPath
+  $stage = 'resolve-current-sid'
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
   $sid = $me.Value
+  $currentSid = $sid
+  $stage = 'inspect-leaf-owner-and-acl'
   $leafItem = Get-Item -LiteralPath $fullPath -Force
   if (-not $leafItem.PSIsContainer -or (($leafItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'unsafe-leaf' }
   $acl = Get-Acl -LiteralPath $fullPath
   $ownerSid = Get-Sid $acl.Owner
   if ($ownerSid -ne $sid) { throw 'wrong-owner' }
+  $stage = 'audit-existing-descendants'
   # Audit all pre-existing descendants before changing the designated leaf DACL.
   # Walk manually: never recurse through a reparse point. Existing children/files are never rewritten.
   $stack = [Collections.Generic.Stack[string]]::new()
@@ -76,6 +85,7 @@ try {
     }
   }
   if ($ProvisionLeaf) {
+    $stage = 'provision-leaf-dacl'
     # Only normalize inherited leaf permissions. Never erase explicit/protected policy from an existing tree.
     foreach ($existingRule in $acl.Access) {
       if (-not $existingRule.IsInherited) {
@@ -90,8 +100,20 @@ try {
     [void]$acl.AddAccessRule($userRule)
     Set-Acl -LiteralPath $fullPath -AclObject $acl
   }
+  $stage = 'verify-provisioned-acl'
   $readback = Read-PrivateAcl $fullPath $sid $true
   $userAce = $false
   foreach ($rule in $readback.Access) { if ((Get-Sid $rule.IdentityReference) -eq $sid -and $rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and (($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)) { $userAce = $true } }
   [pscustomobject]@{ ownerSid=(Get-Sid $readback.Owner); currentSid=$sid; daclProtected=$readback.AreAccessRulesProtected; reparsePoint=(($leafItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0); unexpectedAccess=$false; currentUserFullControl=$userAce } | ConvertTo-Json -Compress
-} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+} catch {
+  $message = $_.Exception.Message
+  if ($fullPath) { $message = $message.Replace($fullPath, '<peer-storage-path>') }
+  $diagnostic = [pscustomobject]@{
+    stage = $stage
+    reason = $message
+    currentSid = $currentSid
+    ownerSid = $ownerSid
+  } | ConvertTo-Json -Compress
+  [Console]::Error.WriteLine($diagnostic)
+  exit 1
+}
