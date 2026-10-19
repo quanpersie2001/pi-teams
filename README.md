@@ -56,6 +56,7 @@ Create additional roles as Markdown agent definitions in `.pi/agents/`. Their av
 | **Alt+G** | Toggle the Team Hub; reopening returns to the last-used tab |
 | **Esc** | Leave a child view without stopping its work |
 | `/teams-backend` | Show the current backend mode; use `/teams-backend auto` or `/teams-backend headless` to switch future children |
+| `/teams-settings` | View or edit pi-teams settings in the global or project `teams.json` without leaving Pi |
 | `/agents teammate-status <name>` | Check a teammate's state |
 
 ## Teammate lifecycle

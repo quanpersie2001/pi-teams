@@ -72,7 +72,11 @@ Isolation is configuration-only: enable `worktreeIsolation` and set definition `
 
 ## 5. Operational settings
 
-Global settings: `~/.pi/agent/teams.json` (Pi agent directory). Project settings: `<configCwd>/.pi/teams.json`. Files are merged per key, project over global; nested `tasks` and `peers` keys also merge individually. Missing/unreadable files are ignored; invalid JSON warns and is ignored. The merged result is sanitized, with unsupported or mistyped values falling back to defaults. These files are read-only to the runtime.
+Global settings: `~/.pi/agent/teams.json` (Pi agent directory). Project settings: `<configCwd>/.pi/teams.json`. Files are merged per key, project over global; nested `tasks` and `peers` keys also merge individually. Missing/unreadable files are ignored; invalid JSON warns and is ignored. The merged result is sanitized, with unsupported or mistyped values falling back to defaults.
+
+`/teams-settings` edits either file in place through its own key-list overlay (sized to its rows, not the full screen): `↑↓` move, `←→` change the selected value, `enter` types an exact number or specialist name, `r` resets, `esc` goes back. Ladder keys (booleans, `backend`, `peers.scope`, `peers.policy`, `tasks.inlineRows`) cycle with `←→`; numbers step by one inside the sanitizer's bounds. Resetting removes the key from the edited scope so the other scope, then the built-in default, applies again, and each row shows which level currently supplies its value (`project`, `global`, `default`) plus `· next session` when the key only binds at startup. The command offers only keys this version knows, validates typed input before writing, and reports whether a key applied live or needs a restart. Editing one key preserves every unrelated key, including keys a newer version may have written; a file that is not valid JSON is never overwritten (the command refuses and names the file). `Show effective values` lists every key and its origin without editing.
+
+Pi exposes no settings registry to extensions, so this is the extension's own command rather than an entry in Pi's `/settings` or `pi config`. The runtime itself only reads these files.
 
 Starter configuration:
 
@@ -91,6 +95,7 @@ Starter configuration:
 |---|---:|---|
 | `tasks.autoCascade` | `false` | Automatically launch eligible planned dependent Tasks after completion. |
 | `tasks.reminders` | `false` | Add periodic task summaries to lead context. |
+| `tasks.inlineRows` | `2` | Rows the inline Tasks widget above the editor may show: `0` (off), `2`, `4` or `6`. `off` is accepted as a readable spelling of `0`; any other value falls back to `2`. The widget is removed while off or while the board has no pending/in-progress/in-review task. |
 | `peers.enabled` | `false` | Opt in to peer messaging. Windows peer support requires `pwsh` (PowerShell 7+) for the named-pipe helper, a protected per-user ACL, and .NET `CurrentUserOnly`; packaged Windows integration passed in [CI run 39117028479](https://github.com/quanpersie2001/pi-teams/actions/runs/39117028479). Unsupported hosts fail closed. |
 | `peers.scope` | `project` | `project` or `all`; project setting may narrow scope but cannot broaden it beyond global scope. |
 | `peers.policy` | `hold` | Receiver approval policy: `hold`, `accept`, or `refuse`. Project settings cannot override global/user policy. Held messages require user approval; queued receipt is not proof of acceptance, and missing acknowledgement is ambiguous. |

@@ -36,7 +36,7 @@ describe("sanitizeSettings", () => {
 			}),
 		).toEqual({
 			peers: { enabled: false, policy: "hold", scope: "project" },
-			tasks: { autoCascade: false, reminders: false },
+			tasks: { autoCascade: false, reminders: false, inlineRows: 2 },
 			maxConcurrent: 8,
 			defaultMaxTurns: 50,
 			graceTurns: 0,
@@ -72,6 +72,20 @@ describe("sanitizeSettings", () => {
 		expect(sanitizeSettings({ backend: "tmux" }).backend).toBe("auto");
 		expect(sanitizeSettings({ backend: " TMUX " }).backend).toBe("auto");
 		expect(sanitizeSettings({ backend: 1 }).backend).toBe("auto");
+	});
+
+	it("accepts only the inline Tasks widget row ladder (off/2/4/6), defaulting to 2", () => {
+		expect(DEFAULT_SUBAGENTS_SETTINGS.tasks.inlineRows).toBe(2);
+		expect(sanitizeSettings({}).tasks.inlineRows).toBe(2);
+		for (const rows of [0, 2, 4, 6])
+			expect(sanitizeSettings({ tasks: { inlineRows: rows } }).tasks.inlineRows).toBe(rows);
+		// `off` is the readable spelling of 0.
+		expect(sanitizeSettings({ tasks: { inlineRows: "off" } }).tasks.inlineRows).toBe(0);
+		expect(sanitizeSettings({ tasks: { inlineRows: " OFF " } }).tasks.inlineRows).toBe(0);
+		// Anything off the ladder falls back rather than shifting the widget height.
+		for (const value of [1, 3, 8, 100, -2, 2.5, "4", null, true]) {
+			expect(sanitizeSettings({ tasks: { inlineRows: value } }).tasks.inlineRows).toBe(2);
+		}
 	});
 
 	it("clamps maxConcurrent into [1, 1024]", () => {

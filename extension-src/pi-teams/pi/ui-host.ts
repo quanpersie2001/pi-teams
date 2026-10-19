@@ -12,7 +12,7 @@ import { activityFromTranscript, buildAgentListView, buildAgentTranscriptView } 
 import type { ThinkingLevel } from "../domain/agent-definition.js";
 import { isActiveStatus } from "../domain/agent-run.js";
 import type { ChildControlCommand } from "../domain/child-protocol.js";
-import type { SubagentsSettings } from "../domain/config.js";
+import type { InlineTaskRows, SubagentsSettings } from "../domain/config.js";
 import type { TaskContext, TaskOutcome, TaskProjection, TaskSpec, TaskStatus } from "../domain/task-board.js";
 import type { AgentFocusPort, AgentFocusSnapshot, AgentListView } from "../domain/ui-view.js";
 import {
@@ -222,6 +222,17 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 
 	// -- widgets -----------------------------------------------------------------
 
+	function inlineTaskLimit(): InlineTaskRows {
+		return options.settings().tasks.inlineRows;
+	}
+
+	/** The inline Tasks widget exists only while the setting is not off and the
+	 *  board has eligible rows. Both the gate and the render read the live
+	 *  setting, so a settings edit only needs a refresh to add or drop the widget. */
+	function inlineTaskWidgetVisible(): boolean {
+		return inlineTaskLimit() > 0 && inlineTasks(taskRows).length > 0;
+	}
+
 	function installPanel(): void {
 		ctx.ui.setWidget(
 			PANEL_WIDGET_KEY,
@@ -237,7 +248,16 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 					},
 					now,
 				);
-				return agents;
+				// Pi adds no spacer around below-editor widgets, so own the gap to the
+				// editor's bottom border. A panel with nothing to show stays empty so the
+				// host removes the widget instead of leaving a blank line.
+				return {
+					render: (width: number) => {
+						const lines = agents.render(width);
+						return lines.length === 0 ? lines : ["", ...lines];
+					},
+					invalidate: () => agents.invalidate(),
+				};
 			},
 			{ placement: "belowEditor" },
 		);
@@ -253,14 +273,26 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	}
 
 	function installTaskWidget(): void {
-		if (!options.tasks || taskWidgetRegistered || inlineTasks(taskRows).length === 0) return;
+		if (!options.tasks || taskWidgetRegistered || !inlineTaskWidgetVisible()) return;
 		ctx.ui.setWidget(
 			TASK_WIDGET_KEY,
 			(widgetTui, theme) => {
 				tui = widgetTui;
 				return {
-					render: (width: number) =>
-						renderInlineTasks(taskRows, taskColorIndex, bindThemeFg(theme), width, listView?.rows ?? [], now()),
+					// Pi's above-editor widgets get a leading spacer but nothing below, so own
+					// the gap to the editor's top border.
+					render: (width: number) => {
+						const lines = renderInlineTasks(
+							taskRows,
+							taskColorIndex,
+							bindThemeFg(theme),
+							width,
+							listView?.rows ?? [],
+							now(),
+							inlineTaskLimit(),
+						);
+						return lines.length === 0 ? lines : [...lines, ""];
+					},
 					invalidate() {},
 				};
 			},
@@ -425,7 +457,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 				(options.tasks.colors() ?? []).flatMap((item) => (item.color ? [[item.name, item.color] as const] : [])),
 			);
 			normalizeTaskSelection();
-			if (enabled() && inlineTasks(taskRows).length > 0) installTaskWidget();
+			if (enabled() && inlineTaskWidgetVisible()) installTaskWidget();
 			else if (taskWidgetRegistered) removeWidgets(TASK_WIDGET_KEY);
 		} catch (error) {
 			taskError = error instanceof Error ? error.message : String(error);
@@ -1472,7 +1504,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			updateStatusLine();
 
 			syncInlineAgentWidget();
-			if (enabled() && inlineTasks(taskRows).length > 0) installTaskWidget();
+			if (enabled() && inlineTaskWidgetVisible()) installTaskWidget();
 			else if (taskWidgetRegistered) removeWidgets(TASK_WIDGET_KEY);
 
 			const runId = viewRunId;

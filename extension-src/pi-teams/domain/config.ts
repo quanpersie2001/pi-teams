@@ -6,7 +6,21 @@
 
 import { MAX_BUDGET_SECONDS } from "./time-policy.js";
 
-export type TasksAutomationSettings = { autoCascade: boolean; reminders: boolean };
+export type TasksAutomationSettings = {
+	autoCascade: boolean;
+	reminders: boolean;
+	/** Rows the inline Tasks widget renders; 0 hides the widget. */
+	inlineRows: InlineTaskRows;
+};
+
+/**
+ * Inline Tasks widget height choices. A fixed ladder keeps the widget bounded:
+ * it renders above the editor, so an arbitrary row count could crowd out the
+ * transcript. `0` means off.
+ */
+export type InlineTaskRows = 0 | 2 | 4 | 6;
+export const INLINE_TASK_ROW_CHOICES: readonly InlineTaskRows[] = [0, 2, 4, 6];
+export const DEFAULT_INLINE_TASK_ROWS: InlineTaskRows = 2;
 export type PeerSettings = { enabled: boolean; scope: "project" | "all"; policy: "hold" | "accept" | "refuse" };
 
 export type SubagentsSettings = {
@@ -35,7 +49,7 @@ export const MIN_MAX_CONCURRENT = 1;
 export const MAX_MAX_CONCURRENT = 1024;
 
 export const DEFAULT_SUBAGENTS_SETTINGS: Readonly<SubagentsSettings> = {
-	tasks: { autoCascade: false, reminders: false },
+	tasks: { autoCascade: false, reminders: false, inlineRows: DEFAULT_INLINE_TASK_ROWS },
 	peers: { enabled: false, scope: "project", policy: "hold" },
 	maxConcurrent: 4,
 	defaultMaxTurns: 30,
@@ -88,6 +102,13 @@ function boolOr(value: unknown, fallback: boolean): boolean {
 	return typeof value === "boolean" ? value : fallback;
 }
 
+function inlineRowsOr(value: unknown, fallback: InlineTaskRows): InlineTaskRows {
+	if (typeof value === "string" && value.trim().toLowerCase() === "off") return 0;
+	return typeof value === "number" && (INLINE_TASK_ROW_CHOICES as readonly number[]).includes(value)
+		? (value as InlineTaskRows)
+		: fallback;
+}
+
 /**
  * Sanitize one default budget setting. 0 = unlimited:
  * - non-number/non-finite → 0;
@@ -111,7 +132,7 @@ function budgetOrZero(value: unknown): number {
  *   positive fractions fall back to 0; whole seconds cap at MAX_BUDGET_SECONDS;
  * - fallbackSubagent must be a non-empty string, else "none";
  * - backend accepts only "auto" or "headless", else "auto";
- * - unknown keys are dropped (the result contains exactly the thirteen keys).
+ * - unknown keys are dropped (the result contains exactly the settings keys).
  */
 export function sanitizeSettings(raw: unknown): SubagentsSettings {
 	const source = toRecord(raw);
@@ -126,6 +147,7 @@ export function sanitizeSettings(raw: unknown): SubagentsSettings {
 		tasks: {
 			autoCascade: boolOr(tasks.autoCascade, DEFAULT_SUBAGENTS_SETTINGS.tasks.autoCascade),
 			reminders: boolOr(tasks.reminders, DEFAULT_SUBAGENTS_SETTINGS.tasks.reminders),
+			inlineRows: inlineRowsOr(tasks.inlineRows, DEFAULT_SUBAGENTS_SETTINGS.tasks.inlineRows),
 		},
 		maxConcurrent: clampInt(
 			source.maxConcurrent,

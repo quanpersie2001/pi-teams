@@ -7,7 +7,8 @@
 // corrupt file logs a warning and contributes no keys, while the other level
 // (or all-built-in defaults) still applies.
 //
-// Settings are read-only; operators own both global and project files.
+// This module only reads. Writes go through settings-writer.ts (the
+// `/teams-settings` command), which patches the operator's file in place.
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";

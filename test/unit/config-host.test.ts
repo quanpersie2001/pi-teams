@@ -197,12 +197,20 @@ describe("loadSubagentsSettings", () => {
 		const settings = await loadSubagentsSettings(rootDir, { agentDir });
 		expect(settings.maxConcurrent).toBe(MIN_MAX_CONCURRENT);
 		expect(settings.fallbackSubagent).toBe("none");
-		expect(settings.tasks).toEqual({ autoCascade: false, reminders: false });
+		expect(settings.tasks).toEqual({ autoCascade: false, reminders: false, inlineRows: 2 });
 		await writeFile(join(agentDir, "teams.json"), JSON.stringify({ tasks: { autoCascade: true } }));
 		await mkdir(join(rootDir, ".pi"), { recursive: true });
 		await writeFile(join(rootDir, ".pi", "teams.json"), JSON.stringify({ tasks: { reminders: true } }));
-		expect((await loadSubagentsSettings(rootDir, { agentDir })).tasks).toEqual({ autoCascade: true, reminders: true });
+		expect((await loadSubagentsSettings(rootDir, { agentDir })).tasks).toEqual({
+			autoCascade: true,
+			reminders: true,
+			inlineRows: 2,
+		});
 		await writeFile(join(rootDir, ".pi", "teams.json"), JSON.stringify({ tasks: { reminders: "yes" } }));
-		expect((await loadSubagentsSettings(rootDir, { agentDir })).tasks).toEqual({ autoCascade: true, reminders: false });
+		expect((await loadSubagentsSettings(rootDir, { agentDir })).tasks).toEqual({
+			autoCascade: true,
+			reminders: false,
+			inlineRows: 2,
+		});
 	});
 });

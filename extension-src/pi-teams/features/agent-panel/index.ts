@@ -115,10 +115,7 @@ export function renderAgentPanel(data: AgentPanelData, fg: ThemeFg, width: numbe
 	if (agents.length === 0 || width < 8) return [];
 	const index = selectionIndex(data.selection, agents) ?? 0;
 
-	const hint = data.selection !== null ? "↑↓ select · enter view · esc back · ←← hub" : "←← hub · ↓ to manage";
 	const lines: string[] = [];
-	lines.push(truncateToWidth(` team (${agents.length}) — ${fg("dim", hint)}`, width));
-	lines.push("");
 
 	const mainSelected = data.selection === null || index === 0;
 	const mainBullet = mainSelected ? fg("accent", "⏺") : fg("dim", "◯");
