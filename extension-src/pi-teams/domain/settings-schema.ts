@@ -294,39 +294,3 @@ export function projectChoices(spec: SettingSpec): readonly SettingChoice[] {
 	if (spec.scope === "global") return [];
 	return (spec.choices ?? []).filter((choice) => choice.projectAllowed !== false);
 }
-
-/** One left/right step on a row: a new explicit value, or a reset (key removal). */
-export type SettingStep = { kind: "value"; value: unknown } | { kind: "reset" };
-
-/**
- * Next state for one arrow press.
- *
- * Ladder keys (boolean/choice) cycle their choices, then — only when the edited
- * scope already holds an override — the reset state, so a project file can get
- * out of the way of the global value. Numeric keys step by one inside the
- * sanitizer's bounds; they never become negative or exceed a documented cap.
- */
-export function stepSettingValue(
-	spec: SettingSpec,
-	current: unknown,
-	options: { overridden: boolean; projectScope: boolean },
-	direction: -1 | 1,
-): SettingStep {
-	if (spec.kind === "integer" || spec.kind === "seconds") {
-		const start = typeof current === "number" && Number.isFinite(current) ? current : (spec.min ?? 0);
-		let next = Math.floor(start) + direction;
-		if (spec.min !== undefined) next = Math.max(spec.min, next);
-		if (spec.max !== undefined) next = Math.min(spec.max, next);
-		return { kind: "value", value: next };
-	}
-	const choices = options.projectScope ? projectChoices(spec) : (spec.choices ?? []);
-	const states: Array<{ kind: "value"; value: unknown } | { kind: "reset" }> = [
-		...choices.map((choice) => ({ kind: "value" as const, value: choice.value })),
-	];
-	if (options.overridden) states.push({ kind: "reset" });
-	if (states.length === 0) return { kind: "value", value: current };
-	const index = states.findIndex((state) => state.kind === "value" && state.value === current);
-	const start = index === -1 ? (direction > 0 ? -1 : 0) : index;
-	const next = states[(start + direction + states.length) % states.length];
-	return next ?? { kind: "value", value: current };
-}

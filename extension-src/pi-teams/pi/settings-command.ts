@@ -1,20 +1,20 @@
 // /teams-settings — edit pi-teams operational settings without leaving the TUI.
 //
 // Pi exposes no settings registry to extensions (its `/settings` and `pi config`
-// own Pi's own keys), so this command is the extension's own editor. Groups and
-// scopes are chosen with stock dialogs; the key list is a compact overlay sized
-// to its rows, where ←/→ change a value in place, because a modal per value
-// would make the common "tweak two numbers" case painful.
+// own Pi's own keys), so this command is the extension's own editor. It is
+// deliberately built from stock dialogs — scope, group, key, value — so there is
+// no custom key handling to maintain and the flow works in every UI-capable
+// host mode. ↑↓/Enter inside a dialog choose; there is no in-place editing.
 //
 // Every edit is validated by the domain schema before it reaches a file, and
 // the file is patched in place (unknown keys survive) by settings-writer.
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import type { TUI } from "@earendil-works/pi-tui";
 import type { SubagentsSettings } from "../domain/config.js";
 import {
 	formatSettingValue,
 	parseSettingText,
+	projectChoices,
 	rawSettingValue,
 	SETTING_GROUP_LABELS,
 	SETTING_SPECS,
@@ -22,9 +22,7 @@ import {
 	type SettingSpec,
 	settingKey,
 	settingValue,
-	stepSettingValue,
 } from "../domain/settings-schema.js";
-import { createSettingsEditorComponent, type SettingsEditorData } from "../features/settings-editor/index.js";
 import {
 	readScopeFile,
 	type SettingsScope,
@@ -38,7 +36,6 @@ export interface SettingsUiPort {
 	select: ExtensionUIContext["select"];
 	input: ExtensionUIContext["input"];
 	notify: ExtensionUIContext["notify"];
-	custom: ExtensionUIContext["custom"];
 }
 
 export interface SettingsCommandDeps extends SettingsWriterOptions {
@@ -48,7 +45,7 @@ export interface SettingsCommandDeps extends SettingsWriterOptions {
 	apply: () => Promise<Readonly<SubagentsSettings>>;
 }
 
-/** A change the editor asks for: a new explicit value, or a reset (key removal). */
+/** A change the flow asks for: a new explicit value, or a reset (key removal). */
 export type SettingChange = { kind: "value"; value: unknown } | { kind: "reset" };
 
 export interface SettingChangeResult {
@@ -58,8 +55,7 @@ export interface SettingChangeResult {
 }
 
 const BACK = "← Back";
-/** Widest the key list grows; longer lines would only add whitespace. */
-const SETTINGS_EDITOR_MAX_WIDTH = 96;
+const RESET = "reset to default (remove the key)";
 const SCOPES: readonly SettingsScope[] = ["global", "project"];
 
 function scopeLabel(scope: SettingsScope): string {
@@ -93,37 +89,19 @@ function specsFor(scope: SettingsScope, group: SettingGroup): readonly SettingSp
 	return SETTING_SPECS.filter((spec) => spec.group === group && (scope === "global" || spec.scope !== "global"));
 }
 
-/** Keys offered for one scope, with the level currently supplying each value. */
+/** Keys offered for one scope; a project file can never hold a global-only key. */
 function visibleSpecs(scope: SettingsScope): readonly SettingSpec[] {
 	return SETTING_SPECS.filter((spec) => scope === "global" || spec.scope !== "global");
 }
 
-async function buildData(
-	deps: SettingsCommandDeps,
-	scope: SettingsScope,
-	group: SettingGroup,
-): Promise<SettingsEditorData & { problem?: string }> {
-	const origins = await loadOrigins(deps);
-	const settings = deps.settings();
-	const items = specsFor(scope, group).map((spec) => ({
-		key: settingKey(spec),
-		label: spec.label,
-		spec,
-		value: formatSettingValue(spec, settingValue(settings, spec)),
-		origin: settingOrigin(spec, origins),
-		overridden: rawSettingValue(scope === "global" ? origins.global : origins.project, spec.path).present,
-		restart: spec.restart === true,
-	}));
-	return {
-		title: `${scopeLabel(scope)} · ${SETTING_GROUP_LABELS[group]}${origins.problem ? ` ⚠ ${origins.problem}` : ""}`,
-		items,
-		...(origins.problem === undefined ? {} : { problem: origins.problem }),
-	};
+function keyLine(spec: SettingSpec, deps: SettingsCommandDeps, origins: Origins): string {
+	const value = formatSettingValue(spec, settingValue(deps.settings(), spec));
+	return `${settingKey(spec)} = ${value}  [${settingOrigin(spec, origins)}]${spec.restart ? " · next session" : ""}`;
 }
 
 /**
  * Write one change and report the outcome. Writes are the only side effect, so
- * this is also the unit tests' entry point: the overlay is a thin shell.
+ * this is also the tests' entry point: the dialogs only ask for the change.
  */
 export async function applySettingChange(
 	deps: SettingsCommandDeps,
@@ -156,100 +134,60 @@ export async function applySettingChange(
 	};
 }
 
-async function openGroupEditor(
+async function editSetting(
+	ui: SettingsUiPort,
+	deps: SettingsCommandDeps,
+	scope: SettingsScope,
+	spec: SettingSpec,
+): Promise<void> {
+	let change: SettingChange;
+	if (spec.kind === "choice" || spec.kind === "boolean") {
+		const choices = scope === "global" ? (spec.choices ?? []) : projectChoices(spec);
+		const picked = await ui.select(`${scopeLabel(scope)} · ${settingKey(spec)} — ${spec.label}`, [
+			...choices.map((choice) => choice.label),
+			RESET,
+		]);
+		if (picked === undefined) return;
+		const choice = choices.find((candidate) => candidate.label === picked);
+		change = picked === RESET || choice === undefined ? { kind: "reset" } : { kind: "value", value: choice.value };
+	} else {
+		const current = formatSettingValue(spec, settingValue(deps.settings(), spec));
+		const text = await ui.input(`${settingKey(spec)} — ${spec.label} · current ${current}; empty resets`, current);
+		if (text === undefined) return;
+		if (text.trim() === "") {
+			change = { kind: "reset" };
+		} else {
+			const parsed = parseSettingText(spec, text);
+			if (!parsed.ok) {
+				ui.notify(`${settingKey(spec)}: ${parsed.reason}`, "error");
+				return;
+			}
+			change = { kind: "value", value: parsed.value };
+		}
+	}
+	const result = await applySettingChange(deps, scope, spec, change);
+	ui.notify(result.message, result.type);
+}
+
+async function editGroup(
 	ui: SettingsUiPort,
 	deps: SettingsCommandDeps,
 	scope: SettingsScope,
 	group: SettingGroup,
 ): Promise<void> {
-	let data = await buildData(deps, scope, group);
-	// One write at a time: a held arrow key must not interleave two file edits.
-	let queue: Promise<unknown> = Promise.resolve();
-	const run = (task: () => Promise<void>): void => {
-		queue = queue.then(task, task);
-	};
-	const refresh = async (): Promise<void> => {
-		data = await buildData(deps, scope, group);
-	};
-	// The editor renders only its own rows, so the overlay is a compact dialog
-	// instead of an empty fullscreen frame; width caps the stretched look on wide
-	// terminals while still following narrow ones.
-	let overlayTui: TUI | undefined;
-	await ui.custom<void>(
-		(tui, theme, _keybindings, done) => {
-			overlayTui = tui;
-			return createSettingsEditorComponent(tui, theme, {
-				getData: () => data,
-				onStep: (item, direction) => {
-					// Free text has no ladder and no meaningful ±1 step; Enter edits it.
-					if (item.spec.kind === "text") return;
-					const step = stepSettingValue(
-						item.spec,
-						settingValue(deps.settings(), item.spec),
-						{ overridden: item.overridden, projectScope: scope === "project" },
-						direction,
-					);
-					run(async () => {
-						await applyAndNotify(ui, deps, scope, item.spec, step);
-						await refresh();
-						tui.requestRender();
-					});
-				},
-				onEdit: (item) => {
-					run(async () => {
-						const current = formatSettingValue(item.spec, settingValue(deps.settings(), item.spec));
-						const text = await ui.input(`${item.key} — ${item.label} · current ${current}; empty resets`, current);
-						if (text === undefined) return;
-						let change: SettingChange = { kind: "reset" };
-						if (text.trim() !== "") {
-							const parsed = parseSettingText(item.spec, text);
-							if (!parsed.ok) {
-								ui.notify(`${item.key}: ${parsed.reason}`, "error");
-								return;
-							}
-							change = { kind: "value", value: parsed.value };
-						}
-						await applyAndNotify(ui, deps, scope, item.spec, change);
-						await refresh();
-						tui.requestRender();
-					});
-				},
-				onReset: (item) => {
-					if (!item.overridden) {
-						ui.notify(
-							`${item.key} has no ${scopeLabel(scope)} override; the effective value comes from ${item.origin}`,
-							"info",
-						);
-						return;
-					}
-					run(async () => {
-						await applyAndNotify(ui, deps, scope, item.spec, { kind: "reset" });
-						await refresh();
-						tui.requestRender();
-					});
-				},
-				onBack: () => done(undefined),
-			});
-		},
-		{
-			overlay: true,
-			overlayOptions: () => ({
-				anchor: "center",
-				width: Math.min(overlayTui?.terminal.columns ?? SETTINGS_EDITOR_MAX_WIDTH, SETTINGS_EDITOR_MAX_WIDTH),
-			}),
-		},
-	);
-}
-
-async function applyAndNotify(
-	ui: SettingsUiPort,
-	deps: SettingsCommandDeps,
-	scope: SettingsScope,
-	spec: SettingSpec,
-	change: SettingChange,
-): Promise<void> {
-	const result = await applySettingChange(deps, scope, spec, change);
-	ui.notify(result.message, result.type);
+	for (;;) {
+		const origins = await loadOrigins(deps);
+		const specs = specsFor(scope, group);
+		if (specs.length === 0) return;
+		const byLine = new Map(specs.map((spec) => [keyLine(spec, deps, origins), spec]));
+		const picked = await ui.select(
+			`${scopeLabel(scope)} · ${SETTING_GROUP_LABELS[group]}${origins.problem ? ` ⚠ ${origins.problem}` : ""}`,
+			[...byLine.keys(), BACK],
+		);
+		if (picked === undefined || picked === BACK) return;
+		const spec = byLine.get(picked);
+		if (spec) await editSetting(ui, deps, scope, spec);
+	}
 }
 
 async function editScope(ui: SettingsUiPort, deps: SettingsCommandDeps, scope: SettingsScope): Promise<void> {
@@ -260,7 +198,7 @@ async function editScope(ui: SettingsUiPort, deps: SettingsCommandDeps, scope: S
 		const picked = await ui.select(`${scopeLabel(scope)} settings · ${paths[scope]}`, [...byLabel.keys(), BACK]);
 		if (picked === undefined || picked === BACK) return;
 		const group = byLabel.get(picked);
-		if (group) await openGroupEditor(ui, deps, scope, group);
+		if (group) await editGroup(ui, deps, scope, group);
 	}
 }
 
