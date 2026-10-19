@@ -1,10 +1,11 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Markdown, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { DEFAULT_INLINE_TASK_ROWS } from "../../domain/config.js";
 import type { TaskProjection } from "../../domain/task-board.js";
 import type { AgentListRow } from "../../domain/ui-view.js";
 import { formatElapsedMs } from "../../shared/elapsed.js";
-import { bindThemeFg, type ThemeFg } from "../../shared/theme.js";
+import { bindThemeFg, type ThemeFg, type UiColorToken } from "../../shared/theme.js";
 import { plainMarkdownTheme, resolveMarkdownTheme } from "../agent-view/transcript-renderer.js";
 
 export type TaskFilter = "all" | "open" | "blocked" | "in_progress" | "in_review" | "completed" | "cancelled";
@@ -21,41 +22,72 @@ export interface TasksHubData {
 	now?: number;
 }
 
-function rgb(hex: string, text: string): string {
-	if (!/^#[\da-f]{6}$/i.test(hex)) return text;
-	return `\x1b[38;2;${Number.parseInt(hex.slice(1, 3), 16)};${Number.parseInt(hex.slice(3, 5), 16)};${Number.parseInt(hex.slice(5, 7), 16)}m${text}\x1b[39m`;
+/** Structural task view shared by the Hub, the inline widget and the default
+ *  tool renderers. `TaskProjection` satisfies it, and tool results parsed from
+ *  task JSON satisfy it without reconstructing the full board record. */
+export interface TaskRowView {
+	id: string;
+	code?: string | undefined;
+	title: string;
+	status: string;
+	assignee?: string | undefined;
+	owner?: string | undefined;
+	blockedBy?: readonly string[] | undefined;
+	attempts?: readonly { status: string; teammateName?: string | undefined; runId?: string | undefined }[] | undefined;
+	createdAt?: number | undefined;
 }
-function activeTaskRun(task: TaskProjection, runs: readonly AgentListRow[] = []): AgentListRow | undefined {
-	const attempt = task.attempts.at(-1);
+
+function activeTaskRun(task: TaskRowView, runs: readonly AgentListRow[] = []): AgentListRow | undefined {
+	const attempt = task.attempts?.at(-1);
 	if (!attempt) return undefined;
 	return runs.find((row) => row.id === attempt.runId && row.status === "running");
 }
-const statusGlyph = (task: TaskProjection, fg: ThemeFg, runs: readonly AgentListRow[] = []): string => {
-	if (task.status === "completed") return fg("success", "✓");
-	if (task.status === "cancelled") return fg("dim", "⊘");
-	if (activeTaskRun(task, runs)) return rgb("#00d7ff", "◉");
-	const latest = task.attempts.at(-1);
-	if (latest && (latest.status === "failed" || latest.status === "stopped")) return fg("error", "!");
-	if (task.status === "in_progress") return rgb("#3b82f6", "◼");
-	if (task.status === "in_review") return rgb("#a855f7", "◇");
-	return task.blockedBy.length ? rgb("#f59e0b", "◌") : fg("text", "○");
-};
 
-export function taskHeader(tasks: readonly TaskProjection[]): string {
-	const counts = [
-		[tasks.filter((t) => t.status === "completed").length, "done"],
-		[tasks.filter((t) => t.status === "in_progress").length, "in progress"],
-		[tasks.filter((t) => t.status === "pending").length, "open"],
-		[tasks.filter((t) => t.status === "in_review").length, "in review"],
-		[tasks.filter((t) => t.status === "cancelled").length, "cancelled"],
-	] as const;
-	return `● ${tasks.length} tasks (${counts
-		.filter(([count]) => count > 0)
-		.map(([count, name]) => `${count} ${name}`)
-		.join(", ")})`;
+/** Task status glyph (`docs/ui/AGENT-PANEL-AND-VIEW.md`). Fill tracks
+ *  progress — hollow `○`/`◌` not started, half `◐` claimed, `◉` live run,
+ *  `◆` review, `✓`/`⊘`/`✗`/`■` terminal — and colors are theme tokens (no
+ *  literal hex), so light and dark themes agree with `statusBadge`. */
+export function taskGlyph(
+	task: TaskRowView,
+	runs: readonly AgentListRow[] = [],
+): { icon: string; color: UiColorToken } {
+	if (task.status === "completed") return { icon: "✓", color: "success" };
+	if (task.status === "cancelled") return { icon: "⊘", color: "dim" };
+	if (activeTaskRun(task, runs)) return { icon: "◉", color: "accent" };
+	const latest = task.attempts?.at(-1);
+	if (latest?.status === "failed") return { icon: "✗", color: "error" };
+	if (latest?.status === "stopped") return { icon: "■", color: "dim" };
+	if (task.status === "in_progress") return { icon: "◐", color: "accent" };
+	if (task.status === "in_review") return { icon: "◆", color: "warning" };
+	if ((task.blockedBy?.length ?? 0) > 0) return { icon: "◌", color: "warning" };
+	return { icon: "○", color: "muted" };
 }
 
-export function inlineTasks(tasks: readonly TaskProjection[]): TaskProjection[] {
+function statusGlyph(task: TaskRowView, fg: ThemeFg, runs: readonly AgentListRow[] = []): string {
+	const glyph = taskGlyph(task, runs);
+	return fg(glyph.color, glyph.icon);
+}
+
+/** Status counts in display order, omitting zero categories. */
+function countSegments(tasks: readonly TaskRowView[]): string {
+	const counts = [
+		[tasks.filter((task) => task.status === "completed").length, "done"],
+		[tasks.filter((task) => task.status === "in_progress").length, "in progress"],
+		[tasks.filter((task) => task.status === "pending").length, "open"],
+		[tasks.filter((task) => task.status === "in_review").length, "in review"],
+		[tasks.filter((task) => task.status === "cancelled").length, "cancelled"],
+	] as const;
+	return counts
+		.filter(([count]) => count > 0)
+		.map(([count, name]) => `${count} ${name}`)
+		.join(", ");
+}
+
+export function taskHeader(tasks: readonly TaskRowView[]): string {
+	return `● ${tasks.length} tasks (${countSegments(tasks)})`;
+}
+
+export function inlineTasks<T extends TaskRowView>(tasks: readonly T[]): T[] {
 	return tasks.filter(
 		(task) => task.status === "pending" || task.status === "in_progress" || task.status === "in_review",
 	);
@@ -78,8 +110,8 @@ function oneLine(value: string): string {
 	return value.replace(/[\r\n]+/g, " ");
 }
 
-function taskIdentity(task: TaskProjection): string | undefined {
-	const latestTeammate = task.attempts.at(-1)?.teammateName;
+export function taskIdentity(task: TaskRowView): string | undefined {
+	const latestTeammate = task.attempts?.at(-1)?.teammateName;
 	if (task.status === "completed" || task.status === "cancelled") return latestTeammate ?? task.assignee ?? task.owner;
 	if (task.status === "pending") return task.assignee;
 	return task.owner ?? task.assignee ?? latestTeammate;
@@ -90,6 +122,18 @@ function identity(name: string | undefined, colors: ReadonlyMap<string, string>,
 	const color = colors.get(name);
 	if (!color || !/^#[\da-f]{6}$/i.test(color)) return fg("muted", `@${name}`);
 	return `\x1b[38;2;${Number.parseInt(color.slice(1, 3), 16)};${Number.parseInt(color.slice(3, 5), 16)};${Number.parseInt(color.slice(5, 7), 16)}m@${name}\x1b[39m`;
+}
+
+/** One-line task row: `<glyph> T3 @owner Title` plus blocked refs. Shared by the
+ *  inline widget and the default `tasks_*` tool renderers so both agree. */
+export function taskRow(
+	task: TaskRowView,
+	colors: ReadonlyMap<string, string>,
+	fg: ThemeFg,
+	runs: readonly AgentListRow[] = [],
+): string {
+	const blocked = (task.blockedBy?.length ?? 0) > 0 ? ` ${fg("warning", `← ${(task.blockedBy ?? []).join(",")}`)}` : "";
+	return `${statusGlyph(task, fg, runs)} ${fg("dim", task.code ?? task.id)} ${identity(taskIdentity(task), colors, fg)} ${oneLine(task.title)}${blocked}`;
 }
 
 export function tasksHubListWindow(
@@ -244,30 +288,60 @@ export function renderTasksHub(
 	return lines.slice(0, h);
 }
 
-function inlineTaskHeader(tasks: readonly TaskProjection[]): string {
+/** Inline widget head: `● Tasks (1 in progress, 5 open)`. The widget owns its
+ *  own head (there is no tool call line above it), so the lane name replaces
+ *  the board count and the counts tint dim. */
+function inlineTaskHeader(tasks: readonly TaskRowView[], fg: ThemeFg): string {
 	const counts = [
 		[tasks.filter((task) => task.status === "in_progress").length, "in progress"],
 		[tasks.filter((task) => task.status === "in_review").length, "in review"],
 		[tasks.filter((task) => task.status === "pending").length, "open"],
 	] as const;
-	return `● ${tasks.length} tasks (${counts
-		.filter(([count]) => count > 0)
-		.map(([count, name]) => `${count} ${name}`)
-		.join(", ")})`;
+	return `${fg("accent", "● Tasks")}${fg(
+		"dim",
+		` (${counts
+			.filter(([count]) => count > 0)
+			.map(([count, name]) => `${count} ${name}`)
+			.join(", ")})`,
+	)}`;
+}
+
+/** Rows the inline widget shows before the `… N more` tail; 0 hides it. */
+export const INLINE_TASK_ROWS = DEFAULT_INLINE_TASK_ROWS;
+
+/** Bounded task list card used by the default `tasks_list` renderer: header
+ *  counts plus a hanging card of `<glyph> T3 @owner Title` rows. */
+export function renderTaskList(
+	tasks: readonly TaskRowView[],
+	colors: ReadonlyMap<string, string>,
+	fg: ThemeFg,
+	width: number,
+	limit: number,
+	runs: readonly AgentListRow[] = [],
+): string[] {
+	if (!tasks.length || width < 8) return [];
+	const shown = tasks.slice(0, Math.max(1, Math.floor(limit)));
+	const lines = [truncateToWidth(`${fg("accent", "● Tasks")}${fg("dim", ` (${countSegments(tasks)})`)}`, width)];
+	for (const [index, task] of shown.entries())
+		lines.push(truncateToWidth(`${fg("dim", index === 0 ? "└─" : "  ")} ${taskRow(task, colors, fg, runs)}`, width));
+	if (tasks.length > shown.length)
+		lines.push(truncateToWidth(fg("dim", `   … ${tasks.length - shown.length} more`), width));
+	return lines;
 }
 
 export function renderInlineTasks(
-	tasks: readonly TaskProjection[],
+	tasks: readonly TaskRowView[],
 	colors: ReadonlyMap<string, string>,
 	fg: ThemeFg,
 	width: number,
 	runs: readonly AgentListRow[] = [],
 	now = Date.now(),
+	limit = INLINE_TASK_ROWS,
 ): string[] {
 	const visible = inlineTasks(tasks);
-	if (!visible.length || width < 8) return [];
+	if (!visible.length || width < 8 || limit <= 0) return [];
 	const ordered = [...visible].sort((a, b) => {
-		const rank = (task: TaskProjection) =>
+		const rank = (task: TaskRowView) =>
 			activeTaskRun(task, runs)
 				? 0
 				: task.status === "in_progress"
@@ -279,24 +353,23 @@ export function renderInlineTasks(
 							: task.status === "completed"
 								? 4
 								: 5;
-		return rank(a) - rank(b) || a.createdAt - b.createdAt;
+		return rank(a) - rank(b) || (a.createdAt ?? 0) - (b.createdAt ?? 0);
 	});
-	const lines = [truncateToWidth(fg("accent", inlineTaskHeader(visible)), width)];
-	const shown = ordered.slice(0, 2);
+	const lines = [truncateToWidth(inlineTaskHeader(visible, fg), width)];
+	const shown = ordered.slice(0, Math.max(1, Math.floor(limit)));
 	for (let i = 0; i < shown.length; i++) {
 		const task = shown[i];
 		if (!task) continue;
 		const running = activeTaskRun(task, runs);
-		const glyph = statusGlyph(task, fg, runs);
-		const who = taskIdentity(task);
 		const elapsed = running
-			? ` ${formatElapsedMs(Math.max(0, now - running.startedAt))} · ↓ ${running.totalTokens} tokens`
+			? ` ${fg("muted", `${formatElapsedMs(Math.max(0, now - running.startedAt))} · ↓ ${running.totalTokens} tokens`)}`
 			: "";
-		const line = `${i === shown.length - 1 ? "└─" : "├─"} ${glyph} ${task.code ?? task.id} ${identity(who, colors, fg)} ${oneLine(task.title)}${task.blockedBy.length ? ` ${fg("warning", `blocked by ${task.blockedBy.join(", ")}`)}` : ""}${elapsed ? fg("muted", elapsed) : ""}`;
-		lines.push(truncateToWidth(line, width));
+		// Hanging card: the first row carries the branch, the rest align under it.
+		const branch = fg("dim", i === 0 ? "└─" : "  ");
+		lines.push(truncateToWidth(`${branch} ${taskRow(task, colors, fg, runs)}${elapsed}`, width));
 	}
 	if (visible.length > shown.length)
-		lines.push(truncateToWidth(fg("muted", `  +${visible.length - shown.length} more tasks`), width));
+		lines.push(truncateToWidth(fg("dim", `   … ${visible.length - shown.length} more`), width));
 	return lines;
 }
 

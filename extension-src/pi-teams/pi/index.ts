@@ -20,6 +20,7 @@ import { registerPeerTools, reviewHeldMessages } from "./peer-tools.js";
 import { ProcessAgentExecutionBackend, resolveLauncherHint, resolveSessionLauncherHint } from "./process-backend.js";
 import { createSubagentRunStore, teamsArtifactDir } from "./registry-host.js";
 import { type SubagentsRpcWiring, wireSubagentsRpc } from "./rpc.js";
+import { registerSettingsCommand } from "./settings-command.js";
 import { summarizeRelevantTasks, TaskReminderCadence } from "./task-reminders.js";
 import { createTasksTools } from "./tasks-tools.js";
 import { eligibleTeammateNames, isTeammateMessageAvailable } from "./teammate-routing.js";
@@ -98,6 +99,13 @@ export default function (pi: ExtensionAPI): void {
 	let rpc: SubagentsRpcWiring | undefined;
 	const getAvailableTeammateNames = () =>
 		eligibleTeammateNames(app.teams?.current?.members ?? [], (name) => app.manager.teammateStatus(name));
+	/** Roster identity colors, shared by the Task Hub UI and the default task
+	 *  tool renderers so both name the same teammate in the same color. */
+	const getTeammateColors = () =>
+		app.teams?.current?.members.map((member) => ({
+			name: member.name,
+			...(member.color ? { color: member.color } : {}),
+		})) ?? [];
 	// No message renderer is registered: the teammate-notification customType
 	// plus its structured plain-text content IS the renderer contract exported
 	// for pi-style companions (docs/INTEGRATION.md); hosts without a renderer
@@ -108,6 +116,20 @@ export default function (pi: ExtensionAPI): void {
 		setInlineAgentsVisible: (visible) => uiHandle?.setInlineAgentsVisible(visible),
 	});
 	registerBackendCommand(pi, { backend });
+	registerSettingsCommand(pi, {
+		configCwd,
+		agentDir,
+		settings: () => app.manager.currentSettings,
+		// Keys that bind at session start (peers, cascade, launcher) report that in
+		// the UI; everything else is read from the manager on each use.
+		apply: async () => {
+			const next = await loadSubagentsSettings(configCwd, { agentDir });
+			currentTaskReminders = next.tasks.reminders;
+			app.updateSettings(next);
+			uiHandle?.refresh();
+			return app.manager.currentSettings;
+		},
+	});
 	registerSubagentTools(pi, app.manager, app.registry, app.delivery);
 	registerModelTools(pi);
 	pi.on("turn_end", () => app.delivery?.finishSpawnBatch());
@@ -143,6 +165,7 @@ export default function (pi: ExtensionAPI): void {
 	for (const tool of createTasksTools(
 		() => board,
 		() => taskExecution,
+		getTeammateColors,
 	))
 		pi.registerTool(tool);
 	pi.registerCommand("tasks", {
@@ -237,11 +260,7 @@ export default function (pi: ExtensionAPI): void {
 				return taskExecution.stop(id, { actor: { name: "lead", coordinator: true } });
 			},
 			executionTypes: () => app.registry.availableTypes,
-			colors: () =>
-				app.teams?.current?.members.map((member) => ({
-					name: member.name,
-					...(member.color ? { color: member.color } : {}),
-				})) ?? [],
+			colors: getTeammateColors,
 		};
 		uiHandle = installSubagentsUi(ctx, {
 			manager: app.manager,

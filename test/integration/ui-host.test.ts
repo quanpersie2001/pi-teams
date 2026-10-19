@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EditorFactory } from "@earendil-works/pi-coding-agent";
-import { type Component, Editor, type TUI } from "@earendil-works/pi-tui";
+import { type Component, Editor, stripTerminalSequences, type TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import { createAgentFocusPort } from "../../extension-src/pi-teams/app/focus-service.js";
 import { createPiSubagentsApp, type PiSubagentsApp } from "../../extension-src/pi-teams/app/index.js";
@@ -122,7 +122,9 @@ async function makeFixture(
 			await vi.waitFor(() => {
 				const factory = host.componentFactories.get("teams-agents");
 				const lines = factory?.({ requestRender() {} }, host.theme).render(100);
-				expect(lines?.[0]).toContain(`team (${app.manager.list().length})`);
+				// The panel owns a leading blank line: the gap from the editor's bottom border.
+				expect(lines?.[0]).toBe("");
+				expect(lines?.[1]).toContain("main");
 				if (description) expect(lines?.join("\n")).toContain(description);
 			});
 		}
@@ -212,7 +214,7 @@ describe("inline UI installation", () => {
 					.render(100)
 					.join("\\n") ?? "";
 			expect(widget()).toContain("TITLE_active");
-			expect(widget()).toContain("● 1 tasks (1 open)");
+			expect(stripTerminalSequences(widget())).toContain("● Tasks (1 open)");
 			expect(widget()).not.toContain("TITLE_done");
 			expect(widget()).not.toContain("TITLE_cancel");
 			fx.ui.openTasks();
@@ -228,7 +230,7 @@ describe("inline UI installation", () => {
 
 			rows = [makeTask("active", "in_progress"), makeTask("done", "completed"), makeTask("cancel", "cancelled")];
 			changed?.();
-			await vi.waitFor(() => expect(widget()).toContain("● 1 tasks (1 in progress)"));
+			await vi.waitFor(() => expect(stripTerminalSequences(widget())).toContain("● Tasks (1 in progress)"));
 			expect(widget()).toContain("TITLE_active");
 			expect(widget()).not.toContain("TITLE_done");
 			expect(allText()).toContain("3 tasks");
@@ -712,18 +714,15 @@ describe("inline UI installation", () => {
 			const agent = await fx.spawn("AGENT_WIDGET");
 			await vi.waitFor(() => expect(fx.host.widgets.get("teams-tasks")?.placement).toBe("aboveEditor"));
 			expect(fx.host.widgets.get("teams-agents")?.placement).toBe("belowEditor");
-			expect(
+			const widgetLines = (key: string) =>
 				fx.host.componentFactories
-					.get("teams-tasks")?.({ requestRender() {} }, fx.host.theme)
-					.render(100)
-					.join("\\n"),
-			).toContain("TASK_WIDGET");
-			expect(
-				fx.host.componentFactories
-					.get("teams-agents")?.({ requestRender() {} }, fx.host.theme)
-					.render(100)
-					.join("\\n"),
-			).toContain("AGENT_WIDGET");
+					.get(key)?.({ requestRender() {} }, fx.host.theme)
+					.render(100) ?? [];
+			expect(widgetLines("teams-tasks").join("\\n")).toContain("TASK_WIDGET");
+			expect(widgetLines("teams-agents").join("\\n")).toContain("AGENT_WIDGET");
+			// Breathing room against the editor: tasks pad below, the below-editor panel pads above.
+			expect(widgetLines("teams-tasks").at(-1)).toBe("");
+			expect(widgetLines("teams-agents")[0]).toBe("");
 			fx.backend.complete(agent, "done");
 			await fx.app.manager.waitForAll();
 			await vi.waitFor(() => expect(fx.host.widgets.has("teams-agents")).toBe(false));
@@ -731,6 +730,59 @@ describe("inline UI installation", () => {
 			fx.ui.dispose();
 			expect(fx.host.widgets.has("teams-agents")).toBe(false);
 			expect(fx.host.widgets.has("teams-tasks")).toBe(false);
+		} finally {
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("tasks.inlineRows turns the Tasks widget off and resizes it live", async () => {
+		const makeTask = (id: string, code: string): TaskProjection => ({
+			id,
+			code,
+			title: `TASK_${id}`,
+			status: "pending",
+			dependencies: [],
+			blockedBy: [],
+			requirementRevision: 1,
+			spec: {},
+			context: {},
+			attempts: [],
+			createdAt: 1,
+			updatedAt: 1,
+		});
+		const rows = Array.from({ length: 7 }, (_, index) => makeTask(`r${index}`, `T${index + 1}`));
+		const tasks: TasksUiPort = {
+			snapshot: () => rows,
+			subscribe: () => () => {},
+			create: () => rows[0] as TaskProjection,
+			update: () => rows[0] as TaskProjection,
+			cancel: () => rows[0] as TaskProjection,
+			execute: async () => ({ task: rows[0], runId: "run-task" }),
+			output: async () => ({ taskId: "r0" }),
+			stop: async () => false,
+			colors: () => [],
+			executionTypes: () => ["general-purpose"],
+		};
+		const fx = await makeFixture({ tasks });
+		const taskWidget = () =>
+			fx.host.componentFactories
+				.get("teams-tasks")?.({ requestRender() {} }, fx.host.theme)
+				.render(100) ?? [];
+		const applyInlineRows = async (inlineRows: number) => {
+			fx.app.updateSettings(sanitizeSettings({ tasks: { inlineRows } }));
+			fx.ui.refresh();
+		};
+		try {
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-tasks")).toBe(true));
+			// The default ladder value shows the header, two rows, the tail and the padding line.
+			expect(taskWidget()).toHaveLength(5);
+			await applyInlineRows(0);
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-tasks")).toBe(false));
+			await applyInlineRows(6);
+			await vi.waitFor(() => expect(fx.host.widgets.has("teams-tasks")).toBe(true));
+			// 6 rows cover all but one of the seven pending tasks: header + 6 + tail + padding.
+			expect(taskWidget()).toHaveLength(9);
 		} finally {
 			fx.ui.dispose();
 			await fx.app.sessionShutdown();

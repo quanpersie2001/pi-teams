@@ -110,18 +110,36 @@ describe("unified tasks presentation", () => {
 			["reviewer", "#AA22CC"],
 		]);
 		const inline = renderInlineTasks(tasks, colors, fg, 100);
-		expect(inline[0]).toContain("● 3 tasks (1 in progress, 1 in review, 1 open)");
+		expect(stripTerminalSequences(inline[0] ?? "")).toBe("● Tasks (1 in progress, 1 in review, 1 open)");
 		expect(inline.join("\n")).toContain("\x1b[38;2;232;121;249m@executor\x1b[39m");
 		expect(inline.join("\n")).not.toContain("T4");
 		expect(inline.join("\n")).not.toContain("T5");
-		expect(inline.at(-1)).toContain("+1 more tasks");
+		// Hanging card: the branch sits on the first row only and stays dim.
+		const wide = renderInlineTasks(tasks, colors, fg, 100, [], Date.now(), 3);
+		expect(wide[1]?.startsWith(fg("dim", "└─"))).toBe(true);
+		expect(wide[2]?.startsWith(fg("dim", "  "))).toBe(true);
+		expect(stripTerminalSequences(inline.at(-1) ?? "")).toBe("   … 1 more");
 		assertWidth(inline, 100);
 		const reviewOnly = renderInlineTasks([review], colors, fg, 100).join("\n");
-		expect(reviewOnly).toContain("● 1 tasks (1 in review)");
-		expect(reviewOnly).toContain("\x1b[38;2;168;85;247m◇\x1b[39m");
+		expect(stripTerminalSequences(reviewOnly)).toContain("● Tasks (1 in review)");
+		expect(reviewOnly).toContain(fg("warning", "◆"));
 		expect(reviewOnly).toContain("\x1b[38;2;170;34;204m@reviewer\x1b[39m");
 		expect(renderInlineTasks([completed, cancelled], colors, fg, 100)).toEqual([]);
 		expect(renderInlineTasks([], colors, fg, 100)).toEqual([]);
+	});
+
+	it("honours the row ladder: off renders nothing, 4 and 6 show more rows before the tail", () => {
+		const many = Array.from({ length: 7 }, (_, index) =>
+			task({ id: `t${index}`, code: `T${index + 1}`, status: "pending" as const }),
+		);
+		expect(renderInlineTasks(many, new Map(), fg, 100, [], Date.now(), 0)).toEqual([]);
+		for (const rows of [2, 4, 6]) {
+			const lines = renderInlineTasks(many, new Map(), fg, 100, [], Date.now(), rows);
+			// Header + rows + the remaining-count tail.
+			expect(lines).toHaveLength(rows + 2);
+			expect(stripTerminalSequences(lines.at(-1) ?? "")).toBe(`   … ${7 - rows} more`);
+			assertWidth(lines, 100);
+		}
 	});
 
 	it("keeps terminal tasks, outcomes and history in the Hub", () => {
@@ -154,8 +172,8 @@ describe("unified tasks presentation", () => {
 		expect(text).not.toContain("└─");
 		expect(text).toContain("\x1b[38;2;232;121;249m@reviewer\x1b[39m");
 		expect(text).toContain(fg("warning", "← T2"));
-		expect(text).toContain(fg("text", "○"));
-		expect(text).toContain("\x1b[38;2;59;130;246m◼\x1b[39m");
+		expect(text).toContain(fg("muted", "○"));
+		expect(text).toContain(fg("accent", "◐"));
 		assertWidth(renderTasksHub(data(tasks), fg, 110, 20), 110);
 	});
 
@@ -194,13 +212,13 @@ describe("unified tasks presentation", () => {
 			}),
 		];
 		const text = renderTasksHub(data(tasks, { runs: [run("r")] }), fg, 120, 30).join("\n");
-		expect(text).toContain("\x1b[38;2;0;215;255m◉\x1b[39m");
-		expect(text).toContain("\x1b[38;2;59;130;246m◼\x1b[39m");
-		expect(text).toContain("\x1b[38;2;245;158;11m◌\x1b[39m");
-		expect(text).toContain("\x1b[38;2;168;85;247m◇\x1b[39m");
+		expect(text).toContain(fg("accent", "◉"));
+		expect(text).toContain(fg("accent", "◐"));
+		expect(text).toContain(fg("warning", "◌"));
+		expect(text).toContain(fg("warning", "◆"));
 		expect(text).toContain(fg("success", "✓"));
 		expect(text).toContain(fg("dim", "⊘"));
-		expect(text).toContain(fg("error", "!"));
+		expect(text).toContain(fg("error", "✗"));
 	});
 
 	it("does not retain a historical failure glyph after a successful retry or terminal state", () => {
@@ -227,13 +245,13 @@ describe("unified tasks presentation", () => {
 		const cancelled = task({ id: "cancelled", status: "cancelled", attempts: retried.attempts.slice(0, 1) });
 		const retriedText = renderTasksHub(data([retried]), fg, 100, 12).join("\n");
 		const retriedRow = retriedText.split("\n").find((line) => line.includes("Inspect auth flow")) ?? "";
-		expect(retriedRow).not.toContain(fg("error", "!"));
-		expect(retriedRow).toContain("\x1b[38;2;59;130;246m◼\x1b[39m");
+		expect(retriedRow).not.toContain(fg("error", "✗"));
+		expect(retriedRow).toContain(fg("accent", "◐"));
 		expect(retried.attempts[0]?.status).toBe("failed");
 		const cancelledText = renderTasksHub(data([cancelled]), fg, 100, 12).join("\n");
 		const cancelledRow = cancelledText.split("\n").find((line) => line.includes("Inspect auth flow")) ?? "";
 		expect(cancelledRow).toContain(fg("dim", "⊘"));
-		expect(cancelledRow).not.toContain(fg("error", "!"));
+		expect(cancelledRow).not.toContain(fg("error", "✗"));
 	});
 
 	it("uses only live AgentRun snapshots for spinner and muted run metrics, and wraps multiline details", () => {
@@ -268,7 +286,7 @@ describe("unified tasks presentation", () => {
 			).join("\n"),
 		).toContain("Run metrics");
 		const noRuntime = renderTasksHub(data([running]), fg, 100, 12).join("\n");
-		expect(noRuntime).not.toContain("\x1b[38;2;0;215;255m◉\x1b[39m");
+		expect(noRuntime).not.toContain(fg("accent", "◉"));
 		const inline = renderInlineTasks([running], new Map(), fg, 100, [run("live", "running", 2048)], 5_000).join("\n");
 		expect(inline).toContain("4.0s · ↓ 2048 tokens");
 	});

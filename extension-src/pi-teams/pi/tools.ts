@@ -7,10 +7,17 @@
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentManager, budgetStopNote, type GetResultOptions, type SpawnRequest } from "../app/agent-manager.js";
+import {
+	type AgentManager,
+	budgetStopNote,
+	type GetResultOptions,
+	type SpawnRequest,
+	type TeammateStatus,
+} from "../app/agent-manager.js";
 import type { AgentRegistry } from "../app/agent-registry.js";
 import type { DeliveryService } from "../app/delivery-service.js";
 import type { MailboxService } from "../app/mailbox-service.js";
+import type { AgentRun } from "../domain/agent-run.js";
 import { isMailboxAddress } from "../domain/mailbox.js";
 import { LEAD_ADDRESS, normalizeTeammateColor, teammateNameProblem } from "../domain/team.js";
 import { isTeammateMessageAvailable } from "./teammate-routing.js";
@@ -75,6 +82,51 @@ export function registerLeadSendMessageTool(
 
 function textResult(text: string, details: Record<string, unknown> = {}, terminate = false) {
 	return { content: [{ type: "text" as const, text }], details, ...(terminate ? { terminate: true } : {}) };
+}
+
+/** Model-facing one-liner for a lifecycle receipt: `@name: idle · context
+ *  available · live run <id>`. Defaults are omitted (an `available` teammate is
+ *  the expected state) and a run id prints once when the live owner and the
+ *  latest assignment agree. */
+function teammateStatusLine(status: TeammateStatus): string {
+	const runs =
+		status.currentRunId !== undefined
+			? status.lastRunId !== undefined && status.lastRunId !== status.currentRunId
+				? `live run ${status.currentRunId} · last run ${status.lastRunId}`
+				: `live run ${status.currentRunId}`
+			: status.lastRunId !== undefined
+				? `last run ${status.lastRunId}`
+				: undefined;
+	const segments = [
+		status.state,
+		status.operation,
+		status.availability === "unavailable" ? "unavailable" : undefined,
+		`context ${status.contextAvailable ? "available" : "unavailable"}`,
+		runs,
+		status.recoveryError,
+	].filter((segment): segment is string => segment !== undefined);
+	return `@${status.name}: ${segments.join(" · ")}`;
+}
+
+/** Structured run snapshot for `get_subagent_result` details, so presentation
+ *  layers do not have to parse the human-readable record. */
+function runDetails(run: AgentRun): Record<string, unknown> {
+	return {
+		agentId: run.id,
+		...(run.teammateName !== undefined ? { teammateName: run.teammateName } : {}),
+		...(run.teammateColor !== undefined ? { color: run.teammateColor } : {}),
+		type: run.type,
+		status: run.status,
+		description: run.description,
+		...(run.model !== undefined ? { model: run.model } : {}),
+		toolUses: run.toolUses,
+		turns: run.turns,
+		totalTokens: run.usage.totalTokens,
+		...(run.completedAt !== undefined ? { durationMs: Math.max(0, run.completedAt - run.startedAt) } : {}),
+		...(run.resultFile !== undefined ? { resultFile: run.resultFile } : {}),
+		...(run.error !== undefined ? { error: run.error } : {}),
+		...(run.recoveryError !== undefined ? { recoveryError: run.recoveryError } : {}),
+	};
 }
 
 /** Only a durable interactive conversation can receive a later completion turn. */
@@ -187,6 +239,8 @@ function createTeammateLifecycleTool(manager: AgentManager, name: "teammate_rele
 			? "Cancel queued or running work, verify child cleanup, reconcile task attempts, archive mailbox, and remove membership without deleting history or worktrees. Lead-only tool."
 			: "Release a settled teammate's retained context. Does not alter task-board claims. Lead-only tool.",
 		parameters: Type.Object({ name: Type.String({ description: "Exact teammate name (without @)." }) }),
+		renderCall: (args) => new Text(`▸ ${name} @${String(args.name)}`, 0, 0),
+		renderResult: (result) => new Text(result.content[0]?.type === "text" ? result.content[0].text : "", 0, 0),
 		async execute(_id, args: { name: string }) {
 			try {
 				const changed = shutdown ? await manager.shutdownTeammate(args.name) : await manager.releaseTeammate(args.name);
@@ -461,7 +515,10 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 		async execute(_toolCallId, params, signal) {
 			const getResultOptions: GetResultOptions = { wait: params.wait === true };
 			if (signal !== undefined) getResultOptions.signal = signal;
-			return textResult(await manager.getResult(params.agent_id as string, getResultOptions));
+			const text = await manager.getResult(params.agent_id as string, getResultOptions);
+			const run = manager.get(params.agent_id as string);
+			// Details are additive presentation metadata; the text stays the contract.
+			return run ? textResult(text, runDetails(run)) : textResult(text);
 		},
 	});
 
@@ -488,17 +545,16 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 
 		async execute(_toolCallId, params) {
 			const agentId = params.agent_id as string;
-			const status = manager.get(agentId)?.status;
-			const queued = status === "queued" || status === "starting";
+			const run = manager.get(agentId);
+			// Address the teammate by name when the run is known; the raw id stays
+			// visible only as the unknown-id fallback.
+			const label = run?.teammateName !== undefined ? `@${run.teammateName}` : `agent ${agentId}`;
+			const queued = run?.status === "queued" || run?.status === "starting";
 			const accepted = await manager.steer(agentId, params.message as string);
 			if (!accepted) {
-				return textResult(`Agent "${String(params.agent_id)}" cannot be steered (unknown id, or no longer running).`);
+				return textResult(`${label} cannot be steered (unknown id, or no longer running).`);
 			}
-			return textResult(
-				queued
-					? `Steering accepted and queued for agent ${String(params.agent_id)}.`
-					: `Steering accepted by agent ${String(params.agent_id)}.`,
-			);
+			return textResult(queued ? `Steering accepted and queued for ${label}.` : `Steering accepted by ${label}.`);
 		},
 	});
 
@@ -508,13 +564,12 @@ export function createSubagentTools(manager: AgentManager, registry: AgentRegist
 		description:
 			"Inspect a named teammate's lifecycle state, recovery availability and live-context availability. State is idle, busy (including queued work), or released; inspect `operation` for shutdown progress. `contextAvailable` is true only for idle with a verified backend/handle and no recovery/unavailability; `currentRunId` names the live runtime owner, while `lastRunId` is the latest assignment artifact. Use this before deciding whether to continue, start fresh, message, release or shutdown. Lead-only tool.",
 		parameters: Type.Object({ name: Type.String({ description: "Exact teammate name (without @)." }) }),
+		renderCall: (args) => new Text(`▸ teammate_status @${String(args.name)}`, 0, 0),
+		renderResult: (result) => new Text(result.content[0]?.type === "text" ? result.content[0].text : "", 0, 0),
 		execute: async (_id, args: { name: string }) => {
 			const status = manager.teammateStatus(args.name);
 			if (!status) return textResult(`Unknown teammate: ${args.name}`, { name: args.name, found: false });
-			return textResult(
-				`@${status.name}: ${status.state}; ${status.availability}; context ${status.contextAvailable ? "available" : "unavailable"}${status.currentRunId ? ` (live run ${status.currentRunId})` : ""}${status.lastRunId ? ` (last run ${status.lastRunId})` : ""}${status.recoveryError ? ` — ${status.recoveryError}` : ""}`,
-				{ ...status },
-			);
+			return textResult(teammateStatusLine(status), { ...status });
 		},
 	});
 	const teammateReleaseTool = createTeammateLifecycleTool(manager, "teammate_release");

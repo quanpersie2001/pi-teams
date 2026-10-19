@@ -189,7 +189,7 @@ describe("teammate lifecycle tools", () => {
 			undefined,
 			fixture.host.extensionContext,
 		);
-		expect(textOf(result)).toContain("@worker: idle; available");
+		expect(textOf(result)).toContain("@worker: idle · context available · live run run-live · last run run-last");
 		expect(result.details).toMatchObject(status);
 	});
 
@@ -617,9 +617,13 @@ describe("get_subagent_result tool", () => {
 		const first = textOf(await pending);
 		expect(first).toContain("the full result");
 
-		const second = textOf(await getResult.execute("call-5", { agent_id: record.id }, NO_SIGNAL, undefined, undefined));
+		const repeat = await getResult.execute("call-5", { agent_id: record.id }, NO_SIGNAL, undefined, undefined);
+		const second = textOf(repeat);
 		expect(second).toContain("the full result");
 		expect(fixture.app.manager.get(record.id)?.resultConsumed).toBe(true);
+		// Structured details let presentation layers skip parsing the record text.
+		expect(repeat.details).toMatchObject({ agentId: record.id, type: "general-purpose", status: "completed" });
+		expect(typeof (repeat.details as { durationMs?: unknown } | undefined)?.durationMs).toBe("number");
 	});
 
 	it("reports still-running state without consuming", async () => {
@@ -643,6 +647,7 @@ describe("steer_subagent tool", () => {
 			type: "general-purpose",
 			prompt: "work",
 			run_in_background: true,
+			...NAMED,
 		});
 		await new Promise<void>((resolve) => {
 			const poll = (): void => {
@@ -653,8 +658,16 @@ describe("steer_subagent tool", () => {
 		});
 
 		const steer = fixture.tools.get("steer_subagent");
-		await steer.execute("call-7", { agent_id: record.id, message: "focus on auth" }, NO_SIGNAL, undefined, undefined);
+		const accepted = await steer.execute(
+			"call-7",
+			{ agent_id: record.id, message: "focus on auth" },
+			NO_SIGNAL,
+			undefined,
+			undefined,
+		);
 		expect(fixture.backend.steers.some((entry) => entry.message === "focus on auth")).toBe(true);
+		// The receipt addresses the teammate, never the raw run id.
+		expect(textOf(accepted)).toBe("Steering accepted by @worker.");
 
 		const bad = textOf(
 			await steer.execute("call-8", { agent_id: "ghost", message: "hi" }, NO_SIGNAL, undefined, undefined),
