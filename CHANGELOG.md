@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.10] - 2026-10-19
+
+### Features
+
+- *(settings)* In-app settings editor, schema and writer
+- *(ui)* Task glyph table, hanging cards and default task renderers
+
+### Refactor
+
+- *(settings)* Drop the arrow key-list overlay for sequential dialogs
+
 ## [0.1.9] - 2026-10-18
 
 ### Bug Fixes
