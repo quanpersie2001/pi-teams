@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.11] - 2026-10-20
+
+### Features
+
+- *(cli)* Add process-scoped pi-teams disable flag
+
 ## [0.1.10] - 2026-10-19
 
 ### Features
