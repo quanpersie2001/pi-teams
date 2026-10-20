@@ -11,6 +11,7 @@ import { DEFAULT_SUBAGENTS_SETTINGS } from "../domain/config.js";
 import { loadAgentMarkdownFiles, resolveAgentSourceDirs } from "./agent-files.js";
 import { installAgentMentionAutocomplete, installTeammateMentionRouting } from "./agent-mention-autocomplete.js";
 import { shouldSkipExtensionInChildSession } from "./child-guard.js";
+import { DISABLE_PI_TEAMS_FLAG, isDisabledByCli } from "./cli-flag.js";
 import { registerAgentsCommand, registerBackendCommand } from "./commands.js";
 import { loadSubagentsSettings } from "./config-host.js";
 import { createPiDeliveryHost, installLeadMailbox } from "./delivery-host.js";
@@ -32,7 +33,12 @@ import { createGitRunner, worktreeTmpRoot } from "./worktree-host.js";
 
 /** Parent extension. Children load only specialist tools and allowlisted presentation extensions. */
 export default function (pi: ExtensionAPI): void {
-	if (shouldSkipExtensionInChildSession()) return;
+	pi.registerFlag(DISABLE_PI_TEAMS_FLAG, {
+		type: "boolean",
+		default: false,
+		description: "Disable pi-teams tools, commands, UI, and lifecycle hooks for this process",
+	});
+	if (shouldSkipExtensionInChildSession() || isDisabledByCli()) return;
 	const configCwd = process.cwd();
 	const agentDir = getAgentDir();
 	let latestCtx: ExtensionContext | undefined;

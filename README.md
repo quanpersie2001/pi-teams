@@ -26,6 +26,16 @@ Requires **Node.js ≥22.19** and **Pi ≥1.0.4 and <1.1.0**.
 pi install npm:@quandev104/pi-teams
 ```
 
+### Disable for one process
+
+```bash
+pi --disable-pi-teams
+```
+
+`--disable-pi-teams` skips all pi-teams tools, commands, UI, and lifecycle hooks for that process only. Omit it to use pi-teams normally; no settings are saved. MCP and other extensions are unaffected. Package skills (`team-lead`, `create-agent`) are still discovered independently.
+
+The flag requires pi-teams to load: do not combine it with `--no-extensions` (`-ne`), which makes it an unknown option. Hosts that start auxiliary Pi processes with `--no-extensions` must omit the flag for those calls too.
+
 ## Quick start
 
 Ask Pi to split a bounded feature into implementation and review, for example:
