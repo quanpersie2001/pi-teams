@@ -145,22 +145,13 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("tool_result", (event) => {
 		if (event.toolName.startsWith("tasks_")) reminderCadence.taskToolUsed();
 	});
-	pi.on("context", (event) => {
+	pi.on("turn_end", () => {
 		if (!currentTaskReminders || !reminderCadence.consume()) return;
 		const summary = board ? summarizeRelevantTasks(board) : undefined;
 		if (!summary) return;
-		return {
-			messages: [
-				...event.messages,
-				{
-					role: "custom" as const,
-					customType: "task-reminder",
-					content: summary,
-					display: false,
-					timestamp: Date.now(),
-				},
-			],
-		};
+		// Persist at the safe turn boundary: a request-only context message would
+		// disappear on replay and invalidate thinking signatures bound to it.
+		pi.sendMessage({ customType: "task-reminder", content: summary, display: false }, { triggerTurn: false });
 	});
 	registerLeadSendMessageTool(
 		pi,

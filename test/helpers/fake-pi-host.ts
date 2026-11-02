@@ -302,7 +302,7 @@ export class FakePiHost {
 	}
 
 	async emit<T extends ExtensionEvent["type"]>(type: T, event: Extract<ExtensionEvent, { type: T }>): Promise<void> {
-		for (const handler of this.handlers.get(type) ?? []) await handler(event, this.context);
+		for (const handler of [...(this.handlers.get(type) ?? [])]) await handler(event, this.context);
 	}
 
 	private createApi(): ExtensionAPI {
@@ -311,6 +311,10 @@ export class FakePiHost {
 				const list = this.handlers.get(event) ?? [];
 				list.push(handler as unknown as Handler);
 				this.handlers.set(event, list);
+				return () => {
+					const index = list.indexOf(handler as unknown as Handler);
+					if (index !== -1) list.splice(index, 1);
+				};
 			},
 			registerCommand: (name, options) => {
 				this.commands.set(name, options);
