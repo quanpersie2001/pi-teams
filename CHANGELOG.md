@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.12] - 2026-11-02
+
+### Bug Fixes
+
+- Persist task reminders to preserve thinking replay context
+
 ## [0.1.11] - 2026-10-20
 
 ### Features
