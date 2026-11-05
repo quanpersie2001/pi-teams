@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.13] - 2026-11-05
+
+### Documentation
+
+- *(skills)* Improve team decomposition and review workflow
+
 ## [0.1.12] - 2026-11-02
 
 ### Bug Fixes
