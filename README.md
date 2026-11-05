@@ -142,7 +142,7 @@ To have Pi create a focused specialist, use the bundled skill:
 /skill:create-agent Create a read-only API documentation reviewer
 ```
 
-For delegation patterns and task-board workflows, try `/skill:team-lead`.
+For context-bounded work splitting, dependency-aware delegation, and task-board workflows, try `/skill:team-lead`. It includes investigation, parallel-work, and implementation/review playbooks, with combined-state verification and a fix–re-review–accept loop. Detailed lifecycle and handoff contracts are loaded only when needed.
 
 ## Workspaces
 

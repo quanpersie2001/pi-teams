@@ -1,0 +1,44 @@
+{
+  "skill_name": "team-lead",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Planning-only exercise; do not inspect a real repository or execute assignments. A local app needs workspace notification preferences persisted with backward-compatible defaults, consumed by a scheduler, and editable in its settings UI. The relevant areas are config parsing/storage, scheduler behavior, and UI controls/tests. The schema and migration contract are not settled. Teammates share the checkout; children cannot delegate. Plan the work and draft bounded briefs, dependencies, verification and acceptance gates. Available roles are general-purpose, explore, scout and reviewer. Explain which parts can run together and when context should be reset. Do not implement or invent test results.",
+      "expected_output": "A discovery/contract wave precedes bounded implementation slices; write ownership, slice-specific inputs, combined verification and independent review are explicit. The feature is not handed wholesale to one worker.",
+      "files": [],
+      "expectations": [
+        "Resolves the schema/default/migration contract before dependent implementation.",
+        "Assigns independently verifiable slices with explicit write ownership rather than one full-feature worker or child fan-out.",
+        "Limits each brief to relevant decisions/artifacts rather than sending all reports or the full transcript.",
+        "Includes integration, combined behavioral verification, independent review, and fix/recheck before final acceptance.",
+        "Does not assume shared checkout provides isolation or invent per-invocation isolation/context fields for tasks_execute."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Planning-only exercise; do not run tools against a real task board. T7 is a review-requested tracked task currently in_review. Its completed worker attempt says implementation is done, but supplies only HEAD abc123, while the checkout has uncommitted changes and no tests were run. The bundled reviewer has read/grep/find/ls only. Outline the exact next handoff and task transitions if review finds a regression, including who fixes it and when T7 can be accepted. Do not fabricate a diff, a passing check or a review verdict.",
+      "expected_output": "The lead captures a usable dirty-state comparison and test evidence, obtains independent review, releases settled work to pending before a fix execution (or uses a separate fix task), then verifies/reviews the changed artifact and accepts through in_review.",
+      "files": [],
+      "expectations": [
+        "Does not accept the task based on worker completion or HEAD alone; identifies the uncommitted artifact state.",
+        "Provides readable comparison evidence, intent/criteria and executable check evidence without asking reviewer to use git/bash or run tests.",
+        "Uses legal task transitions for fix execution, retaining reviewRequested and returning through in_review before completion.",
+        "Treats reviewRequested as a status gate rather than an automatically executed independent review.",
+        "Requires affected verification and re-review after fixes at the new artifact identity."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Planning-only exercise. A read-only audit was divided into config behavior, runtime lifecycle, and UI state coverage. Config returned cited findings. Runtime hit its context limit and says its scope grew to include several unrelated modules. UI has not returned a terminal result, only a progress message. A replacement runtime worker is available, but the old run has uncertain cleanup. Explain how to recover, what each follow-up receives, and what may be reported now. The user requested findings and recommendations only, not fixes. Do not execute assignments or invent results.",
+      "expected_output": "Preserves required coverage gaps, narrows remaining runtime investigation and transfers concise context after safe settlement, uses bounded retries, does not poll or treat UI progress as completion, and stays read-only.",
+      "files": [],
+      "expectations": [
+        "Reports runtime/UI as missing required coverage rather than declaring the whole audit complete.",
+        "Splits or narrows oversized remaining investigation and transfers relevant accepted facts/artifacts rather than the whole transcript.",
+        "Resolves uncertain run/cleanup state before replacement instead of assuming failure means settlement.",
+        "Uses a bounded recovery budget and treats UI progress as nonterminal without passive polling.",
+        "Preserves the read-only scope and does not implement recommendations."
+      ]
+    }
+  ]
+}

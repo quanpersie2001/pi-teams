@@ -26,7 +26,7 @@ The file has YAML frontmatter followed by the system-prompt body. The declared `
 | --- | --- |
 | `name` | Specialist identifier. Explicitly include it. |
 | `description` | Concise single-sentence “Use this agent when…” trigger. Quote YAML strings when needed. |
-| `tools` | Minimal built-in allowlist, e.g. `read, grep, find, ls`. Available built-ins: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Omission permits the default built-in toolset; `none` explicitly permits no tools. |
+| `tools` | Minimal built-in allowlist, e.g. `read, grep, find, ls`. Available built-ins: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Omission permits the default built-in toolset; `none` permits no built-in tools. Team messaging and task tools are injected separately; this is not a boundary against coordination-state mutations. |
 | `model` | Optional native `provider/modelId` string, not a role, list, or invented model identifier. Omit normally to inherit. Pin only a known available model for a concrete reason. |
 | `thinking` | Optional `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; omit to allow invocation/native defaults. |
 | `max_turns` | Optional nonnegative integer. Omission defers to the invocation limit, then configuration (default 30); `0` explicitly pins unlimited. Do not use unlimited as a routine default. |
@@ -91,6 +91,8 @@ After a new session loads the file, call the model-facing **`Agent`** tool with 
   "prompt": "Review the recent changes in src/auth/session.ts and test/auth/session.test.ts. Intended behavior: expired sessions must be rejected before protected handlers run. Change context: the expiry check was moved from the handler into the session lookup; inspect the current functions and tests for ordering regressions. Use only read-only tools; do not edit files or run checks. Report actionable defects with file/line evidence, concrete failure scenarios, and a scope/verification note. Limit review to these changes and directly relevant callers. This is current-code change context, not a supplied diff; state that limitation.",
   "description": "Review session expiry changes",
   "subagent_type": "changed-code-review",
+  "name": "session-reviewer",
+  "color": "#47a3e8",
   "run_in_background": false
 }
 ```
