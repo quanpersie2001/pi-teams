@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.15] - 2026-11-12
+
+### Bug Fixes
+
+- *(ui)* Keep agent roster below status rows
+
 ## [0.1.14] - 2026-11-12
 
 ### Bug Fixes
