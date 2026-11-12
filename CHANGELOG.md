@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.14] - 2026-11-12
+
+### Bug Fixes
+
+- Harden teammate lifecycle and integrate native status footers
+
 ## [0.1.13] - 2026-11-05
 
 ### Documentation
