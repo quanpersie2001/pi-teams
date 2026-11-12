@@ -28,6 +28,13 @@ export interface ProcessLauncher {
 	available(): Promise<boolean>;
 	launch(spec: ChildLaunchSpec): Promise<LauncherHandle>;
 	alive(handle: LauncherHandle): Promise<boolean | undefined>;
+	/**
+	 * Read-only cleanup admission: return a new full handle only after revalidating
+	 * original immutable ownership. Never signal, mutate the receipt, or rebind a
+	 * recorded identity. Undefined keeps cleanup fenced (cleanupExited may still
+	 * prove exit); absence preserves the existing full-handle cleanup contract.
+	 */
+	recoverForCleanup?(handle: LauncherHandle): Promise<LauncherHandle | undefined>;
 	/** Clean up only after proving the original process/group is gone and owned resources are safe to release. */
 	cleanupExited(handle: LauncherHandle): Promise<boolean>;
 	terminate(handle: LauncherHandle): Promise<void>;
@@ -42,7 +49,12 @@ export interface ProcessLauncher {
 	attach?(handle: LauncherHandle): Promise<void>;
 }
 export class ProcessLaunchCleanupPendingError extends Error {
-	constructor(message: string, options?: ErrorOptions) {
+	/** Partial identity is retained for recovery, never permission to signal an unverified process. */
+	constructor(
+		message: string,
+		options?: ErrorOptions,
+		readonly handle?: LauncherHandle,
+	) {
 		super(message, options);
 		this.name = "ProcessLaunchCleanupPendingError";
 	}

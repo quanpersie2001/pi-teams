@@ -2,15 +2,17 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import type { SerializableBackendHandle } from "../app/run-registry.js";
-import type {
-	AgentBackendHandle,
-	AgentExecutionBackend,
-	AgentLaunchInput,
-	AgentResumeInput,
-	BackendStatus,
-	ModelAdmission,
-	ModelAdmissionInput,
+import {
+	type AgentBackendHandle,
+	type AgentExecutionBackend,
+	AgentLaunchCleanupPendingError,
+	type AgentLaunchInput,
+	type AgentResumeInput,
+	type BackendStatus,
+	type ModelAdmission,
+	type ModelAdmissionInput,
 } from "../domain/backend.js";
 import {
 	type ChildBootstrap,
@@ -59,6 +61,7 @@ interface ChildConnection {
 	detached: boolean;
 	presentationListeners: Set<(available: boolean) => void>;
 	closed: boolean;
+	launchCleanupPending?: true;
 	identityFailure?: ChildProtocolError;
 	refreshing: boolean;
 	refreshAgain: boolean;
@@ -152,6 +155,8 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	readonly kind = "process" as const;
 	private readonly launchers: readonly ProcessLauncher[];
 	private readonly runs = new Map<string, RunConnection>();
+	/** Recovery-only receipts: never adopt a failed launch as an admitted assignment. */
+	private readonly pendingLaunches = new Map<string, SerializableBackendHandle>();
 	private readonly children = new Map<string, ChildConnection>();
 	private readonly options: ProcessBackendOptions;
 	private readonly admitModel: (input: ModelAdmissionInput) => Promise<ModelAdmission>;
@@ -258,7 +263,12 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			child.viewerBootstrapFile = viewerBootstrapFile;
 			for (const listener of [...child.presentationListeners]) listener(true);
 		} catch (error) {
-			rmSync(viewerBootstrapFile, { force: true });
+			if (error instanceof ProcessLaunchCleanupPendingError && error.handle?.childId === viewerId) {
+				child.viewerHandle = error.handle;
+				child.viewerBootstrapFile = viewerBootstrapFile;
+			} else {
+				rmSync(viewerBootstrapFile, { force: true });
+			}
 			throw error;
 		}
 	}
@@ -281,7 +291,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	private async reconcilePresentationLocked(): Promise<void> {
 		const withinThreshold = this.livingChildCount() <= 6;
 		for (const child of this.children.values()) {
-			if (child.closed || !child.presentationLauncher) continue;
+			if (child.closed || child.launchCleanupPending || !child.presentationLauncher) continue;
 			if (child.viewerHandle) {
 				const exited = (await child.presentationLauncher.alive(child.viewerHandle).catch(() => undefined)) === false;
 				if (exited && (await child.presentationLauncher.cleanupExited(child.viewerHandle).catch(() => false))) {
@@ -427,17 +437,39 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			await this.refreshChild(child);
 			return { kind: "process", handle: run.runId };
 		} catch (error) {
-			if (error instanceof ProcessLaunchCleanupPendingError)
-				throw new AggregateError(
-					[error],
-					`Child launcher cleanup remains unverified. Recovery bootstrap: ${configFile}`,
-				);
+			const retainOwnership = (errors: unknown[], message: string): never => {
+				if (!handle) throw new AggregateError(errors, message);
+				this.pendingLaunches.set(input.runId, {
+					kind: "process",
+					childId,
+					socketPath: bootstrap.socketPath,
+					token: bootstrap.token,
+					runDir,
+					launcher: handle,
+					...(child?.viewerHandle ? { viewer: child.viewerHandle } : {}),
+				});
+				if (child) {
+					child.launchCleanupPending = true;
+					child.connected = false;
+					child.detached = true;
+					this.unwatch(child);
+					child.client.disconnect();
+				}
+				throw new AgentLaunchCleanupPendingError(errors, message, { kind: "process", handle: input.runId });
+			};
+			if (
+				error instanceof ProcessLaunchCleanupPendingError &&
+				(error.handle?.childId === childId || (!error.handle && !handle))
+			) {
+				handle = error.handle ?? { kind: launcher.kind, childId };
+				retainOwnership([error], `Child launcher cleanup remains unverified. Recovery bootstrap: ${configFile}`);
+			}
 			if (error instanceof ChildProtocolError && error.code === "prompt_failed" && child) {
 				try {
 					this.acceptSnapshot(child, await child.client.state());
 				} catch (snapshotError) {
 					if (child.identityFailure)
-						throw new AggregateError(
+						retainOwnership(
 							[error, snapshotError],
 							`Child prompt failed and its authenticated outcome could not be reconciled. Recovery bootstrap: ${configFile}`,
 						);
@@ -466,7 +498,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				try {
 					await launcher.terminate(handle);
 				} catch (cleanupError) {
-					throw new AggregateError(
+					retainOwnership(
 						[failure, cleanupError],
 						`Child launch failed; cleanup failed. Recovery bootstrap: ${configFile}`,
 					);
@@ -476,7 +508,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 				try {
 					await this.closeViewer(child);
 				} catch (cleanupError) {
-					throw new AggregateError([failure, cleanupError], "Child launch failed and viewer cleanup was not verified.");
+					retainOwnership([failure, cleanupError], "Child launch failed and viewer cleanup was not verified.");
 				}
 				this.releaseChild(child);
 				this.children.delete(childId);
@@ -532,11 +564,14 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			}
 			throw error;
 		}
-		if (!child.snapshot || snapshot.seq >= child.snapshot.seq) child.snapshot = snapshot;
+		const previous = child.snapshot;
+		if (!previous || snapshot.seq >= previous.seq) child.snapshot = snapshot;
 		child.connected = true;
 		for (const run of this.runs.values()) if (run.child === child) this.updateRun(run);
 		const current = child.snapshot;
-		if (current) for (const listener of [...child.focusListeners]) listener(current);
+		// Focus observers may read state again; unchanged or stale RPC replies must not retrigger them.
+		if (current && !isDeepStrictEqual(previous, current))
+			for (const listener of [...child.focusListeners]) listener(current);
 	}
 	private watchChild(child: ChildConnection): void {
 		child.unlisten.push(
@@ -592,16 +627,22 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 					// Verified disappearance is an execution failure, never a successful result.
 					const exited = await child.launcher.cleanupExited(child.launcherHandle).catch(() => false);
 					if (exited) {
-						for (const run of this.runs.values())
-							if (run.child === child && !isSettled(run.status))
-								this.publish(run, {
-									state: "failed",
-									outcomeUnavailable: true,
-									error: "Child process exited before an RPC outcome was recovered.",
-									detail: "Child process exited before an RPC outcome was recovered.",
-								});
 						await this.closeViewer(child);
 						this.releaseChild(child);
+						for (const run of this.runs.values())
+							if (run.child === child)
+								this.publish(
+									run,
+									isSettled(run.status)
+										? { ...run.status, childExited: true }
+										: {
+												state: "failed",
+												outcomeUnavailable: true,
+												childExited: true,
+												error: "Child process exited before an RPC outcome was recovered.",
+												detail: "Child process exited before an RPC outcome was recovered.",
+											},
+								);
 						await this.reconcilePresentation();
 						return;
 					}
@@ -710,6 +751,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			previous.result === next.result &&
 			previous.error === next.error &&
 			previous.outcomeUnavailable === next.outcomeUnavailable &&
+			previous.childExited === next.childExited &&
 			previous.sessionFile === next.sessionFile &&
 			previous.turns === next.turns &&
 			previous.toolUses === next.toolUses &&
@@ -731,6 +773,8 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		return run;
 	}
 	async status(handle: AgentBackendHandle): Promise<BackendStatus> {
+		if (this.pendingLaunches.has(handle.handle))
+			return { state: "disconnected", detail: "Launch cleanup remains unverified." };
 		const run = this.requireRun(handle);
 		if (run.child.identityFailure) return { ...run.status };
 		if (run.child.detached) {
@@ -754,6 +798,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		return { ...run.status };
 	}
 	subscribe(handle: AgentBackendHandle, listener: (status: BackendStatus) => void): () => void {
+		if (this.pendingLaunches.has(handle.handle)) return () => {};
 		const run = this.requireRun(handle);
 		run.listeners.add(listener);
 		return () => run.listeners.delete(listener);
@@ -847,9 +892,18 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 	 * retained receipt), never a fabricated outcome.
 	 */
 	async enforceTerminate(handle: AgentBackendHandle, graceMs: number): Promise<BackendStatus> {
+		if (this.pendingLaunches.has(handle.handle)) {
+			await this.dispose(handle);
+			return {
+				state: "failed",
+				outcomeUnavailable: true,
+				childExited: true,
+				error: "Failed launch resources were cleaned up without a recovered execution outcome.",
+			};
+		}
 		const run = this.requireRun(handle);
 		const child = run.child;
-		if (child.closed) return { ...run.status };
+		if (child.closed) return { ...run.status, childExited: true };
 		// Cached-identity ownership gate — no RPC, no reconnect, no reattach.
 		// The run→child mapping was authenticated at launch (bootstrap childId,
 		// token+socketPath); the launcher handle must belong to that child, and a cached
@@ -895,22 +949,33 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		// The owned process group is gone: sibling runs sharing this child lost
 		// their resource; publish the verified-loss outcome honestly.
 		for (const other of this.runs.values()) {
-			if (other !== run && other.child === child && !isSettled(other.status)) {
-				this.publish(other, {
-					state: "failed",
-					outcomeUnavailable: true,
-					error: "Owned child process group was terminated by budget enforcement.",
-				});
+			if (other !== run && other.child === child) {
+				this.publish(
+					other,
+					isSettled(other.status)
+						? { ...other.status, childExited: true }
+						: {
+								state: "failed",
+								outcomeUnavailable: true,
+								childExited: true,
+								error: "Owned child process group was terminated by budget enforcement.",
+							},
+				);
 			}
 		}
-		return {
-			state: "stopped",
-			...(snapshot?.sessionFile && existsSync(snapshot.sessionFile) ? { sessionFile: snapshot.sessionFile } : {}),
-			...(snapshot?.usage ? { usage: { ...snapshot.usage } } : {}),
-			...(snapshot?.turns !== undefined ? { turns: snapshot.turns } : {}),
-			...(snapshot?.toolUses !== undefined ? { toolUses: snapshot.toolUses } : {}),
-			detail: "budget enforcement: owned child process group terminated after ignoring the cooperative abort",
-		};
+		const status: BackendStatus = isSettled(run.status)
+			? { ...run.status, childExited: true }
+			: {
+					state: "stopped",
+					childExited: true,
+					...(snapshot?.sessionFile && existsSync(snapshot.sessionFile) ? { sessionFile: snapshot.sessionFile } : {}),
+					...(snapshot?.usage ? { usage: { ...snapshot.usage } } : {}),
+					...(snapshot?.turns !== undefined ? { turns: snapshot.turns } : {}),
+					...(snapshot?.toolUses !== undefined ? { toolUses: snapshot.toolUses } : {}),
+					detail: "budget enforcement: owned child process group terminated after ignoring the cooperative abort",
+				};
+		this.publish(run, status);
+		return status;
 	}
 	async resume(input: AgentResumeInput): Promise<AgentBackendHandle> {
 		const bootstrapFile = join(dirname(input.sessionFile), "bootstrap.json");
@@ -952,6 +1017,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		return transcript ? { ...transcript, items: [...transcript.items] } : { items: [], cursor: 0 };
 	}
 	hasViewer(handle: AgentBackendHandle): boolean {
+		if (this.pendingLaunches.has(handle.handle)) return false;
 		return Boolean(this.requireRun(handle).child.viewerHandle);
 	}
 	subscribePresentation(handle: AgentBackendHandle, listener: (available: boolean) => void): () => void {
@@ -961,6 +1027,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		return () => child.presentationListeners.delete(listener);
 	}
 	async attach(handle: AgentBackendHandle): Promise<boolean> {
+		if (this.pendingLaunches.has(handle.handle)) return false;
 		const child = this.requireRun(handle).child;
 		if (child.closed) return false;
 		if (child.identityFailure) throw child.identityFailure;
@@ -969,6 +1036,7 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		return true;
 	}
 	detach(handle: AgentBackendHandle): void {
+		if (this.pendingLaunches.has(handle.handle)) return;
 		const child = this.requireRun(handle).child;
 		child.detached = true;
 		child.connected = false;
@@ -976,6 +1044,19 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		child.client.disconnect();
 	}
 	async dispose(handle: AgentBackendHandle): Promise<void> {
+		const pending = this.pendingLaunches.get(handle.handle);
+		if (pending) {
+			if (!(await this.disposePersisted(pending)))
+				throw new Error("Launch cleanup remains unverified; process receipt retained.");
+			this.pendingLaunches.delete(handle.handle);
+			const child = this.children.get(pending.childId);
+			if (child) this.releaseChild(child);
+			this.children.delete(pending.childId);
+			this.runs.delete(handle.handle);
+			this.pendingChildren.delete(pending.childId);
+			await this.reconcilePresentation();
+			return;
+		}
 		const child = this.requireRun(handle).child;
 		if (child.closed) return;
 		if (child.identityFailure) throw child.identityFailure;
@@ -1014,8 +1095,10 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 		await this.reconcilePresentation();
 	}
 	serializeHandle(handle: AgentBackendHandle, sessionFile?: string): SerializableBackendHandle | undefined {
-		const child = this.requireRun(handle).child;
-		if (child.closed) return undefined;
+		const pending = this.pendingLaunches.get(handle.handle);
+		if (pending) return pending;
+		const child = this.runs.get(handle.handle)?.child;
+		if (!child || child.closed) return undefined;
 		return {
 			kind: "process",
 			childId: child.bootstrap.childId,
@@ -1050,6 +1133,32 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			: undefined;
 		if (serialized.viewer && !viewerLauncher) return false;
 		if (serialized.viewer) viewerLauncher?.restore?.(serialized.viewer);
+		// Recovery is read-only: undefined permits exit proof, never signaling.
+		const nativeHandle = launcher.recoverForCleanup
+			? await launcher.recoverForCleanup(serialized.launcher).catch(() => undefined)
+			: serialized.launcher;
+		const viewerHandle =
+			serialized.viewer && viewerLauncher
+				? viewerLauncher.recoverForCleanup
+					? await viewerLauncher.recoverForCleanup(serialized.viewer).catch(() => undefined)
+					: serialized.viewer
+				: undefined;
+		let viewerCleaned = serialized.viewer === undefined;
+		const cleanupViewer = async (): Promise<boolean> => {
+			if (viewerCleaned) return true;
+			if (!serialized.viewer || !viewerLauncher) return false;
+			if (viewerHandle) {
+				try {
+					await viewerLauncher.terminate(viewerHandle);
+					viewerCleaned = true;
+					return true;
+				} catch {
+					// Retain the original receipt unless exit can independently be proven.
+				}
+			}
+			viewerCleaned = await viewerLauncher.cleanupExited(viewerHandle ?? serialized.viewer).catch(() => false);
+			return viewerCleaned;
+		};
 		const client = new ChildRpcClient({
 			socketPath: serialized.socketPath,
 			childId: serialized.childId,
@@ -1057,28 +1166,18 @@ export class ProcessAgentExecutionBackend implements AgentExecutionBackend {
 			connectTimeoutMs: this.options.connectTimeoutMs ?? 2000,
 		});
 		try {
+			if (!nativeHandle) throw new Error("Launcher cleanup identity could not be recovered.");
 			const snapshot = await client.connect();
-			this.verifyChildPid(serialized.launcher, snapshot);
-			if (serialized.viewer && viewerLauncher) {
-				try {
-					await viewerLauncher.terminate(serialized.viewer);
-				} catch (error) {
-					if (!(await viewerLauncher.cleanupExited(serialized.viewer).catch(() => false))) throw error;
-				}
-			}
-			await launcher.terminate(serialized.launcher);
+			this.verifyChildPid(nativeHandle, snapshot);
+			if (!(await cleanupViewer())) return false;
+			await launcher.terminate(nativeHandle);
 			cleanupControlEndpointPath(serialized.socketPath, currentPlatform());
 			return true;
 		} catch (error) {
 			if (error instanceof ChildProtocolError && error.code === "identity_mismatch") throw error;
-			if (!(await launcher.cleanupExited(serialized.launcher))) return false;
-			if (serialized.viewer && viewerLauncher) {
-				try {
-					await viewerLauncher.terminate(serialized.viewer);
-				} catch {
-					if (!(await viewerLauncher.cleanupExited(serialized.viewer).catch(() => false))) return false;
-				}
-			}
+			if (!(await launcher.cleanupExited(nativeHandle ?? serialized.launcher))) return false;
+			if (!(await cleanupViewer())) return false;
+			cleanupControlEndpointPath(serialized.socketPath, currentPlatform());
 			return true;
 		} finally {
 			client.disconnect();

@@ -71,6 +71,7 @@ export interface BoardTask {
 	dependencies: string[];
 	owner?: string;
 	ownerMembershipId?: string;
+	ownerReservationId?: string;
 	assignee?: string;
 	reviewRequested?: boolean;
 	executionPlan?: TaskExecutionPlan;
@@ -290,6 +291,8 @@ export function parseBoardTask(value: unknown): BoardTask | undefined {
 			(typeof r.assignee !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(r.assignee))) ||
 		(r.ownerMembershipId !== undefined &&
 			(typeof r.ownerMembershipId !== "string" || r.ownerMembershipId.length === 0)) ||
+		(r.ownerReservationId !== undefined &&
+			(typeof r.ownerReservationId !== "string" || r.ownerReservationId.length === 0)) ||
 		(r.reviewRequested !== undefined && typeof r.reviewRequested !== "boolean") ||
 		(r.executionPlan !== undefined && !parseExecutionPlan(r.executionPlan)) ||
 		!Number.isSafeInteger(r.createdAt) ||
@@ -315,6 +318,12 @@ export function parseBoardTask(value: unknown): BoardTask | undefined {
 		attempts = parsed as TaskAttempt[];
 	}
 	if ((r.status === "in_progress" || r.status === "in_review") !== (r.owner !== undefined)) return undefined;
+	if (
+		r.ownerReservationId !== undefined &&
+		(r.owner === undefined ||
+			!attempts.some((attempt) => attempt.reservationId === r.ownerReservationId && attempt.teammateName === r.owner))
+	)
+		return undefined;
 	const executionPlan = r.executionPlan === undefined ? undefined : parseExecutionPlan(r.executionPlan);
 	return {
 		id: r.id,
@@ -325,6 +334,7 @@ export function parseBoardTask(value: unknown): BoardTask | undefined {
 		dependencies: [...r.dependencies],
 		...(typeof r.owner === "string" ? { owner: r.owner } : {}),
 		...(typeof r.ownerMembershipId === "string" ? { ownerMembershipId: r.ownerMembershipId } : {}),
+		...(typeof r.ownerReservationId === "string" ? { ownerReservationId: r.ownerReservationId } : {}),
 		...(typeof r.assignee === "string" ? { assignee: r.assignee } : {}),
 		...(typeof r.reviewRequested === "boolean" ? { reviewRequested: r.reviewRequested } : {}),
 		...(executionPlan ? { executionPlan } : {}),

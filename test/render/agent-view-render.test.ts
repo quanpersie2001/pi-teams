@@ -11,7 +11,12 @@ import { describe, expect, it } from "vitest";
 import { buildAgentTranscriptView } from "../../extension-src/pi-teams/app/ui-snapshot.js";
 import { EMPTY_USAGE } from "../../extension-src/pi-teams/domain/agent-run.js";
 import type { TranscriptItem } from "../../extension-src/pi-teams/domain/transcript.js";
-import type { AgentTranscriptView } from "../../extension-src/pi-teams/domain/ui-view.js";
+import type {
+	AgentFocusSnapshot,
+	AgentListRow,
+	AgentTranscriptView,
+} from "../../extension-src/pi-teams/domain/ui-view.js";
+import { renderAgentPanelWithTargets } from "../../extension-src/pi-teams/features/agent-panel/index.js";
 import {
 	type AgentViewEditor,
 	type AgentViewOverlay,
@@ -103,8 +108,15 @@ class TestEditor implements AgentViewEditor {
 	invalidate(): void {}
 }
 
-function makeOverlay(items: readonly TranscriptItem[], overrides: Partial<AgentTranscriptView> = {}) {
-	const tui = { terminal: { rows: 24, columns: 80 }, requestRender() {} } as never;
+function makeOverlay(
+	items: readonly TranscriptItem[],
+	overrides: Partial<AgentTranscriptView> = {},
+	focus?: AgentFocusSnapshot,
+	navigationRows?: AgentListRow[],
+	submit?: (text: string) => boolean | Promise<boolean>,
+) {
+	const terminal = { rows: 24, columns: 80 };
+	const tui = { terminal, requestRender() {} } as never;
 	let view = viewOf(items, overrides);
 	let revision = 0;
 	const editor = new TestEditor();
@@ -114,6 +126,8 @@ function makeOverlay(items: readonly TranscriptItem[], overrides: Partial<AgentT
 		aborts: 0,
 		attaches: 0,
 		closes: 0,
+		selected: [] as string[],
+		returnedMain: 0,
 	};
 	let overlay: AgentViewOverlay;
 	const pane = createAgentTranscriptPane(tui, theme, {
@@ -130,10 +144,28 @@ function makeOverlay(items: readonly TranscriptItem[], overrides: Partial<AgentT
 		pane,
 		editor,
 		host: {
-			getData: () => ({ view }),
+			getData: () => ({ view, ...(focus ? { focus } : {}) }),
+			renderNavigation: (width, maxRows) =>
+				renderAgentPanelWithTargets(
+					{
+						view: { rows: navigationRows ?? [], runningCount: 0, generatedAt: 2000 },
+						selection: view.agentId,
+						stopArmedFor: null,
+					},
+					fg,
+					width,
+					2000,
+					Math.min(6, maxRows),
+				),
+			onSelect: (runId) => {
+				state.selected.push(runId);
+			},
+			onReturnMain: () => {
+				state.returnedMain++;
+			},
 			onSubmit: (text) => {
 				state.submitted.push(text);
-				return !text.startsWith("/");
+				return submit ? submit(text) : !text.startsWith("/");
 			},
 			onAbort: () => {
 				state.aborts++;
@@ -150,6 +182,7 @@ function makeOverlay(items: readonly TranscriptItem[], overrides: Partial<AgentT
 	});
 	return {
 		overlay,
+		terminal,
 		editor,
 		state,
 		update(nextItems: readonly TranscriptItem[]) {
@@ -258,6 +291,163 @@ describe("fullscreen agent transcript", () => {
 		const header = fixture.overlay.render(80)[0];
 		expect(header).toContain("\x1b[38;2;18;171;52m@scout\x1b[39m");
 		fixture.overlay.dispose();
+	});
+
+	it("places run and child metadata below the editor without command hints", () => {
+		const fixture = makeOverlay(fixtureItems(), {
+			usage: { ...EMPTY_USAGE, inputTokens: 12400, outputTokens: 3200 },
+		});
+		try {
+			const lines = fixture.overlay.render(160).map(stripTerminalSequences);
+			const editorEnd = lines.findIndex((line) => line.includes("╰"));
+			expect(lines[0]).not.toContain("12400");
+			expect(lines[0]).not.toContain("Find auth files");
+			expect(lines[editorEnd + 1]).toContain("12400 in / 3200 out — Find auth files · 1.0s · 2 tools · 3 turns");
+			expect(lines[editorEnd + 2]).toContain(
+				"model unavailable · thinking unavailable · context ?/? · cwd unavailable",
+			);
+			expect(lines.join("\n")).not.toMatch(/type \+ enter|\/model|\/thinking|\/compact/);
+		} finally {
+			fixture.overlay.dispose();
+		}
+	});
+
+	it("renders pi-style status with only the selected child's data and clamps its lines", () => {
+		const key = Symbol.for("@quandev104/pi-style:detached-editor");
+		const globals = globalThis as Record<symbol, unknown>;
+		const previous = globals[key];
+		let received: unknown;
+		globals[key] = {
+			renderStatus(_theme: unknown, width: number, snapshot: unknown) {
+				received = snapshot;
+				return [`CHILD STATUS ${"x".repeat(width)}`];
+			},
+		};
+		const focus: AgentFocusSnapshot = {
+			runId: "run-1",
+			currentRunId: "run-1",
+			model: "child-model",
+			thinking: "high",
+			cwd: "/child",
+			context: { usedTokens: 24000, windowTokens: 200000 },
+			capabilities: [],
+			items: [],
+			truncatedHead: false,
+			closed: false,
+		};
+		const fixture = makeOverlay([], { teammateName: "builder" }, focus);
+		try {
+			const lines = fixture.overlay.render(80);
+			expect(stripTerminalSequences(lines.at(-1) ?? "")).toContain("CHILD STATUS");
+			expect(lines.every((line) => visibleWidth(line) === 80)).toBe(true);
+			expect(received).toMatchObject({
+				model: "child-model",
+				thinkingLevel: "high",
+				cwd: "/child",
+				sessionName: "@builder",
+				context: { currentTokens: 24000, windowTokens: 200000, percent: 12 },
+				usage: undefined,
+			});
+		} finally {
+			fixture.overlay.dispose();
+			if (previous === undefined) delete globals[key];
+			else globals[key] = previous;
+		}
+	});
+
+	it("shows the shared roster below the composer and navigates clicked rows without losing its draft", () => {
+		const navigationRows: AgentListRow[] = Array.from({ length: 9 }, (_, i) => ({
+			id: `run-${i + 1}`,
+			type: "explore",
+			teammateName: `peer-${i + 1}`,
+			description: "Review changes",
+			status: "running",
+			backend: "process",
+			resourceState: "open",
+			startedAt: 1000,
+			toolUses: 2,
+			turns: 3,
+			totalTokens: 3200,
+			isBackground: true,
+			capabilities: { attachable: true, viewable: true, steerable: true, stoppable: true, resumable: false },
+		}));
+		const fixture = makeOverlay(fixtureItems(), { agentId: "run-9" }, undefined, navigationRows);
+		const click = (y: number) => fixture.overlay.handleMouse({ type: "click", button: "left", x: 4, y });
+		try {
+			fixture.editor.setText("unfinished draft");
+			const lines = fixture.overlay.render(80).map(stripTerminalSequences);
+			const mainY = lines.findIndex((line) => line.trim() === "◯ main");
+			expect(mainY).toBeGreaterThan(lines.findIndex((line) => line.includes("unfinished draft")));
+			expect(lines.findIndex((line) => line.includes("⏺ @peer-9"))).toBeGreaterThan(mainY);
+			expect(lines[mainY + 1]).toContain("↑ 3 more");
+			click(mainY + 1);
+			expect(fixture.state.selected).toEqual([]);
+			click(lines.findIndex((line) => line.includes("@peer-8")));
+			expect(fixture.state.selected).toEqual(["run-8"]);
+			click(mainY);
+			expect(fixture.state.returnedMain).toBe(1);
+			expect(fixture.editor.getText()).toBe("unfinished draft");
+			for (const height of [12, 8, 3, 1]) {
+				fixture.terminal.rows = height;
+				const resized = fixture.overlay.render(40);
+				expect(resized).toHaveLength(height);
+				expect(resized.every((line) => visibleWidth(line) === 40)).toBe(true);
+				if (height === 12) expect(stripTerminalSequences(resized.join("\n"))).toContain("@peer-9");
+			}
+		} finally {
+			fixture.overlay.dispose();
+		}
+	});
+
+	it.each([false, new Error("native input rejected")])("retains ordinary draft on failed submission: %s", (failure) => {
+		const fixture = makeOverlay([], {}, undefined, undefined, () => {
+			if (failure instanceof Error) throw failure;
+			return failure;
+		});
+		try {
+			fixture.editor.setText("retry this request");
+			fixture.overlay.handleInput(ENTER);
+			expect(fixture.editor.getText()).toBe("retry this request");
+			expect(stripTerminalSequences(fixture.overlay.render(100).join("\n"))).toMatch(/failed|rejected/);
+		} finally {
+			fixture.overlay.dispose();
+		}
+	});
+
+	it.each([false, new Error("native input rejected")])(
+		"retains draft after asynchronous rejection: %s",
+		async (failure) => {
+			const response = Promise.withResolvers<boolean>();
+			const fixture = makeOverlay([], {}, undefined, undefined, () => response.promise);
+			try {
+				fixture.editor.setText("retry this request");
+				fixture.overlay.handleInput(ENTER);
+				fixture.overlay.handleInput(ENTER);
+				expect(fixture.state.submitted).toEqual(["retry this request"]);
+				if (failure instanceof Error) response.reject(failure);
+				else response.resolve(failure);
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(fixture.editor.getText()).toBe("retry this request");
+				expect(stripTerminalSequences(fixture.overlay.render(100).join("\n"))).toMatch(/failed|rejected/);
+			} finally {
+				fixture.overlay.dispose();
+			}
+		},
+	);
+
+	it("does not overwrite a newer draft when an asynchronous submission succeeds", async () => {
+		const response = Promise.withResolvers<boolean>();
+		const fixture = makeOverlay([], {}, undefined, undefined, () => response.promise);
+		try {
+			fixture.editor.setText("submitted request");
+			fixture.overlay.handleInput(ENTER);
+			fixture.editor.setText("newer draft");
+			response.resolve(true);
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(fixture.editor.getText()).toBe("newer draft");
+		} finally {
+			fixture.overlay.dispose();
+		}
 	});
 
 	it("keeps printable and cursor input in the native editor and submits steers", () => {

@@ -89,44 +89,72 @@ export function watchChildMailbox(options: ChildMailboxOptions): ChildMailboxHan
 	let closed = false;
 	let drainAgain = false;
 	let draining: Promise<void> | undefined;
+	let retryTimer: ReturnType<typeof setTimeout> | undefined;
+	let retryDelay = 100;
+	const close = () => {
+		if (closed) return;
+		closed = true;
+		if (retryTimer !== undefined) clearTimeout(retryTimer);
+		retryTimer = undefined;
+		watcher?.close();
+	};
+	const isCurrent = () => {
+		if (closed) return false;
+		if (options.membershipId !== undefined) {
+			const self = participantAvailability(options.teamDir).get(options.self);
+			if (!self || self.membershipId !== options.membershipId || self.operation === "shutting_down") {
+				warn(`mailbox stopped: membership incarnation for @${options.self} is no longer current`);
+				close();
+				return false;
+			}
+		}
+		return true;
+	};
+	const scheduleRetry = () => {
+		if (closed || retryTimer !== undefined) return;
+		retryTimer = setTimeout(() => {
+			retryTimer = undefined;
+			void drain();
+		}, retryDelay);
+		retryTimer.unref();
+		retryDelay = Math.min(retryDelay * 2, 2_000);
+	};
 	const drain = (): Promise<void> => {
+		if (closed || retryTimer !== undefined) return Promise.resolve();
 		if (draining) {
 			drainAgain = true;
 			return draining;
 		}
 		draining = (async () => {
-			while (!closed) {
-				if (options.membershipId !== undefined) {
-					const self = participantAvailability(options.teamDir).get(options.self);
-					if (!self || self.membershipId !== options.membershipId || self.operation === "shutting_down") {
-						warn(`mailbox stopped: membership incarnation for @${options.self} is no longer current`);
-						closed = true;
-						break;
-					}
-				}
+			while (isCurrent()) {
+				drainAgain = false;
 				const messages = service.receive(16);
-				if (messages.length === 0) {
-					if (drainAgain) {
-						drainAgain = false;
-						continue;
-					}
-					break;
-				}
+				if (messages.length === 0) break;
 				for (const message of messages) {
+					if (!isCurrent()) return;
 					try {
 						const text = formatMailboxMessageForInjection(message);
 						if (options.isRunning()) await options.steer(text);
 						else await options.prompt(text);
 						service.consume(message);
+						retryDelay = 100;
 					} catch (error) {
 						warn(`mailbox delivery ${message.id} failed: ${error instanceof Error ? error.message : String(error)}`);
+						scheduleRetry();
 						return;
 					}
 				}
 			}
-		})().finally(() => {
-			draining = undefined;
-		});
+		})()
+			.catch((error) => {
+				warn(`mailbox drain failed: ${error instanceof Error ? error.message : String(error)}`);
+				scheduleRetry();
+			})
+			.finally(() => {
+				draining = undefined;
+				// Events during delivery must survive both rejection and drain completion.
+				if (drainAgain) void drain();
+			});
 		return draining;
 	};
 	let watcher: FSWatcher | undefined;
@@ -142,10 +170,7 @@ export function watchChildMailbox(options: ChildMailboxOptions): ChildMailboxHan
 
 	return {
 		service,
-		close() {
-			closed = true;
-			watcher?.close();
-		},
+		close,
 	};
 }
 

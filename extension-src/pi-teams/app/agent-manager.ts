@@ -16,13 +16,14 @@ import {
 	isTerminalStatus,
 	transition,
 } from "../domain/agent-run.js";
-import type {
-	AgentBackendHandle,
-	AgentExecutionBackend,
-	AgentLaunchInput,
-	AgentResumeInput,
-	BackendStatus,
-	TeamBootstrapContext,
+import {
+	type AgentBackendHandle,
+	type AgentExecutionBackend,
+	AgentLaunchCleanupPendingError,
+	type AgentLaunchInput,
+	type AgentResumeInput,
+	type BackendStatus,
+	type TeamBootstrapContext,
 } from "../domain/backend.js";
 import type { ChildControlCommand, ChildState } from "../domain/child-protocol.js";
 import type { SubagentsSettings } from "../domain/config.js";
@@ -170,6 +171,8 @@ interface RunInternals {
 	stopCommand?: Promise<boolean>;
 	slotAcquired: boolean;
 	launchPromise?: Promise<void>;
+	/** Resource receipt ready, independent of post-launch control acknowledgements. */
+	launchReady?: Promise<void>;
 	unsubscribeBackend?: () => void;
 	unsubscribeAssignments?: () => void;
 	unsubscribePresentation?: () => void;
@@ -177,6 +180,8 @@ interface RunInternals {
 	worktreeInfo?: WorktreeInfo;
 	finalizePromise?: Promise<void>;
 	settlementPromise?: Promise<void>;
+	/** Backend verified that the owned child resource is gone. */
+	childExited?: true;
 	controlsFlushing?: boolean;
 	lastFocusState?: ChildState;
 	/** Focus subscription feeding the idle clock; armed only when a budget is active. */
@@ -1099,21 +1104,34 @@ export class AgentManager {
 		return internal.backend.steer(internal.record.handle, message);
 	}
 
-	/** Authenticated child state; settled runs retain their last observed metadata. */
+	/** Read-only eligibility; does not expand steering or control admission. */
+	hasLiveFocus(agentId: string): boolean {
+		const internal = this.runs.get(agentId);
+		if (!internal || this.disposed || this.shuttingDown || internal.childExited) return false;
+		const name = internal.record.teammateName;
+		if (name !== undefined) {
+			const runtime = this.teammateRuntime.get(name);
+			const member = this.teamService?.current?.members.find((entry) => entry.name === name);
+			if (runtime?.currentRunId !== agentId || runtime.membershipId !== internal.record.membershipId) return false;
+			if (this.teamService && (!member || member.membershipId !== internal.record.membershipId)) return false;
+		}
+		return this.liveResource(internal) !== undefined;
+	}
+
+	/** Authenticated current resource state; closed history only retains its last observed metadata. */
 	async readFocusState(agentId: string): Promise<ChildState | undefined> {
 		const internal = this.runs.get(agentId);
 		if (!internal) throw new Error(`Unknown agent: "${agentId}".`);
 		if (this.disposed || this.shuttingDown) throw new Error("AgentManager session is not active.");
-		const { backend } = internal;
-		const handle = internal.record.handle;
-		if (!backend?.readFocusState || !handle || isTerminalStatus(internal.record.status)) {
-			return internal.lastFocusState;
-		}
+		const resource = this.hasLiveFocus(agentId) ? this.liveResource(internal) : undefined;
+		if (!resource?.backend.readFocusState) return internal.lastFocusState;
 		const epoch = this.admissionEpoch;
-		const state = await backend.readFocusState(handle);
+		const state = await resource.backend.readFocusState(resource.handle);
 		if (epoch !== this.admissionEpoch || this.disposed || this.shuttingDown) {
 			throw new Error("Parent session changed while reading child state.");
 		}
+		const current = this.hasLiveFocus(agentId) ? this.liveResource(internal) : undefined;
+		if (current?.handle !== resource.handle || current.backend !== resource.backend) return internal.lastFocusState;
 		return state ? this.rememberFocusState(internal, state) : internal.lastFocusState;
 	}
 
@@ -1429,8 +1447,14 @@ export class AgentManager {
 		void this.stop(internal.record.id).catch(() => {});
 		void this.enforceBudgetDeadline(internal).catch((error: unknown) => {
 			// Visible failure with a retained receipt — never a fabricated outcome.
-			if (this.runs.get(internal.record.id) !== internal || !isActiveStatus(internal.record.status)) return;
-			internal.record.recoveryError = `Budget enforcement failed: ${errorText(error)}`;
+			if (this.runs.get(internal.record.id) !== internal) return;
+			const message = `Budget enforcement failed: ${errorText(error)}`;
+			internal.record.recoveryError = message;
+			const name = internal.record.teammateName;
+			if (name !== undefined && this.teammateRuntime.get(name)?.currentRunId === internal.record.id) {
+				this.teammateRuntime.setRecoveryError(name, message);
+				this.teamService?.setAvailability(name, "unavailable", message);
+			}
 			this.syncRegistry();
 		});
 	}
@@ -1446,6 +1470,7 @@ export class AgentManager {
 	 * budget expiry (2s) and session teardown (15s, ADR 0007 §1).
 	 */
 	private async enforceStopDeadline(internal: RunInternals, graceMs: number): Promise<void> {
+		await internal.launchReady;
 		const outcome = await Promise.race([
 			internal.settle.then(() => "settled" as const),
 			enforcementDelay(graceMs).then(() => "deadline" as const),
@@ -1458,7 +1483,7 @@ export class AgentManager {
 		// semantics exist; stopRequested keeps retrying on reconnects.
 		if (!backend?.enforceTerminate || !handle) return;
 		const status = await backend.enforceTerminate(handle, 0);
-		if (this.runs.get(internal.record.id) !== internal || !isActiveStatus(internal.record.status)) return;
+		if (this.runs.get(internal.record.id) !== internal) return;
 		await this.reconcileBackendStatus(internal, status);
 	}
 
@@ -1805,7 +1830,7 @@ export class AgentManager {
 		const releasable = sharedChild[0];
 		if (ownedBackend && ownedHandle) {
 			try {
-				await ownedBackend.dispose(ownedHandle);
+				if (!ownerInternal.childExited) await ownedBackend.dispose(ownedHandle);
 				onVerifiedDispose?.();
 			} catch (error) {
 				const message = `Child cleanup failed; process receipt retained: ${errorText(error)}`;
@@ -1893,77 +1918,11 @@ export class AgentManager {
 
 	// -- teardown ---------------------------------------------------------------
 
-	/** Explicit teardown stops child runs, waits for their RPC outcomes, then closes children. */
+	/** Explicit teardown shares the bounded, verified session cleanup path. */
 	async dispose(): Promise<void> {
 		if (this.disposed) return;
-		this.shuttingDown = true;
-		this.admissionEpoch += 1;
-		await Promise.all([...this.teammateLocks.values()]);
-		for (const backend of this.backends) backend.setPresentationActive?.(false);
-		for (const [id, internal] of [...this.runs]) {
-			if (internal.record.status === "queued") await this.stop(id);
-		}
-		await Promise.allSettled(
-			[...this.runs.values()].map((internal) => internal.launchPromise).filter((promise) => promise !== undefined),
-		);
-		for (const [id, internal] of this.runs) {
-			if (!isActiveStatus(internal.record.status) || !internal.backend || !internal.record.handle) continue;
-			if (!(await this.stop(id)) && isActiveStatus(internal.record.status)) {
-				this.shuttingDown = false;
-				for (const backend of this.backends) backend.setPresentationActive?.(true);
-				throw new Error(`Child did not accept abort for run "${id}".`);
-			}
-		}
-		await this.waitForAll();
-		await Promise.allSettled(
-			[...this.runs.values()].map((internal) => internal.finalizePromise).filter((promise) => promise !== undefined),
-		);
+		await this.shutdownSession();
 		this.disposed = true;
-		this.queue = [];
-		for (const internal of this.runs.values()) {
-			this.detachBudgetWatch(internal);
-			internal.unsubscribeBackend?.();
-			delete internal.unsubscribeBackend;
-			internal.unsubscribeAssignments?.();
-			delete internal.unsubscribeAssignments;
-			if (internal.record.teammateName === undefined && internal.backend && internal.record.handle) {
-				await internal.backend.dispose(internal.record.handle);
-				delete internal.record.handle;
-				delete internal.backend;
-			}
-			this.stopObservingPresentation(internal);
-		}
-		for (const runtime of this.teammateRuntime.values()) {
-			if (!runtime.backend || !runtime.handle) continue;
-			try {
-				await runtime.backend.dispose(runtime.handle);
-			} catch (error) {
-				const message = `Child cleanup failed during manager disposal; process receipt retained: ${errorText(error)}`;
-				this.teammateRuntime.setRecoveryError(runtime.name, message);
-				this.teamService?.setAvailability(runtime.name, "unavailable", message);
-				if (runtime.handle && runtime.backend) runtime.backend.detach(runtime.handle);
-				const owner = runtime.currentRunId ? this.runs.get(runtime.currentRunId) : undefined;
-				if (owner) owner.record.recoveryError = message;
-				continue;
-			}
-			this.teammateRuntime.clearChild(runtime.name);
-			try {
-				await this.teamService?.discardPending(runtime.name, "context-reset");
-			} catch (error) {
-				const message = `Pending mailbox cleanup failed during manager disposal: ${errorText(error)}`;
-				this.teammateRuntime.setRecoveryError(runtime.name, message);
-				this.teamService?.setAvailability(runtime.name, "unavailable", message);
-				continue;
-			}
-			this.teamService?.setAvailability(runtime.name, "available");
-			this.teamService?.setLifecycle(runtime.name, "released");
-		}
-		this.budgetWatcher.clear();
-		this.syncRegistry();
-		this.clearFocusObservations();
-		this.presentationListeners.clear();
-		this.runs.clear();
-		this.runningSlots = 0;
 	}
 
 	// -- durable registry ------------------------------------------------------
@@ -2022,12 +1981,7 @@ export class AgentManager {
 		// Start every cooperative stop without waiting for its RPC acknowledgement;
 		// each independent enforcement deadline runs concurrently below.
 		for (const internal of active) void this.stop(internal.record.id).catch(() => false);
-		await Promise.allSettled(
-			active.map(async (internal) => {
-				await internal.launchPromise;
-				await this.enforceStopDeadline(internal, this.teardownGraceMs);
-			}),
-		);
+		await Promise.allSettled(active.map((internal) => this.enforceStopDeadline(internal, this.teardownGraceMs)));
 		// Let settlement finalization (worktree preserve, registry/history
 		// writes) finish before detaching what is left.
 		await Promise.allSettled(
@@ -2149,8 +2103,7 @@ export class AgentManager {
 		}
 		record.completedAt = this.now();
 		this.detachBudgetWatch(internal);
-		internal.unsubscribeBackend?.();
-		delete internal.unsubscribeBackend;
+		// Keep observing resource loss after native settlement until the child is released.
 		this.registry.releaseSnapshot(record.id);
 		if (internal.slotAcquired) {
 			internal.slotAcquired = false;
@@ -2164,7 +2117,7 @@ export class AgentManager {
 					runtime !== undefined && (record.membershipId === undefined || runtime.membershipId === record.membershipId);
 				if (sameMembership) {
 					const nextState: TeammateLifecycle = runtime.handle ? "idle" : "released";
-					this.teammateRuntime.setState(record.teammateName, nextState);
+					this.teammateRuntime.setState(record.teammateName, nextState, runtime.recoveryError);
 					this.teamService?.setLifecycle(record.teammateName, nextState, record.membershipId);
 					if (record.recoveryError?.startsWith("Teammate connection unavailable:")) delete record.recoveryError;
 					if (runtime.handle && runtime.recoveryError === undefined)
@@ -2190,8 +2143,13 @@ export class AgentManager {
 	}
 
 	private async startRun(internal: RunInternals): Promise<void> {
+		const ready = Promise.withResolvers<void>();
+		internal.launchReady = ready.promise;
 		await Promise.resolve();
-		if (internal.record.status !== "queued") return;
+		if (internal.record.status !== "queued") {
+			ready.resolve();
+			return;
+		}
 		this.queue = this.queue.filter((id) => id !== internal.record.id);
 		this.applyEvent(internal, { type: "start" });
 		this.emit(internal.record, "started");
@@ -2284,14 +2242,33 @@ export class AgentManager {
 					this.syncRegistry();
 				});
 			});
+			if (internal.plan.kind === "assignment") {
+				const source = this.runs.get(internal.plan.sourceAgentId);
+				source?.unsubscribeBackend?.();
+				if (source) delete source.unsubscribeBackend;
+			}
 			this.observeAssignments(internal);
 
 			this.syncRegistry();
+			ready.resolve();
 			await this.reconcileBackendStatus(internal, await backend.status(handle));
 
 			await this.flushPendingControls(internal);
 			if (this.shuttingDown) this.syncRegistry();
 		} catch (error) {
+			if (error instanceof AgentLaunchCleanupPendingError && internal.backend) {
+				internal.record.handle = error.handle;
+				handleCommitted = true;
+				if (internal.record.teammateName !== undefined) {
+					this.teammateRuntime.setChild(internal.record.teammateName, {
+						currentRunId: internal.record.id,
+						backend: internal.backend,
+						handle: error.handle,
+						cwd: internal.cwd,
+						...(internal.worktreeInfo !== undefined ? { worktreeInfo: internal.worktreeInfo } : {}),
+					});
+				}
+			}
 			if (internal.plan.kind === "mailbox" && internal.record.handle !== undefined && internal.backend) {
 				const backend = internal.backend;
 				const handle = internal.record.handle;
@@ -2329,6 +2306,10 @@ export class AgentManager {
 					this.teamService?.setAvailability(internal.record.teammateName, "unavailable", message);
 				}
 				this.syncRegistry();
+				if (internal.pendingBudgetStop !== undefined) {
+					delete internal.pendingBudgetStop;
+					this.beginEnforcedStop(internal);
+				}
 				return;
 			}
 			if (internal.plan.kind === "assignment") {
@@ -2347,6 +2328,8 @@ export class AgentManager {
 				type: "fail",
 				error: errorText(error),
 			});
+		} finally {
+			ready.resolve();
 		}
 	}
 
@@ -2540,7 +2523,13 @@ export class AgentManager {
 
 	private async reconcileBackendStatus(internal: RunInternals, status: BackendStatus): Promise<void> {
 		const record = internal.record;
+		if (status.childExited) internal.childExited = true;
 		if (isTerminalStatus(record.status)) {
+			if (status.childExited) {
+				await internal.finalizePromise;
+				await this.disposeTerminalChild(internal);
+				return;
+			}
 			if (internal.finalizePromise) return internal.finalizePromise;
 			if (status.outcomeUnavailable) {
 				await this.disposeTerminalChild(internal);
@@ -2597,8 +2586,6 @@ export class AgentManager {
 				}
 				record.completedAt ??= this.now();
 				this.detachBudgetWatch(internal);
-				internal.unsubscribeBackend?.();
-				delete internal.unsubscribeBackend;
 				this.registry.releaseSnapshot(record.id);
 				internal.finalizePromise = this.finalizeTerminalRun(internal);
 				await internal.finalizePromise;
@@ -2721,7 +2708,13 @@ export class AgentManager {
 		this.syncRegistry();
 		const name = internal.record.teammateName;
 		const runtime = name !== undefined ? this.teammateRuntime.get(name) : undefined;
-		if (name !== undefined && runtime?.currentRunId === internal.record.id && runtime.handle && runtime.backend) {
+		if (
+			!internal.childExited &&
+			name !== undefined &&
+			runtime?.currentRunId === internal.record.id &&
+			runtime.handle &&
+			runtime.backend
+		) {
 			delete internal.record.handle;
 			delete internal.backend;
 			this.syncRegistry();
@@ -2790,7 +2783,7 @@ export class AgentManager {
 		if (linked.some((internal) => isActiveStatus(internal.record.status))) return;
 
 		try {
-			await representative.backend.dispose(representative.record.handle);
+			if (!representative.childExited) await representative.backend.dispose(representative.record.handle);
 		} catch (error) {
 			const recoveryError = `Child cleanup failed; process receipt retained: ${errorText(error)}`;
 			for (const internal of linked) {

@@ -194,7 +194,12 @@ describe("TaskAutomationService", () => {
 
 	it("detects a newly created-and-completed peer prerequisite after coalesced filesystem events", async () => {
 		const parent = createBoard();
-		const peer = new TaskBoardService({ teamDir: root as string, self: "worker", now: () => 43 });
+		const peer = new TaskBoardService({
+			teamDir: root as string,
+			self: "worker",
+			selfMembershipId: "worker-member",
+			now: () => 43,
+		});
 		const run = executor(async () => ({}));
 		automate(parent, run, true);
 		const prerequisite = peer.create({ title: "Burst prerequisite" });
@@ -211,7 +216,12 @@ describe("TaskAutomationService", () => {
 
 	it("observes accepted completions from peer board services alongside UI watchers exactly once", async () => {
 		const parent = createBoard();
-		const peer = new TaskBoardService({ teamDir: root as string, self: "worker", now: () => 43 });
+		const peer = new TaskBoardService({
+			teamDir: root as string,
+			self: "worker",
+			selfMembershipId: "worker-member",
+			now: () => 43,
+		});
 		const prerequisite = parent.create({ title: "Peer prerequisite" });
 		const planned = parent.create({
 			title: "Planned from peer completion",
@@ -354,7 +364,12 @@ describe("TaskAutomationService", () => {
 
 	it("does not override a manual claim made during a lock-held reservation retry", async () => {
 		const board = createBoard();
-		const peer = new TaskBoardService({ teamDir: root as string, self: "worker", now: () => 43 });
+		const peer = new TaskBoardService({
+			teamDir: root as string,
+			self: "worker",
+			selfMembershipId: "worker-member",
+			now: () => 43,
+		});
 		const prerequisite = board.create({ title: "Prerequisite" });
 		const dependent = board.create({
 			title: "Manual claim wins",

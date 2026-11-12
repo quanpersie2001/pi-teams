@@ -112,6 +112,7 @@ export class TaskExecutionService {
 						coordinator,
 						input.expectedRequirementRevision,
 						input.expectedStatus,
+						this.manager.teammateMembershipId(name),
 					);
 				},
 				input.signal,
@@ -123,30 +124,33 @@ export class TaskExecutionService {
 			if (/Task board conflict/.test(message)) throw new TaskExecutionReservationConflictError({ cause: error });
 			throw error;
 		}
-		if (this.manager.teammateMembershipId(name) !== undefined)
-			this.board.bindOwnerMembership(task.id, this.manager.teammateMembershipId(name));
-		if (
-			this.disposed ||
-			!this.acceptingExecutions ||
-			(this.shutdownEpoch.get(name) ?? 0) !== admissionEpoch ||
-			input.signal?.aborted ||
-			(input.expectedRequirementRevision !== undefined &&
-				reservation.task.requirementRevision !== input.expectedRequirementRevision)
-		) {
-			const cancelled =
+		let spawnedRunId: string | undefined;
+		try {
+			const membershipId = this.manager.teammateMembershipId(name);
+			if (membershipId !== undefined)
+				await this.retryBoardWrite(
+					reservationId,
+					() => this.board.bindOwnerMembership(task.id, membershipId),
+					input.signal,
+					true,
+				);
+			if (
 				this.disposed ||
 				!this.acceptingExecutions ||
 				(this.shutdownEpoch.get(name) ?? 0) !== admissionEpoch ||
-				input.signal?.aborted
-					? new TaskExecutionCancelledError()
-					: new TaskExecutionPlanChangedError();
-			await this.retryBoardWrite(reservationId, () =>
-				this.board.rollbackReservation(task.id, reservationId, cancelled.message, reservation.previous),
-			);
-			throw cancelled;
-		}
-		let spawnedRunId: string | undefined;
-		try {
+				input.signal?.aborted ||
+				(input.expectedRequirementRevision !== undefined &&
+					reservation.task.requirementRevision !== input.expectedRequirementRevision)
+			) {
+				const cancelled =
+					this.disposed ||
+					!this.acceptingExecutions ||
+					(this.shutdownEpoch.get(name) ?? 0) !== admissionEpoch ||
+					input.signal?.aborted
+						? new TaskExecutionCancelledError()
+						: new TaskExecutionPlanChangedError();
+				throw cancelled;
+			}
 			const prompt = this.contextPacket(reservation.task, input.additionalContext);
 			const request: SpawnRequest = {
 				type: input.type,
@@ -161,7 +165,6 @@ export class TaskExecutionService {
 			const run = await this.manager.spawn(request);
 			spawnedRunId = run.id;
 			this.active.set(run.id, { taskId: task.id, reservationId, actor: name });
-			if (run.membershipId !== undefined) this.board.bindOwnerMembership(task.id, run.membershipId);
 			await this.retryBoardWrite(reservationId, () =>
 				this.board.bindAttempt(task.id, reservationId, run.id, run.membershipId),
 			);
@@ -227,17 +230,30 @@ export class TaskExecutionService {
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
 		for (const task of this.board.list()) {
+			const expectedClaim = {
+				owner: task.owner,
+				ownerMembershipId: task.ownerMembershipId,
+				ownerReservationId: task.ownerReservationId,
+			};
 			const activeClaim = task.status === "in_progress" || task.status === "in_review";
-			let ownsClaim = task.owner === name && activeClaim && task.ownerMembershipId === _membershipId;
+			let ownsClaim =
+				_membershipId !== undefined && task.owner === name && activeClaim && task.ownerMembershipId === _membershipId;
 			if (task.owner === name && activeClaim && task.ownerMembershipId === undefined) {
 				const attemptProvesMembership =
 					_membershipId !== undefined &&
-					task.attempts.some((attempt) => attempt.teammateName === name && attempt.membershipId === _membershipId);
+					task.ownerReservationId !== undefined &&
+					task.attempts.some(
+						(attempt) =>
+							attempt.reservationId === task.ownerReservationId &&
+							attempt.teammateName === name &&
+							attempt.membershipId === _membershipId,
+					);
 				if (!attemptProvesMembership)
 					throw new Error(
 						`Legacy task claim ${task.code ?? task.id} for @${name} has no verifiable membership owner; shutdown is fenced for recovery.`,
 					);
-				this.board.bindOwnerMembership(task.id, _membershipId);
+				this.board.bindOwnerMembership(task.id, _membershipId, expectedClaim);
+				expectedClaim.ownerMembershipId = _membershipId;
 				ownsClaim = true;
 			}
 			const terminal = task.status === "completed" || task.status === "cancelled";
@@ -245,11 +261,14 @@ export class TaskExecutionService {
 			if (!ownsClaim && !invalidatesPlan) continue;
 			if (task.attempts.some((attempt) => attempt.status === "running"))
 				throw new Error(`Task ${task.code ?? task.id} still has an active attempt; claim retained.`);
-			this.board.update({
-				id: task.id,
-				...(ownsClaim ? { status: "pending" as const } : {}),
-				...(invalidatesPlan ? { executionPlan: null } : {}),
-			});
+			this.board.update(
+				{
+					id: task.id,
+					...(ownsClaim ? { status: "pending" as const } : {}),
+					...(invalidatesPlan ? { executionPlan: null } : {}),
+				},
+				expectedClaim,
+			);
 		}
 	}
 

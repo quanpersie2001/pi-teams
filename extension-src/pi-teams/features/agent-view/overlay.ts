@@ -5,6 +5,8 @@ import type { AgentFocusSnapshot, AgentTranscriptView } from "../../domain/ui-vi
 import { formatElapsedMs } from "../../shared/elapsed.js";
 import { identityColor } from "../../shared/identity-color.js";
 import { statusBadge } from "../../shared/status.js";
+import { updateAgentSteerEditor } from "./editor.js";
+import { agentStatusSnapshot, renderAgentStatus } from "./status.js";
 import type { AgentTranscriptPane } from "./transcript-pane.js";
 
 export interface AgentViewEditor extends Pick<Component, "render" | "invalidate"> {
@@ -13,6 +15,7 @@ export interface AgentViewEditor extends Pick<Component, "render" | "invalidate"
 	setText(text: string): void;
 	isShowingAutocomplete?(): boolean;
 	getExpandedText?(): string;
+	getCursor?(): { line: number; col: number };
 	onSubmit?: (text: string) => void;
 	focused?: boolean;
 	dispose?(): void;
@@ -25,6 +28,8 @@ export interface AgentViewData {
 
 export interface AgentViewOverlayHost {
 	getData(): AgentViewData | null;
+	renderNavigation?(width: number, maxAgentRows: number): { lines: string[]; targets: ReadonlyMap<number, string> };
+	onSelect?(runId: string): void;
 	onSubmit(text: string): boolean | Promise<boolean>;
 	onNavigate?(delta: number): void;
 	onReturnMain?(): void;
@@ -73,6 +78,8 @@ export function createAgentViewOverlay(options: {
 	let focused = true;
 	let abortArmed = false;
 	let submitFeedback: string | undefined;
+	let submitting = false;
+	let panelTargets: ReadonlyMap<number, string> = new Map();
 
 	function canCompose(view: AgentTranscriptView): boolean {
 		return view.capabilities.steerable || view.capabilities.resumable;
@@ -85,35 +92,40 @@ export function createAgentViewOverlay(options: {
 	function submitText(submitted: string): void {
 		const text = submitted.trim();
 		abortArmed = false;
-		if (!text) return;
-		if (text.startsWith("/")) {
-			const draft = editor.getText();
-			const result = host.onSubmit(text);
-			if (result instanceof Promise) {
-				void result
-					.then((accepted) => {
-						if (accepted === false) submitFeedback ??= "Command unavailable or failed; draft retained.";
-						else {
-							submitFeedback = undefined;
-							if (editor.getText() === draft) editor.setText("");
-						}
-						requestRender();
-					})
-					.catch((error: unknown) => {
-						submitFeedback = error instanceof Error ? error.message : String(error);
-						requestRender();
-					});
-			} else if (result === false) submitFeedback ??= "Command unavailable or failed; draft retained.";
-			else {
+		if (!text || submitting) return;
+		const draft = editor.getText();
+		const finish = (accepted: boolean): void => {
+			if (disposed) return;
+			if (!accepted) {
+				submitFeedback ??= text.startsWith("/")
+					? "Command unavailable or failed; draft retained."
+					: "Message unavailable or failed; draft retained.";
+			} else {
 				submitFeedback = undefined;
-				editor.setText("");
+				if (editor.getText() === draft) editor.setText("");
 			}
 			requestRender();
-			return;
+		};
+		const failed = (error: unknown): void => {
+			if (disposed) return;
+			submitFeedback = error instanceof Error ? error.message : String(error);
+			requestRender();
+		};
+		submitting = true;
+		try {
+			const result = host.onSubmit(text);
+			if (result instanceof Promise) {
+				void result.then(finish, failed).finally(() => {
+					submitting = false;
+				});
+			} else {
+				submitting = false;
+				finish(result);
+			}
+		} catch (error) {
+			submitting = false;
+			failed(error);
 		}
-		editor.setText("");
-		void host.onSubmit(text);
-		requestRender();
 	}
 
 	function color(token: string, text: string): string {
@@ -122,10 +134,6 @@ export function createAgentViewOverlay(options: {
 
 	function header(view: AgentTranscriptView, focus: AgentFocusSnapshot | undefined, width: number): string {
 		const badge = statusBadge(view.status);
-		const elapsed = Math.max(0, (view.completedAt ?? view.generatedAt) - view.startedAt);
-		const stats: string[] = [formatElapsedMs(elapsed)];
-		if (view.toolUses > 0) stats.push(`${view.toolUses} tool${view.toolUses === 1 ? "" : "s"}`);
-		if (view.turns > 0) stats.push(`${view.turns} turn${view.turns === 1 ? "" : "s"}`);
 		const state =
 			view.resourceState === "closed"
 				? " · Pi process closed (history only)"
@@ -134,49 +142,30 @@ export function createAgentViewOverlay(options: {
 					: view.resourceState === "idle"
 						? " · Pi process idle (retained teammate)"
 						: "";
-		const usage = `${view.usage.inputTokens} in / ${view.usage.outputTokens} out`;
 		const name = view.teammateName ? identityColor(theme, view.teammateColor, `@${view.teammateName}`) : view.type;
-		const title = ` ${color(badge.color, badge.icon)} ${name} · ${usage} — ${view.description} · ${stats.join(" · ")}${state}`;
 		const truncation = focus?.truncatedHead || view.truncatedHead ? " · transcript is a bounded tail" : "";
-		return truncateToWidth(`${title}${truncation}`, width);
+		return truncateToWidth(` ${color(badge.color, badge.icon)} ${name}${state}${truncation}`, width);
 	}
 
-	function focusDetails(focus: AgentFocusSnapshot | undefined, width: number): string {
-		if (!focus) return truncateToWidth("child state unavailable", width);
-		const models = focus.capabilities.filter((item) => item.startsWith("model:")).map((item) => item.slice(6));
-		const thinking = focus.capabilities.filter((item) => item.startsWith("thinking:")).map((item) => item.slice(9));
-		const details = `${focus.model ?? "model unavailable"} · thinking ${focus.thinking ?? "unavailable"} · context ${focus.context?.usedTokens ?? "?"}/${focus.context?.windowTokens ?? "?"} · ${focus.cwd ?? "cwd unavailable"}`;
-		const options = [
-			...(models.length ? [`models: ${models.join(", ")}`] : []),
-			...(thinking.length ? [`thinking levels: ${thinking.join(", ")}`] : []),
-		];
-		return truncateToWidth([details, ...options].join(" · "), width);
-	}
-
-	function footer(view: AgentTranscriptView, focus: AgentFocusSnapshot | undefined, width: number): string {
-		const actions: string[] = [];
-		if (canCompose(view))
-			actions.push(
-				view.resourceState === "idle"
-					? "type + enter assign"
-					: view.capabilities.steerable
-						? "type + enter steer"
-						: "type + enter cold resume",
-			);
-		for (const command of ["model", "thinking", "compact"]) {
-			if (focus?.capabilities.includes(command)) {
-				actions.push(
-					command === "model" ? "/model <provider/id>" : command === "thinking" ? "/thinking <level>" : "/compact",
-				);
-			}
-		}
-		if (view.capabilities.stoppable) actions.push(abortArmed ? "ctrl+x again to abort" : "ctrl+x abort");
-		if (view.capabilities.attachable) actions.push("alt+o open pane");
-		const left = color("dim", actions.join(" · "));
-		const right = color("dim", "↑↓ / pgup / pgdn scroll");
-		const roomForLeft = Math.max(0, width - visibleWidth(right) - 2);
-		if (visibleWidth(left) > roomForLeft) return truncateToWidth(left, width);
-		return `${left}${" ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)))}${right}`;
+	function statusLines(view: AgentTranscriptView, focus: AgentFocusSnapshot | undefined, width: number): string[] {
+		const elapsed = Math.max(0, (view.completedAt ?? view.generatedAt) - view.startedAt);
+		const stats = [view.description, formatElapsedMs(elapsed)];
+		if (view.toolUses > 0) stats.push(`${view.toolUses} tool${view.toolUses === 1 ? "" : "s"}`);
+		if (view.turns > 0) stats.push(`${view.turns} turn${view.turns === 1 ? "" : "s"}`);
+		const native = agentStatusSnapshot(view, focus);
+		const styled = renderAgentStatus(theme, width, view, focus);
+		const summary = stats.join(" · ");
+		const lines = styled
+			? [color("dim", `run · ${summary}`), ...styled]
+			: [
+					color("dim", `${view.usage.inputTokens} in / ${view.usage.outputTokens} out — ${summary}`),
+					color(
+						"dim",
+						`${native.model ?? "model unavailable"} · thinking ${native.thinkingLevel ?? "unavailable"} · context ${native.context.currentTokens ?? "?"}/${native.context.windowTokens ?? "?"} · ${native.cwd ?? "cwd unavailable"}`,
+					),
+				];
+		if (abortArmed) lines.unshift(color("warning", "ctrl+x again to abort"));
+		return lines.map((line) => truncateToWidth(line, width));
 	}
 
 	function maskLine(line: string, width: number): string {
@@ -259,9 +248,18 @@ export function createAgentViewOverlay(options: {
 			requestRender();
 			return;
 		}
-		if (matchesKey(data, "return")) {
+		if (
+			keybindings.matches(data, "tui.input.submit") ||
+			(matchesKey(data, "return") && !keybindings.matches(data, "tui.input.newLine"))
+		) {
 			if (autocompleteActive) {
 				editor.handleInput(data);
+				requestRender();
+				return;
+			}
+			const cursor = editor.getCursor?.();
+			if (cursor && cursor.col > 0 && text.split("\n")[cursor.line]?.[cursor.col - 1] === "\\") {
+				editor.handleInput(data); // Preserve native backslash/newline submit escape.
 				requestRender();
 				return;
 			}
@@ -274,7 +272,12 @@ export function createAgentViewOverlay(options: {
 		requestRender();
 	}
 
-	editor.onSubmit = (text) => submitText(text);
+	editor.onSubmit = (text) => {
+		// Native alternate submit paths clear the buffer before invoking this
+		// callback. Preserve their expanded content before awaiting acceptance.
+		if (editor.getText() === "") editor.setText(text);
+		submitText(text);
+	};
 	const initialView = host.getData()?.view;
 	editor.focused = initialView !== undefined && canCompose(initialView);
 
@@ -301,7 +304,13 @@ export function createAgentViewOverlay(options: {
 				return { handled: true, render: true };
 			}
 			if (event.type === "click" && event.button === "left") {
-				const result = pane.handleMouse({ ...event, y: event.y - 1 });
+				const target = panelTargets.get(event.y);
+				if (target) {
+					if (target === "main") host.onReturnMain?.();
+					else host.onSelect?.(target);
+					return { handled: true, render: true };
+				}
+				const result = pane.handleMouse({ ...event, y: event.y - 1 - Number(submitFeedback !== undefined) });
 				if (result) {
 					requestRender();
 					return result;
@@ -315,30 +324,37 @@ export function createAgentViewOverlay(options: {
 			editor.invalidate();
 		},
 		render(width: number): string[] {
+			panelTargets = new Map();
 			const rows = Math.max(0, Math.floor(tui.terminal.rows));
 			if (rows === 0 || width <= 0) return [];
 			const data = host.getData();
 			const view = data?.view;
 			const focus = data?.focus;
+			updateAgentSteerEditor(editor, view, focus);
 			const lines: string[] = [];
 			if (!view) {
 				for (let row = 0; row < rows; row++) lines.push(maskLine("", width));
 				return lines;
 			}
 			lines.push(header(view, focus, width));
-			lines.push(focusDetails(focus, width));
 			if (submitFeedback) lines.push(color("error", submitFeedback));
-			const hasFooter = rows > 1;
-			const available = Math.max(0, rows - lines.length - Number(hasFooter));
-			const editorBudget =
-				canCompose(view) && available > 0
-					? Math.min(4, Math.max(1, Math.floor(rows / 6)), Math.max(1, available - 1))
-					: 0;
+			const footer = statusLines(view, focus, width).slice(0, Math.max(0, rows - lines.length));
+			const bodyBudget = Math.max(0, rows - lines.length - footer.length);
+			const editorReserve = canCompose(view) ? Math.min(4, Math.max(1, Math.floor(rows / 6))) : 0;
+			// Reserve a transcript line and the panel's main row plus both window hints.
+			const panel = host.renderNavigation?.(width, Math.max(0, bodyBudget - editorReserve - 1 - 3)) ?? {
+				lines: [],
+				targets: new Map<number, string>(),
+			};
+			const available = Math.max(0, bodyBudget - panel.lines.length);
+			const editorBudget = available > 0 ? Math.min(editorReserve, Math.max(1, available - 1)) : 0;
 			const editorLines = fitEditorViewport(canCompose(view) ? editor.render(width) : [], editorBudget);
 			const paneRows = Math.max(0, available - editorLines.length);
 			lines.push(...pane.render(width, paneRows));
 			lines.push(...editorLines);
-			if (hasFooter) lines.push(footer(view, focus, width));
+			panelTargets = new Map([...panel.targets].map(([y, id]) => [lines.length + y, id]));
+			lines.push(...panel.lines);
+			lines.push(...footer);
 			while (lines.length < rows) lines.push("");
 			return lines.slice(0, rows).map((line) => maskLine(line, width));
 		},

@@ -28,9 +28,10 @@ import {
 	parseChildRequest,
 	requireString,
 } from "../domain/child-protocol.js";
-import type { TranscriptItem } from "../domain/transcript.js";
+import { boundedToolResult, type TranscriptItem } from "../domain/transcript.js";
 import { currentPlatform, isWindowsPipeEndpoint, validateControlEndpoints } from "./child-endpoint.js";
 import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
+import { childSessionMetadata } from "./child-session-stats.js";
 import { createTeamTaskTools } from "./team-task-tools.js";
 
 const MAX_TRANSCRIPT_ITEMS = 256;
@@ -430,22 +431,20 @@ export function normalizeMessage(message: unknown): TranscriptItem[] {
 		return items;
 	}
 	if (message.role === "toolResult") {
-		const result = content === undefined ? undefined : previewJson(content);
+		const projected = boundedToolResult(content, message.details);
 		const text = previewContent(content);
-		const metadata = {
-			...(text.truncated ? { textTruncated: true, textOriginalLength: text.originalLength } : {}),
-			...(result?.truncated ? { resultTruncated: true } : {}),
-		};
 		return [
 			{
 				kind: "toolResult",
 				timestamp,
 				...(typeof message.toolName === "string" ? { toolName: message.toolName } : {}),
 				...(typeof message.toolCallId === "string" ? { toolCallId: message.toolCallId } : {}),
+				...projected,
 				text: text.text,
-				...(result !== undefined ? { result: result.value } : {}),
+				...(text.truncated
+					? { metadata: { ...projected.metadata, textTruncated: true, textOriginalLength: text.originalLength } }
+					: {}),
 				...(typeof message.isError === "boolean" ? { isError: message.isError } : {}),
-				...(Object.keys(metadata).length > 0 ? { metadata } : {}),
 			},
 		];
 	}
@@ -547,7 +546,8 @@ class ChildRuntime {
 		this.transcriptItems = history.slice(-MAX_TRANSCRIPT_ITEMS).map((item, index) => {
 			const text = item.text === undefined ? undefined : previewText(item.text);
 			const args = item.args === undefined ? undefined : previewJson(item.args);
-			const result = item.result === undefined ? undefined : previewJson(item.result);
+			const nativeResult = item.kind === "toolResult" ? boundedToolResult(item.result, item.details) : undefined;
+			const result = nativeResult ? undefined : item.result === undefined ? undefined : previewJson(item.result);
 			const metadataPreview = item.metadata === undefined ? undefined : previewJson(item.metadata);
 			const metadata = {
 				...(metadataPreview && isRecord(metadataPreview.value) ? metadataPreview.value : {}),
@@ -555,6 +555,7 @@ class ChildRuntime {
 				...(text?.truncated ? { truncated: true, originalLength: text.originalLength } : {}),
 				...(args?.truncated ? { argsTruncated: true } : {}),
 				...(result?.truncated ? { resultTruncated: true } : {}),
+				...nativeResult?.metadata,
 			};
 			return {
 				...item,
@@ -563,6 +564,7 @@ class ChildRuntime {
 				...(text !== undefined ? { text: text.text } : {}),
 				...(args !== undefined ? { args: args.value } : {}),
 				...(result !== undefined ? { result: result.value } : {}),
+				...(nativeResult ?? {}),
 				...(Object.keys(metadata).length > 0 ? { metadata } : {}),
 			};
 		});
@@ -1493,7 +1495,11 @@ export async function installChildBridgeExtension(pi: ExtensionAPI): Promise<voi
 				}),
 			),
 		);
-		const board = new TaskBoardService({ teamDir: initialBootstrap.teamDir, self: initialBootstrap.teammateName });
+		const board = new TaskBoardService({
+			teamDir: initialBootstrap.teamDir,
+			self: initialBootstrap.teammateName,
+			...(initialBootstrap.membershipId !== undefined ? { selfMembershipId: initialBootstrap.membershipId } : {}),
+		});
 		for (const tool of createTeamTaskTools(() => board)) pi.registerTool(tool);
 	}
 	pi.on("before_agent_start", async (event) => {
@@ -1543,20 +1549,22 @@ export async function installChildBridgeExtension(pi: ExtensionAPI): Promise<voi
 }
 
 function createInteractiveHost(pi: ExtensionAPI, context: ExtensionContext): ChildBridgeHost {
-	let selectedModel = context.model;
-	let thinkingLevel = context.thinkingLevel ?? pi.getThinkingLevel();
 	const getFocus = (): NonNullable<ChildState["focus"]> => {
-		const model = selectedModel;
+		const model = context.model;
 		const thinking = model?.reasoning
 			? (["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const).filter(
 					(level) => model.thinkingLevelMap?.[level] !== null,
 				)
 			: (["off"] as const);
 		const contextUsage = context.getContextUsage();
+		const metadata = childSessionMetadata(context.sessionManager.getEntries?.());
 		return {
 			cwd: context.cwd,
-			...(model ? { model: { provider: model.provider, id: model.id, name: model.name } } : {}),
-			thinking: thinkingLevel,
+			...metadata,
+			...(model
+				? { model: { provider: model.provider, id: model.id, name: model.name, reasoning: model.reasoning } }
+				: {}),
+			thinking: context.thinkingLevel ?? pi.getThinkingLevel(),
 			...(contextUsage && contextUsage.tokens !== null
 				? {
 						context: {
@@ -1625,7 +1633,6 @@ function createInteractiveHost(pi: ExtensionAPI, context: ExtensionContext): Chi
 					);
 				if (!(await pi.setModel(model)))
 					throw new ChildProtocolError("model_unavailable", `Pi could not select ${command.model}`);
-				selectedModel = model;
 				return;
 			}
 			if (command.type === "thinking") {
@@ -1635,7 +1642,6 @@ function createInteractiveHost(pi: ExtensionAPI, context: ExtensionContext): Chi
 						`Thinking level ${command.thinking} is unavailable for the current model`,
 					);
 				pi.setThinkingLevel(command.thinking);
-				thinkingLevel = command.thinking;
 				return;
 			}
 			throw new ChildProtocolError("unsupported_command", "Manual compaction is unavailable in the process backend");
@@ -1643,7 +1649,7 @@ function createInteractiveHost(pi: ExtensionAPI, context: ExtensionContext): Chi
 		prompt: async (prompt) => {
 			// Dispatch is void; native preflight failures otherwise emit no settlement event.
 			// Validate with the native registry before acknowledging admission.
-			const model = selectedModel;
+			const model = context.model;
 			if (!model) throw new Error("No model selected. Select a model before sending a prompt.");
 			const registry = context.modelRegistry;
 			const hasAuth =

@@ -5,7 +5,7 @@
 // overlay only detaches UI; it never stops or disposes a child resource.
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Component } from "@earendil-works/pi-tui";
+import type { Component, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Editor, isKeyRelease, isKeyRepeat, matchesKey, type OverlayHandle, type TUI } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../app/agent-manager.js";
 import { activityFromTranscript, buildAgentListView, buildAgentTranscriptView } from "../app/ui-snapshot.js";
@@ -20,6 +20,8 @@ import {
 	createAgentHubComponent,
 	createAgentListComponent,
 	hubRosterCapacity,
+	MAX_AGENT_ROWS,
+	renderAgentPanelWithTargets,
 } from "../features/agent-panel/index.js";
 import {
 	activatePanel,
@@ -39,6 +41,7 @@ import {
 	createAgentTranscriptPane,
 	createAgentViewOverlay,
 } from "../features/agent-view/index.js";
+import { readAgentGit } from "../features/agent-view/status.js";
 import {
 	createTasksHubComponent,
 	inlineTasks,
@@ -136,6 +139,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	let focusData: AgentFocusSnapshot | null = null;
 	let focusUnsubscribe: (() => void) | undefined;
 	let focusGeneration = 0;
+	let gitRequest: object | undefined;
 	let hubOpen = false;
 	let hubTab: "agents" | "tasks" = "agents";
 	let lastHubTab: "agents" | "tasks" = "agents";
@@ -178,6 +182,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	const activityByRunId = new Map<string, string>();
 	const dismissed = new Set<string>();
 	const viewDrafts = new Map<string, string>();
+	const pendingSubmissions = new Map<string, { text: string; draft: string; promise: Promise<boolean> }>();
 	const viewUiState = new Map<
 		string,
 		{ scrollBack: number; toolsExpanded: boolean; toolExpansion: readonly (readonly [string, boolean])[] }
@@ -247,6 +252,12 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 						return data;
 					},
 					now,
+					(id) => {
+						if (id === "main") {
+							selection = null;
+							requestRender();
+						} else if (inlineListView?.rows.some((row) => row.id === id && row.capabilities.viewable)) openView(id);
+					},
 				);
 				// Pi adds no spacer around below-editor widgets, so own the gap to the
 				// editor's bottom border. A panel with nothing to show stays empty so the
@@ -256,12 +267,23 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 						const lines = agents.render(width);
 						return lines.length === 0 ? lines : ["", ...lines];
 					},
+					handleMouse: (event: TuiMouseEvent) => agents.handleMouse?.({ ...event, y: event.y - 1 }),
 					invalidate: () => agents.invalidate(),
 				};
 			},
 			{ placement: "belowEditor" },
 		);
 		panelRegistered = true;
+		// Pi reinserts widgets in insertion order. Let an optional status owner
+		// move only its own rows behind the newly mounted roster.
+		const ordering = (globalThis as Record<symbol, unknown>)[Symbol.for("@quandev104/pi-style:status-widget-order")] as
+			| { reflow?: () => void }
+			| undefined;
+		try {
+			ordering?.reflow?.();
+		} catch {
+			// Optional styling must not prevent the roster from mounting.
+		}
 	}
 
 	function syncInlineAgentWidget(): void {
@@ -335,7 +357,22 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 						editor,
 						host: {
 							getData: () => (viewRunId === runId ? viewData : null),
-							onSubmit: (text) => routeComposer(text, runId),
+							renderNavigation: (width, maxAgentRows) =>
+								listView
+									? renderAgentPanelWithTargets(
+											{
+												view: { ...listView, rows: listView.rows.filter((row) => row.capabilities.viewable) },
+												selection: runId,
+												stopArmedFor: null,
+											},
+											bindThemeFg(theme),
+											width,
+											now(),
+											Math.min(MAX_AGENT_ROWS, maxAgentRows),
+										)
+									: { lines: [], targets: new Map() },
+							onSelect: openView,
+							onSubmit: (text) => submitViewedDraft(runId, text, editor.getText()),
 							onAbort: () => abortViewedRun(runId),
 							onAttachPane: () => handleAttach(runId),
 							onNavigate: (delta) => navigateViewedRun(runId, delta),
@@ -1048,6 +1085,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		focusUnsubscribe?.();
 		focusUnsubscribe = undefined;
 		focusData = null;
+		gitRequest = undefined;
 		if (oldRunId !== null && overlayComponent) {
 			viewDrafts.set(oldRunId, overlayComponent.editor.getText());
 			viewUiState.set(oldRunId, overlayComponent.pane.getState());
@@ -1069,6 +1107,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			component?.dispose();
 			handle?.hide();
 		}
+		ensureTick();
 		requestRender();
 	}
 
@@ -1199,23 +1238,75 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		const revision = ++focusReadRevision;
 		try {
 			const snapshot = await options.focus.read(runId);
-			if (
-				disposed ||
-				generation !== focusGeneration ||
-				revision !== focusReadRevision ||
-				viewRunId !== runId ||
-				snapshot.runId !== runId ||
-				(snapshot.currentRunId !== null && snapshot.currentRunId !== runId)
-			)
+			if (disposed || generation !== focusGeneration || revision !== focusReadRevision || viewRunId !== runId) return;
+			if (snapshot.runId !== runId || (snapshot.currentRunId !== null && snapshot.currentRunId !== runId)) {
+				focusData = null;
+				gitRequest = undefined;
+				if (viewData) {
+					delete viewData.focus;
+					viewRevision++;
+				}
+				requestRender();
 				return;
-			focusData = snapshot;
-			updateFocusedView(runId, generation, snapshot);
+			}
+			setFocus(snapshot);
+			if (focusData) updateFocusedView(runId, generation, focusData);
+			void hydrateGit(runId, generation);
 		} catch (error) {
 			if (generation === focusGeneration && revision === focusReadRevision && viewRunId === runId) {
 				notify(error instanceof Error ? error.message : String(error), "error");
 			}
 		}
 	}
+	function gitCwd(snapshot: AgentFocusSnapshot | null): string | undefined {
+		return snapshot &&
+			!snapshot.closed &&
+			snapshot.runId === viewRunId &&
+			(snapshot.currentRunId === null || snapshot.currentRunId === viewRunId)
+			? snapshot.cwd || undefined
+			: undefined;
+	}
+
+	function setFocus(snapshot: AgentFocusSnapshot): void {
+		const cwd = gitCwd(snapshot);
+		const sameCwd = cwd !== undefined && cwd === gitCwd(focusData);
+		if (!sameCwd) gitRequest = undefined;
+		const git = sameCwd ? focusData?.git : undefined;
+		focusData = { ...snapshot };
+		delete focusData.git;
+		if (git) focusData.git = git;
+	}
+
+	async function hydrateGit(runId: string, generation: number): Promise<void> {
+		const cwd = gitCwd(focusData);
+		if (!cwd || gitRequest || disposed) return;
+		const request = {};
+		gitRequest = request;
+		try {
+			const git = await readAgentGit(cwd);
+			if (
+				disposed ||
+				gitRequest !== request ||
+				generation !== focusGeneration ||
+				viewRunId !== runId ||
+				gitCwd(focusData) !== cwd
+			)
+				return;
+			// Merge only Git into the latest native snapshot, never the request's snapshot.
+			if (focusData && JSON.stringify(focusData.git) !== JSON.stringify(git)) {
+				const latest = { ...focusData };
+				delete latest.git;
+				if (git) latest.git = git;
+				focusData = latest;
+				updateFocusedView(runId, generation, latest);
+			}
+		} catch {
+			/* Optional provider failure must not disturb the viewer. */
+		} finally {
+			if (gitRequest === request) gitRequest = undefined;
+		}
+	}
+
 	function updateFocusedView(runId: string, generation: number, snapshot: AgentFocusSnapshot): void {
 		const record = manager.get(runId);
 		if (!record || disposed || generation !== focusGeneration || viewRunId !== runId) return;
@@ -1230,6 +1321,31 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		viewRevision++;
 		startViewOverlay();
 		requestRender();
+	}
+
+	/** Submission ownership outlives an overlay, just like each run's saved draft. */
+	function submitViewedDraft(runId: string, text: string, draft: string): Promise<boolean> {
+		const pending = pendingSubmissions.get(runId);
+		if (pending) {
+			if (pending.text === text && pending.draft === draft) return pending.promise;
+			overlayComponent?.showFeedback("A message is still awaiting acceptance; draft retained.");
+			return Promise.resolve(false);
+		}
+		const operation = { text, draft, promise: Promise.resolve(false) };
+		operation.promise = routeComposer(text, runId)
+			.then((accepted) => {
+				if (accepted && !disposed && pendingSubmissions.get(runId) === operation) {
+					if (viewDrafts.get(runId) === draft) viewDrafts.delete(runId);
+					if (viewRunId === runId && overlayComponent?.editor.getText() === draft) overlayComponent.editor.setText("");
+					requestRender();
+				}
+				return accepted;
+			})
+			.finally(() => {
+				if (pendingSubmissions.get(runId) === operation) pendingSubmissions.delete(runId);
+			});
+		pendingSubmissions.set(runId, operation);
+		return operation.promise;
 	}
 
 	/** Composer routes only explicit child controls, steer, or cold continuation. */
@@ -1256,16 +1372,18 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			const controlRevision = focusReadRevision;
 			try {
 				const next = await options.focus.control(runId, control);
+				if (next.runId !== runId || (next.currentRunId !== null && next.currentRunId !== runId)) return false;
+				// Native acceptance belongs to the run, even when its view was replaced.
+				// Only the focused snapshot/repaint is fenced by navigation generation.
+				if (generation !== focusGeneration || viewRunId !== runId) return true;
 				if (
-					generation !== focusGeneration ||
-					viewRunId !== runId ||
-					next.runId !== runId ||
-					(next.currentRunId !== null && next.currentRunId !== runId)
-				)
-					return false;
-				if (focusReadRevision === controlRevision) {
+					focusReadRevision === controlRevision &&
+					next.runId === runId &&
+					(next.currentRunId === null || next.currentRunId === runId)
+				) {
 					focusReadRevision++;
-					focusData = next;
+					setFocus(next);
+					void hydrateGit(runId, generation);
 				}
 				updateFocusedView(runId, generation, focusData?.runId === runId ? focusData : next);
 				return true;
@@ -1568,8 +1686,12 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 
 	function ensureTick(): void {
 		const anyActive = manager.list().some((record) => isActiveStatus(record.status));
-		if (anyActive) {
-			if (tickTimer === undefined) tickTimer = setInterval(() => void refresh(), TICK_MS);
+		if (!disposed && (anyActive || viewRunId !== null)) {
+			if (tickTimer === undefined)
+				tickTimer = setInterval(() => {
+					void refresh();
+					if (viewRunId !== null) void loadFocus(viewRunId, focusGeneration);
+				}, TICK_MS);
 			return;
 		}
 		clearTick();
@@ -1656,6 +1778,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			inlineListView = null;
 			selection = null;
 			viewDrafts.clear();
+			pendingSubmissions.clear();
 			viewUiState.clear();
 		},
 	};

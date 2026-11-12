@@ -321,6 +321,7 @@ function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string
 	const waitForOwnedProcess = async (
 		paneId: string,
 		terminalId: string,
+		observe: (pid: number, startTime?: string) => void,
 	): Promise<{ pid: number; startTime: string; foregroundProcessGroupId: number }> => {
 		const deadline = Date.now() + 15_000;
 		let lastError: unknown;
@@ -334,8 +335,10 @@ function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string
 				// Pi changes its process title; argv is neither stable nor exposed by HerdR.
 				const processEntry = info.processes.find((entry) => entry.pid === info.foregroundProcessGroupId);
 				if (processEntry) {
+					observe(processEntry.pid);
 					const startTime = await readProcessStart(runner, processEntry.pid);
 					if (startTime) {
+						observe(processEntry.pid, startTime);
 						return {
 							pid: processEntry.pid,
 							startTime,
@@ -351,6 +354,59 @@ function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string
 		}
 		throw new Error("Timed out waiting for the owned HerdR child process", { cause: lastError });
 	};
+	async function recoverForCleanup(handle: LauncherHandle): Promise<LauncherHandle | undefined> {
+		validateHandle(handle, "herdr");
+		const { paneId, terminalId, socketPath: commandSocketPath, identity } = handle;
+		if (!paneId || !terminalId || !commandSocketPath || !isAbsolute(commandSocketPath)) return undefined;
+		if (
+			(identity?.paneId && identity.paneId !== paneId) ||
+			(identity?.terminalId && identity.terminalId !== terminalId)
+		)
+			return undefined;
+		const savedProcess = !!(
+			handle.pid &&
+			identity?.startTime &&
+			identity.foregroundProcessGroupId === String(handle.pid)
+		);
+		if (!savedProcess && !identity?.ownerToken) return undefined;
+		try {
+			const pane = await readPane(paneId, commandSocketPath);
+			if (pane.pane_id !== paneId || pane.terminal_id !== terminalId) return undefined;
+			const info = await readProcessInfo(paneId, commandSocketPath);
+			const pid = info.foregroundProcessGroupId;
+			if (!Number.isSafeInteger(pid) || pid <= 0 || !info.processes.some((entry) => entry.pid === pid))
+				return undefined;
+			if (
+				(handle.pid !== undefined && handle.pid !== pid) ||
+				(identity?.foregroundProcessGroupId !== undefined && identity.foregroundProcessGroupId !== String(pid))
+			)
+				return undefined;
+			const startTime = await readProcessStart(runner, pid);
+			if (!startTime || (identity?.startTime !== undefined && identity.startTime !== startTime)) return undefined;
+			// A terminal id alone cannot identify the original process after a failed probe.
+			if (!savedProcess && (await processHasOwner(runner, pid, identity?.ownerToken as string)) !== true)
+				return undefined;
+			const recheck = await readPane(paneId, commandSocketPath);
+			const current = await readProcessInfo(paneId, commandSocketPath);
+			if (
+				recheck.pane_id !== paneId ||
+				recheck.terminal_id !== terminalId ||
+				current.foregroundProcessGroupId !== pid ||
+				!current.processes.some((entry) => entry.pid === pid) ||
+				(await readProcessStart(runner, pid)) !== startTime
+			)
+				return undefined;
+			if (!savedProcess && (await processHasOwner(runner, pid, identity?.ownerToken as string)) !== true)
+				return undefined;
+			return {
+				...handle,
+				pid,
+				identity: { ...identity, paneId, terminalId, foregroundProcessGroupId: String(pid), startTime },
+			};
+		} catch {
+			return undefined;
+		}
+	}
 	const lifecycle: TerminalLauncher = {
 		kind: "herdr",
 		async available() {
@@ -388,12 +444,29 @@ function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string
 			const paneId = String(pane.pane_id ?? "");
 			const terminalId = String(pane.terminal_id ?? "");
 			if (!paneId || !terminalId) throw new Error("HerdR split did not return pane identity");
-			const command = `exec env ${shellCommand(spec.interactiveArgv, spec.env)}`;
+			const ownerToken = randomUUID();
+			const partialIdentity: Record<string, string> = { sourcePaneId, ownerToken };
+			const pending: LauncherHandle = {
+				kind: "herdr",
+				childId: spec.childId,
+				paneId,
+				terminalId,
+				socketPath,
+				identity: partialIdentity,
+			};
+			const command = `exec env ${shellCommand(spec.interactiveArgv, { ...spec.env, PI_TEAMS_LAUNCH_OWNER: ownerToken })}`;
 			try {
 				// HerdR joins COMMAND arguments into shell input; preserve quoting as one command.
 				await run(["pane", "run", paneId, command]);
-				const owned = await waitForOwnedProcess(paneId, terminalId);
+				const owned = await waitForOwnedProcess(paneId, terminalId, (pid, startTime) => {
+					if (pending.pid !== undefined && pending.pid !== pid)
+						throw new Error("HerdR process identity changed during startup");
+					pending.pid = pid;
+					partialIdentity.foregroundProcessGroupId = String(pid);
+					if (startTime) partialIdentity.startTime = startTime;
+				});
 				const identity = {
+					...partialIdentity,
 					paneId,
 					terminalId,
 					sourcePaneId,
@@ -404,7 +477,11 @@ function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string
 			} catch (error) {
 				const cleanupComplete = await closeHerdPaneIfOwned(run, paneId, terminalId, readProcessInfo).catch(() => false);
 				if (!cleanupComplete)
-					throw new ProcessLaunchCleanupPendingError("HerdR pane cleanup remains unverified.", { cause: error });
+					throw new ProcessLaunchCleanupPendingError(
+						"HerdR pane cleanup remains unverified.",
+						{ cause: error },
+						pending,
+					);
 				throw error;
 			}
 		},
@@ -442,6 +519,7 @@ function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string
 		},
 		async cleanupExited(handle) {
 			validateHandle(handle, "herdr");
+			// Exit-only proof needs the recorded group, not a successful startup start-time probe.
 			const identity = handle.identity;
 			const paneId = handle.paneId;
 			const terminalId = handle.terminalId;
@@ -454,7 +532,6 @@ function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string
 				!pid ||
 				!commandSocketPath ||
 				!isAbsolute(commandSocketPath) ||
-				!identity?.startTime ||
 				!Number.isSafeInteger(foregroundProcessGroupId) ||
 				foregroundProcessGroupId <= 0 ||
 				foregroundProcessGroupId !== pid
@@ -548,28 +625,31 @@ function herdrLauncher(runner: LauncherCommandRunner, env: Record<string, string
 		}
 		throw new Error("HerdR pane has no verified neighbor in its managed group");
 	}
-	return withTerminalPaneLayout(
-		lifecycle,
-		createHerdrPaneLayoutAdapter(runner, env),
-		lifecycle.launch.bind(lifecycle),
-		(handle, parent, peers) =>
-			focusNeighbor(handle, [parent.paneId, ...peers.flatMap((peer) => (peer.paneId ? [peer.paneId] : []))]),
-		async (handle) => {
-			const alive = await lifecycle.alive(handle);
-			if (alive !== false || !handle.pid || !handle.paneId || !handle.socketPath) return alive;
-			if (processExists(handle.pid) !== false || processGroupExists(handle.pid) !== false) return false;
-			try {
-				const pane = await readPane(handle.paneId, handle.socketPath);
-				return (
-					pane.pane_id === handle.paneId &&
-					pane.terminal_id === handle.terminalId &&
-					(await readProcessInfo(handle.paneId, handle.socketPath)).processes.length === 0
-				);
-			} catch (error) {
-				return isMissingHerdPane(error) ? false : undefined;
-			}
-		},
-	);
+	return {
+		...withTerminalPaneLayout(
+			lifecycle,
+			createHerdrPaneLayoutAdapter(runner, env),
+			lifecycle.launch.bind(lifecycle),
+			(handle, parent, peers) =>
+				focusNeighbor(handle, [parent.paneId, ...peers.flatMap((peer) => (peer.paneId ? [peer.paneId] : []))]),
+			async (handle) => {
+				const alive = await lifecycle.alive(handle);
+				if (alive !== false || !handle.pid || !handle.paneId || !handle.socketPath) return alive;
+				if (processExists(handle.pid) !== false || processGroupExists(handle.pid) !== false) return false;
+				try {
+					const pane = await readPane(handle.paneId, handle.socketPath);
+					return (
+						pane.pane_id === handle.paneId &&
+						pane.terminal_id === handle.terminalId &&
+						(await readProcessInfo(handle.paneId, handle.socketPath)).processes.length === 0
+					);
+				} catch (error) {
+					return isMissingHerdPane(error) ? false : undefined;
+				}
+			},
+		),
+		recoverForCleanup,
+	};
 }
 
 class ConfirmedMissingTmuxPaneError extends Error {
@@ -585,14 +665,20 @@ function tmuxLauncher(runner: LauncherCommandRunner, env: Record<string, string 
 	const missingServer = /no server running|ENOENT|no such file or directory/i;
 	const run = (args: readonly string[], socketPath = defaultSocketPath) =>
 		runner.run("tmux", [...(socketPath ? ["-S", socketPath] : []), ...args], { env: { ...process.env, ...env } });
-	const paneIdentity = async (paneId: string, socketPath?: string): Promise<TmuxPaneIdentity> => {
+	const paneIdentity = async (
+		paneId: string,
+		socketPath?: string,
+		observe?: (identity: Omit<TmuxPaneIdentity, "startCommand">) => void,
+	): Promise<TmuxPaneIdentity> => {
 		const result = await run(["display-message", "-p", "-t", paneId, "#{pane_id} #{pane_pid} #{pid}"], socketPath);
 
 		const fields = (lastLine(result.stdout) ?? "").split(/\s+/);
+		const [actualPaneId, panePid, serverPid] = fields;
+		if (fields.length === 3 && actualPaneId && panePid && serverPid)
+			observe?.({ paneId: actualPaneId, panePid, serverPid });
 		const command = (
 			await run(["display-message", "-p", "-t", paneId, "#{pane_start_command}"], socketPath)
 		).stdout.replace(/\r?\n$/, "");
-		const [actualPaneId, panePid, serverPid] = fields;
 		if (fields.length !== 3 || !actualPaneId || !panePid || !serverPid || !command) {
 			// tmux 3.6a returns exit 0 and only #{pid} for a missing -t pane.
 			// A malformed identity alone is not absence: prove it against the whole server.
@@ -605,6 +691,32 @@ function tmuxLauncher(runner: LauncherCommandRunner, env: Record<string, string 
 		}
 		return { paneId: actualPaneId, panePid, serverPid, startCommand: command };
 	};
+	async function recoverForCleanup(handle: LauncherHandle): Promise<LauncherHandle | undefined> {
+		validateHandle(handle, "tmux");
+		const { paneId, socketPath, identity } = handle;
+		if (!paneId || !socketPath || !isAbsolute(socketPath) || !identity?.ownerToken || !identity.serverPid)
+			return undefined;
+		if (!Number.isSafeInteger(Number(identity.serverPid)) || Number(identity.serverPid) <= 0) return undefined;
+		if (identity.paneId !== undefined && identity.paneId !== paneId) return undefined;
+		const ownerToken = identity.ownerToken;
+		const matches = (current: TmuxPaneIdentity) =>
+			current.paneId === paneId &&
+			current.serverPid === identity.serverPid &&
+			current.startCommand.includes(ownerToken) &&
+			Number.isSafeInteger(Number(current.panePid)) &&
+			Number(current.panePid) > 0 &&
+			(handle.pid === undefined || handle.pid === Number(current.panePid)) &&
+			(identity.panePid === undefined || identity.panePid === current.panePid);
+		try {
+			const current = await paneIdentity(paneId, socketPath);
+			if (!matches(current)) return undefined;
+			const recheck = await paneIdentity(paneId, socketPath);
+			if (!matches(recheck) || recheck.panePid !== current.panePid) return undefined;
+			return { ...handle, pid: Number(current.panePid), identity: { ...identity, paneId, panePid: current.panePid } };
+		} catch {
+			return undefined;
+		}
+	}
 	const lifecycle: TerminalLauncher = {
 		kind: "tmux",
 		async available() {
@@ -641,8 +753,26 @@ function tmuxLauncher(runner: LauncherCommandRunner, env: Record<string, string 
 			);
 			const paneId = lastLine(result.stdout);
 			if (!paneId) throw new Error("tmux split-window returned no pane id");
+			const partialIdentity: Record<string, string> = {
+				paneId,
+				ownerToken,
+				serverPid: String(jsonResult<Record<string, unknown>>(plan.parent.identity, "tmux parent identity").serverPid),
+			};
+			const pending: LauncherHandle = {
+				kind: "tmux",
+				childId: spec.childId,
+				paneId,
+				socketPath: defaultSocketPath,
+				identity: partialIdentity,
+			};
 			try {
-				const current = await paneIdentity(paneId, defaultSocketPath);
+				const current = await paneIdentity(paneId, defaultSocketPath, (observed) => {
+					if (observed.paneId !== paneId || observed.serverPid !== partialIdentity.serverPid) return;
+					const pid = Number(observed.panePid);
+					if (!Number.isSafeInteger(pid) || pid <= 0) return;
+					pending.pid = pid;
+					partialIdentity.panePid = observed.panePid;
+				});
 				if (!current.startCommand.includes(ownerToken)) throw new Error("tmux child identity could not be established");
 				const identity = { paneId: current.paneId, panePid: current.panePid, serverPid: current.serverPid, ownerToken };
 				return {
@@ -669,7 +799,11 @@ function tmuxLauncher(runner: LauncherCommandRunner, env: Record<string, string 
 							: missingResource.test(errorText(cleanupError));
 				}
 				if (!cleanupComplete)
-					throw new ProcessLaunchCleanupPendingError("tmux pane cleanup remains unverified.", { cause: error });
+					throw new ProcessLaunchCleanupPendingError(
+						"tmux pane cleanup remains unverified.",
+						{ cause: error },
+						pending,
+					);
 				throw error;
 			}
 		},
@@ -773,7 +907,10 @@ function tmuxLauncher(runner: LauncherCommandRunner, env: Record<string, string 
 			await run(["select-pane", "-t", paneId], socketPath);
 		},
 	};
-	return withTerminalPaneLayout(lifecycle, createTmuxPaneLayoutAdapter(runner, env), lifecycle.launch.bind(lifecycle));
+	return {
+		...withTerminalPaneLayout(lifecycle, createTmuxPaneLayoutAdapter(runner, env), lifecycle.launch.bind(lifecycle)),
+		recoverForCleanup,
+	};
 }
 
 function unixHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: typeof spawn): ProcessLauncher {
@@ -808,8 +945,9 @@ function unixHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: typeo
 			const pid = child.pid;
 			if (!pid) throw new Error("Headless child failed to start");
 			child.unref();
+			let startTime: string | undefined;
 			try {
-				const startTime = await readProcessStart(runner, pid);
+				startTime = await readProcessStart(runner, pid);
 				if (!startTime || (await processHasOwner(runner, pid, ownerToken)) !== true) {
 					throw new Error(`Unable to establish headless child identity; inspect ${logPath}`);
 				}
@@ -833,9 +971,18 @@ function unixHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: typeo
 					}
 				}
 				if (!cleanupComplete)
-					throw new ProcessLaunchCleanupPendingError("Headless process-group cleanup remains unverified.", {
-						cause: cleanupError ?? error,
-					});
+					throw new ProcessLaunchCleanupPendingError(
+						"Headless process-group cleanup remains unverified.",
+						{
+							cause: cleanupError ?? error,
+						},
+						{
+							kind: "headless",
+							childId: spec.childId,
+							pid,
+							identity: { ownerToken, ...(startTime ? { startTime } : {}) },
+						},
+					);
 				throw error;
 			}
 		},
@@ -850,8 +997,7 @@ function unixHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: typeo
 		},
 		async cleanupExited(handle) {
 			validateHandle(handle, "headless");
-			if (!handle.pid || !handle.identity?.startTime || !handle.identity.ownerToken)
-				throw new Error("Incomplete headless launcher handle");
+			if (!handle.pid || !handle.identity?.ownerToken) throw new Error("Incomplete headless launcher handle");
 			return processExists(handle.pid) === false && processGroupExists(handle.pid) === false;
 		},
 		async terminate(handle) {
@@ -940,8 +1086,10 @@ function windowsHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: ty
 			const pid = child.pid;
 			if (!pid) throw new Error("Headless child failed to start");
 			child.unref();
+			let creationDate: string | undefined;
 			try {
 				const probed = await readWindowsProcessIdentity(runner, pid);
+				creationDate = probed?.creationDate;
 				if (probed?.commandLine?.includes(ownerToken) !== true) {
 					throw new Error(
 						`Unable to establish headless child identity; inspect ${logPath} (${childLogExcerpt(logPath)})`,
@@ -974,9 +1122,18 @@ function windowsHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: ty
 					}
 				}
 				if (!cleanupComplete)
-					throw new ProcessLaunchCleanupPendingError("Headless process cleanup remains unverified.", {
-						cause: cleanupError ?? error,
-					});
+					throw new ProcessLaunchCleanupPendingError(
+						"Headless process cleanup remains unverified.",
+						{
+							cause: cleanupError ?? error,
+						},
+						{
+							kind: "headless",
+							childId: spec.childId,
+							pid,
+							identity: { ownerToken, ...(creationDate ? { creationDate } : {}) },
+						},
+					);
 				throw error;
 			}
 		},
@@ -991,8 +1148,7 @@ function windowsHeadlessLauncher(runner: LauncherCommandRunner, spawnProcess: ty
 		},
 		async cleanupExited(handle) {
 			validateHandle(handle, "headless");
-			if (!handle.pid || !handle.identity?.creationDate || !handle.identity.ownerToken)
-				throw new Error("Incomplete headless launcher handle");
+			if (!handle.pid || !handle.identity?.ownerToken) throw new Error("Incomplete headless launcher handle");
 			// No process groups on Windows; the owned tree is torn down via taskkill
 			// /T, so a verified-gone root PID is the full exit proof available here.
 			return processExists(handle.pid) === false;

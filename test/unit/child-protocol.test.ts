@@ -7,6 +7,8 @@ import {
 	encodeChildFrame,
 	parseChildRequest,
 } from "../../extension-src/pi-teams/domain/child-protocol.js";
+import { boundedToolResult } from "../../extension-src/pi-teams/domain/transcript.js";
+import { childSessionMetadata } from "../../extension-src/pi-teams/pi/child-session-stats.js";
 
 const validState: ChildState = {
 	childId: "child-a",
@@ -59,6 +61,57 @@ describe("child state validation", () => {
 			assertChildState({ ...validState, transcript: { ...validState.transcript, offset: 1 } }, "child-a"),
 		).toThrowError(ChildProtocolError);
 	});
+	it("roundtrips native session stats with unavailable billing and validates model reasoning", () => {
+		const state = {
+			...validState,
+			focus: {
+				cwd: "/child",
+				thinking: "off",
+				model: { provider: "native", id: "selected", name: "Native selected", reasoning: false },
+				...childSessionMetadata([{ type: "usage", usage: { input: 3, output: 2, cacheRead: 1, cacheWrite: 0 } }]),
+				capabilities: { models: [], thinking: ["off"], commands: [] },
+			},
+		};
+		expect(assertChildState(JSON.parse(JSON.stringify(state)), "child-a").focus?.sessionUsage).not.toHaveProperty(
+			"cost",
+		);
+		// Old v2 parents ignore additive fields but require cost whenever legacy stats exists.
+		expect(state.focus).not.toHaveProperty("stats");
+		const billed = childSessionMetadata([{ type: "usage", usage: { input: 1, cost: { total: 0 } } }]);
+		expect(billed?.stats?.cost).toBe(0);
+		expect(() =>
+			assertChildState(
+				{ ...state, focus: { ...state.focus, stats: { ...billed?.stats, cost: undefined } } },
+				"child-a",
+			),
+		).toThrowError(ChildProtocolError);
+		for (const cost of [-1, NaN, Infinity]) {
+			expect(() =>
+				assertChildState(
+					{ ...state, focus: { ...state.focus, sessionUsage: { ...state.focus.sessionUsage, cost } } },
+					"child-a",
+				),
+			).toThrowError(ChildProtocolError);
+		}
+		expect(() =>
+			assertChildState(
+				{ ...state, focus: { ...state.focus, model: { ...state.focus.model, reasoning: "yes" } } },
+				"child-a",
+			),
+		).toThrowError(ChildProtocolError);
+		for (const input of [-1, NaN, Infinity]) {
+			expect(() =>
+				assertChildState(
+					{
+						...state,
+						focus: { ...state.focus, sessionUsage: { ...state.focus.sessionUsage, inputTokens: input } },
+					},
+					"child-a",
+				),
+			).toThrowError(ChildProtocolError);
+		}
+	});
+
 	it("validates focus capabilities and streamed transcript identity", () => {
 		const focused: ChildState = {
 			...validState,
@@ -100,4 +153,23 @@ describe("child state validation", () => {
 			),
 		).toThrowError(ChildProtocolError);
 	});
+});
+
+it("frames bounded structured results with explicit image/detail truncation", () => {
+	const projected = boundedToolResult(
+		[
+			{ type: "image", data: "A".repeat(1_000_000), mimeType: "image/png" },
+			{ type: "text", text: "😀".repeat(100_000) },
+		],
+		{ diff: "😀".repeat(100_000) },
+	);
+	const state = {
+		...validState,
+		transcript: { ...validState.transcript, items: [{ kind: "toolResult", timestamp: 1, ...projected }] },
+	};
+	const frame = encodeChildFrame({ id: "state", ok: true, result: state });
+	expect(frame.byteLength).toBeLessThan(100_000);
+	expect(projected.metadata?.resultTruncated).toBe(true);
+	expect(projected.result.some((block) => block.type === "image")).toBe(false);
+	expect(assertChildState((decodeChildFrame(frame) as { result: unknown }).result, "child-a")).toEqual(state);
 });

@@ -82,6 +82,16 @@ export interface ChildFocusModel {
 	provider: string;
 	id: string;
 	name: string;
+	reasoning?: boolean;
+}
+
+export interface ChildSessionUsage {
+	scope: "session";
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	cost?: number;
 }
 
 export interface ChildState {
@@ -103,6 +113,7 @@ export interface ChildState {
 		model?: ChildFocusModel;
 		thinking: ThinkingLevel;
 		context?: { tokens: number; contextWindow: number; percent: number };
+		sessionUsage?: ChildSessionUsage;
 		stats?: {
 			userMessages: number;
 			assistantMessages: number;
@@ -234,7 +245,8 @@ function assertChildFocus(value: unknown): boolean {
 		if (
 			typeof value.model.provider !== "string" ||
 			typeof value.model.id !== "string" ||
-			typeof value.model.name !== "string"
+			typeof value.model.name !== "string" ||
+			(value.model.reasoning !== undefined && typeof value.model.reasoning !== "boolean")
 		)
 			return false;
 	}
@@ -263,7 +275,8 @@ function assertChildFocus(value: unknown): boolean {
 				isRecord(model) &&
 				typeof model.provider === "string" &&
 				typeof model.id === "string" &&
-				typeof model.name === "string",
+				typeof model.name === "string" &&
+				(model.reasoning === undefined || typeof model.reasoning === "boolean"),
 		)
 	)
 		return false;
@@ -279,13 +292,29 @@ function assertChildFocus(value: unknown): boolean {
 		)
 	)
 		return false;
+	if (value.sessionUsage !== undefined) {
+		const usage = value.sessionUsage;
+		if (!isRecord(usage) || usage.scope !== "session") return false;
+		for (const name of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"]) {
+			if (typeof usage[name] !== "number" || !Number.isFinite(usage[name]) || usage[name] < 0) return false;
+		}
+		if (usage.cost !== undefined && (typeof usage.cost !== "number" || !Number.isFinite(usage.cost) || usage.cost < 0))
+			return false;
+	}
+
 	if (value.stats !== undefined) {
 		if (!isRecord(value.stats) || !isRecord(value.stats.tokens)) return false;
 		for (const name of ["userMessages", "assistantMessages", "toolCalls", "toolResults", "totalMessages", "cost"]) {
-			if (typeof value.stats[name] !== "number" || !Number.isFinite(value.stats[name])) return false;
+			if (typeof value.stats[name] !== "number" || !Number.isFinite(value.stats[name]) || value.stats[name] < 0)
+				return false;
 		}
 		for (const name of ["input", "output", "cacheRead", "cacheWrite", "total"]) {
-			if (typeof value.stats.tokens[name] !== "number" || !Number.isFinite(value.stats.tokens[name])) return false;
+			if (
+				typeof value.stats.tokens[name] !== "number" ||
+				!Number.isFinite(value.stats.tokens[name]) ||
+				value.stats.tokens[name] < 0
+			)
+				return false;
 		}
 	}
 	return true;

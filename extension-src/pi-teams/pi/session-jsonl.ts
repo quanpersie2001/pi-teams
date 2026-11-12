@@ -7,7 +7,7 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { TranscriptItem } from "../domain/transcript.js";
+import { boundedToolResult, type TranscriptItem } from "../domain/transcript.js";
 
 interface JsonlMessageEntry {
 	type?: string;
@@ -20,6 +20,7 @@ interface JsonlMessageEntry {
 		toolCallId?: string;
 		toolName?: string;
 		isError?: boolean;
+		details?: unknown;
 	};
 }
 
@@ -146,7 +147,7 @@ export function readTranscriptItems(sessionDir: string, sessionName?: string): T
 				items.push({
 					kind: "toolResult",
 					timestamp,
-					result: msg.content,
+					...boundedToolResult(msg.content, msg.details),
 					isError: msg.isError === true,
 					...(typeof msg.toolCallId === "string" ? { toolCallId: msg.toolCallId } : {}),
 					...(typeof msg.toolName === "string" ? { toolName: msg.toolName } : {}),

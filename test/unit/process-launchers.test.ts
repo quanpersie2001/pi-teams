@@ -16,7 +16,8 @@ interface Harness {
 	launcher: ProcessLauncher;
 	reusePane(command?: string): void;
 	failSplit(): void;
-	failPaneQuery(): void;
+	failPaneQuery(fail?: boolean): void;
+	failCommandQuery(fail?: boolean): void;
 	removePane(blankReply?: boolean): void;
 	command(): string;
 	killed: string[];
@@ -37,6 +38,7 @@ function tmuxHarness(): Harness {
 	let startCommand = "";
 	let splitFails = false;
 	let paneQueryFails = false;
+	let commandQueryFails = false;
 	let paneMissing = false;
 	let blankMissingReply = false;
 	let splitCreated = false;
@@ -71,8 +73,10 @@ function tmuxHarness(): Harness {
 				startCommand = commandArgs.at(-1) ?? "";
 				return { stdout: "%7\n", stderr: "" };
 			}
-			if (commandArgs[0] === "display-message" && commandArgs.includes("#{pane_start_command}"))
+			if (commandArgs[0] === "display-message" && commandArgs.includes("#{pane_start_command}")) {
+				if (commandQueryFails) throw new Error("temporary tmux command probe failure");
 				return { stdout: paneMissing && blankMissingReply ? "\n" : `${startCommand}\n`, stderr: "" };
+			}
 			if (commandArgs[0] === "display-message" && commandArgs.includes("#{pane_id} #{pane_pid} #{pid}")) {
 				if (paneMissing && blankMissingReply) return { stdout: `  ${serverPid}\n`, stderr: "" };
 				if (paneMissing) throw new Error("can't find pane: %7");
@@ -101,8 +105,11 @@ function tmuxHarness(): Harness {
 		failSplit() {
 			splitFails = true;
 		},
-		failPaneQuery() {
-			paneQueryFails = true;
+		failPaneQuery(fail = true) {
+			paneQueryFails = fail;
+		},
+		failCommandQuery(fail = true) {
+			commandQueryFails = fail;
 		},
 		removePane(blankReply = false) {
 			paneMissing = true;
@@ -240,6 +247,33 @@ describe("process launcher lifecycle safety", () => {
 		await expect(harness.launcher.launch(spec)).rejects.toBeInstanceOf(ProcessLaunchCleanupPendingError);
 		expect(harness.killed).toEqual([]);
 	});
+
+	it.each(["pane", "command"])(
+		"recovers a serialized partial tmux receipt after the original %s probe returns",
+		async (probe) => {
+			const harness = tmuxHarness();
+			if (probe === "pane") harness.failPaneQuery();
+			else harness.failCommandQuery();
+			const failure = await harness.launcher.launch(spec).catch((error: unknown) => error);
+			if (!(failure instanceof ProcessLaunchCleanupPendingError) || !failure.handle)
+				throw new Error("missing allocated receipt");
+			const partial = JSON.parse(JSON.stringify(failure.handle));
+			expect(partial.pid).toBe(probe === "pane" ? undefined : 1900000000);
+			harness.failPaneQuery(false);
+			harness.failCommandQuery(false);
+			if (probe === "pane")
+				await expect(harness.launcher.terminate(partial)).rejects.toThrow("Incomplete tmux launcher handle");
+			const recovered = await harness.launcher.recoverForCleanup?.(partial);
+			expect(recovered).toMatchObject({
+				pid: 1900000000,
+				identity: { panePid: "1900000000", serverPid: "1899999999" },
+			});
+			if (!recovered) throw new Error("original pane did not recover");
+			await harness.launcher.terminate(recovered);
+			expect(harness.killed).toEqual(["%7"]);
+			expect(partial.pid).toBe(probe === "pane" ? undefined : 1900000000);
+		},
+	);
 
 	it("preserves argument boundaries and literal shell metacharacters", async () => {
 		const harness = tmuxHarness();

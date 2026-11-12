@@ -31,9 +31,16 @@ import {
 export interface TaskBoardServiceOptions {
 	teamDir: string;
 	self: string;
+	selfMembershipId?: string;
 	now?: () => number;
 }
 export type TaskBoardChange = { type: "created" | "updated" | "removed"; task?: TaskProjection; id: string };
+/** Internal compare-and-set identity for reconciliation writes; not a tool parameter. */
+export interface TaskClaimGuard {
+	owner: string | undefined;
+	ownerMembershipId: string | undefined;
+	ownerReservationId: string | undefined;
+}
 export interface TaskFilters {
 	status?: TaskStatus;
 	assignee?: string;
@@ -45,6 +52,7 @@ const clone = <T>(v: T): T => structuredClone(v);
 export class TaskBoardService {
 	readonly taskDir: string;
 	readonly self: string;
+	private readonly selfMembershipId: string | undefined;
 	private readonly now: () => number;
 	private listeners = new Set<(event: TaskBoardChange) => void>();
 	private fsWatcher: ReturnType<typeof watch> | undefined;
@@ -53,6 +61,7 @@ export class TaskBoardService {
 		if (!isMailboxAddress(options.self)) throw new Error("Invalid task board participant name");
 		this.taskDir = join(options.teamDir, "tasks");
 		this.self = options.self;
+		this.selfMembershipId = options.selfMembershipId;
 		this.now = options.now ?? (() => Date.now());
 		mkdirSync(this.taskDir, { recursive: true, mode: 0o700 });
 		chmodSync(this.taskDir, 0o700);
@@ -98,22 +107,26 @@ export class TaskBoardService {
 			return this.project(validated);
 		});
 	}
-	update(input: {
-		id: string;
-		expectedRequirementRevision?: number;
-		status?: TaskStatus;
-		title?: string;
-		description?: string;
-		dependencies?: string[];
-		spec?: TaskSpec;
-		context?: TaskContext;
-		executionPlan?: TaskExecutionPlan | null;
-		assignee?: string | null;
-		reviewRequested?: boolean;
-		outcome?: TaskOutcome;
-	}): TaskProjection {
+	update(
+		input: {
+			id: string;
+			expectedRequirementRevision?: number;
+			status?: TaskStatus;
+			title?: string;
+			description?: string;
+			dependencies?: string[];
+			spec?: TaskSpec;
+			context?: TaskContext;
+			executionPlan?: TaskExecutionPlan | null;
+			assignee?: string | null;
+			reviewRequested?: boolean;
+			outcome?: TaskOutcome;
+		},
+		expectedClaim?: TaskClaimGuard,
+	): TaskProjection {
 		return this.withBoardLock(() => {
 			const task = this.require(input.id);
+			if (expectedClaim) this.assertClaim(task, expectedClaim);
 			if (
 				input.expectedRequirementRevision !== undefined &&
 				task.requirementRevision !== input.expectedRequirementRevision
@@ -121,6 +134,12 @@ export class TaskBoardService {
 				throw new Error(
 					`Task revision is stale (expected ${input.expectedRequirementRevision}, current ${task.requirementRevision})`,
 				);
+			if (
+				task.owner === this.self &&
+				this.self !== "lead" &&
+				(this.selfMembershipId === undefined || task.ownerMembershipId !== this.selfMembershipId)
+			)
+				throw new Error("Task owner membership does not match the caller");
 			if (["completed", "cancelled"].includes(task.status))
 				throw new Error(`${this.label(task)} is ${task.status} - terminal`);
 			const requirementsChanged =
@@ -195,6 +214,8 @@ export class TaskBoardService {
 				if (blockers.length) throw new Error(`${this.label(task)} is blocked by: ${blockers.join(", ")}`);
 				task.status = status;
 				task.owner = this.self;
+				delete task.ownerReservationId;
+				if (this.selfMembershipId !== undefined) task.ownerMembershipId = this.selfMembershipId;
 				return;
 			}
 			if (task.status !== "in_progress") throw new Error(`Cannot claim task while it is ${task.status}`);
@@ -210,6 +231,7 @@ export class TaskBoardService {
 			task.status = status;
 			delete task.owner;
 			delete task.ownerMembershipId;
+			delete task.ownerReservationId;
 			return;
 		}
 		if (status === "in_review") {
@@ -237,6 +259,7 @@ export class TaskBoardService {
 			task.status = status;
 			delete task.owner;
 			delete task.ownerMembershipId;
+			delete task.ownerReservationId;
 			return;
 		}
 		if (status === "cancelled") throw new Error("Task cancellation requires tasks_cancel");
@@ -323,11 +346,35 @@ export class TaskBoardService {
 			}
 		};
 	}
-	bindOwnerMembership(id: string, membershipId: string | undefined): TaskProjection {
+	private assertClaim(task: BoardTask, expected: TaskClaimGuard): void {
+		if (
+			task.owner !== expected.owner ||
+			task.ownerMembershipId !== expected.ownerMembershipId ||
+			task.ownerReservationId !== expected.ownerReservationId
+		)
+			throw new Error("Task claim changed since reconciliation");
+	}
+	bindOwnerMembership(id: string, membershipId: string | undefined, expectedClaim?: TaskClaimGuard): TaskProjection {
 		return this.withBoardLock(() => {
 			const task = this.require(id);
+			if (expectedClaim) {
+				this.assertClaim(task, expectedClaim);
+				if (
+					membershipId === undefined ||
+					task.ownerReservationId === undefined ||
+					!task.attempts.some(
+						(attempt) =>
+							attempt.reservationId === task.ownerReservationId &&
+							attempt.teammateName === task.owner &&
+							attempt.membershipId === membershipId,
+					)
+				)
+					throw new Error("Task claim membership proof no longer matches the binding");
+			}
 			if (task.status !== "in_progress" && task.status !== "in_review")
 				throw new Error("Task owner membership requires an active claim");
+			if (task.ownerMembershipId !== undefined && task.ownerMembershipId !== membershipId)
+				throw new Error("Task owner membership does not match the binding");
 			if (membershipId !== undefined) task.ownerMembershipId = membershipId;
 			task.updatedAt = this.now();
 			this.write(task);
@@ -350,10 +397,16 @@ export class TaskBoardService {
 		coordinator: boolean,
 		expectedRequirementRevision?: number,
 		expectedStatus?: TaskStatus,
+		ownerMembershipId?: string,
 	): {
 		attempt: TaskAttempt;
 		task: TaskProjection;
-		previous: { status: "pending" | "in_progress"; owner?: string; ownerMembershipId?: string };
+		previous: {
+			status: "pending" | "in_progress";
+			owner?: string;
+			ownerMembershipId?: string;
+			ownerReservationId?: string;
+		};
 	} {
 		return this.withBoardLock(() => {
 			const task = this.require(id);
@@ -363,10 +416,24 @@ export class TaskBoardService {
 				throw new Error(
 					`Task revision is stale (expected ${expectedRequirementRevision}, current ${task.requirementRevision})`,
 				);
+			if (task.attempts.some((attempt) => attempt.status === "running"))
+				throw new Error("Task already has an active attempt");
+			if (task.owner === owner && task.status === "in_progress") {
+				const associatedAttempt = task.attempts.find((attempt) => attempt.reservationId === task.ownerReservationId);
+				const verifiedOwner =
+					ownerMembershipId !== undefined &&
+					(task.ownerMembershipId === ownerMembershipId ||
+						(task.ownerMembershipId === undefined &&
+							task.ownerReservationId !== undefined &&
+							associatedAttempt?.teammateName === owner &&
+							associatedAttempt.membershipId === ownerMembershipId));
+				if (!verifiedOwner) throw new Error("Task owner membership does not match the executor");
+			}
 			const previous = {
 				status: task.status === "pending" ? ("pending" as const) : ("in_progress" as const),
 				...(task.owner !== undefined ? { owner: task.owner } : {}),
 				...(task.ownerMembershipId !== undefined ? { ownerMembershipId: task.ownerMembershipId } : {}),
+				...(task.ownerReservationId !== undefined ? { ownerReservationId: task.ownerReservationId } : {}),
 			};
 			if (task.status === "pending") {
 				const blockers = this.blockedBy(task);
@@ -379,7 +446,10 @@ export class TaskBoardService {
 				if (!coordinator || task.owner !== this.self)
 					throw new Error(`Task is claimed by @${task.owner}; only that owner may execute it`);
 				task.owner = owner;
+				delete task.ownerMembershipId;
 			}
+			// Publish a verifiable claim with the reservation, before observers or shutdown can inspect it.
+			if (ownerMembershipId !== undefined) task.ownerMembershipId = ownerMembershipId;
 			const attempt = this.reserveAttemptCore(task, reservationId);
 			return { attempt, task: this.project(task), previous };
 		});
@@ -403,6 +473,7 @@ export class TaskBoardService {
 			},
 		};
 		t.attempts.push(a);
+		t.ownerReservationId = runId;
 		t.updatedAt = this.now();
 		this.write(t);
 		this.emit({ type: "updated", id: t.id, task: this.project(t) });
@@ -412,7 +483,12 @@ export class TaskBoardService {
 		id: string,
 		reservationId: string,
 		error: string,
-		previous: { status: "pending" | "in_progress"; owner?: string; ownerMembershipId?: string },
+		previous: {
+			status: "pending" | "in_progress";
+			owner?: string;
+			ownerMembershipId?: string;
+			ownerReservationId?: string;
+		},
 	): TaskProjection {
 		return this.withBoardLock(() => {
 			const task = this.require(id);
@@ -424,6 +500,8 @@ export class TaskBoardService {
 			else delete task.owner;
 			if (previous.ownerMembershipId !== undefined) task.ownerMembershipId = previous.ownerMembershipId;
 			else delete task.ownerMembershipId;
+			if (previous.ownerReservationId !== undefined) task.ownerReservationId = previous.ownerReservationId;
+			else delete task.ownerReservationId;
 			task.updatedAt = this.now();
 			this.write(task);
 			this.emit({ type: "updated", id: task.id, task: this.project(task) });
@@ -434,7 +512,20 @@ export class TaskBoardService {
 		return this.withBoardLock(() => {
 			const t = this.require(id);
 			const a = t.attempts.find((x) => x.reservationId === reservationId);
-			if (a?.status !== "running") throw new Error("Task execution reservation is no longer active");
+			if (!a || (a.status !== "running" && a.runId !== runId))
+				throw new Error("Task execution reservation is no longer active");
+			if (a.membershipId !== undefined && a.membershipId !== membershipId)
+				throw new Error("Task attempt membership does not match the binding");
+			if (membershipId !== undefined) {
+				const sameClaim =
+					(t.status === "in_progress" || t.status === "in_review") &&
+					t.owner === a.teammateName &&
+					t.ownerReservationId === reservationId;
+				const compatibleMembership = t.ownerMembershipId === undefined || t.ownerMembershipId === membershipId;
+				if (a.status === "running" && (!sameClaim || !compatibleMembership))
+					throw new Error("Task owner membership does not match the binding");
+				if (sameClaim && compatibleMembership) t.ownerMembershipId = membershipId;
+			}
 			a.runId = runId;
 			if (membershipId !== undefined) a.membershipId = membershipId;
 			t.updatedAt = this.now();

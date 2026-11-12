@@ -111,8 +111,20 @@ function renderRunRow(
  * then removes the widget entirely.
  */
 export function renderAgentPanel(data: AgentPanelData, fg: ThemeFg, width: number, now: number): string[] {
+	return renderAgentPanelWithTargets(data, fg, width, now).lines;
+}
+
+/** Shared inline layout and mouse hit targets, optionally reduced for short overlays. */
+export function renderAgentPanelWithTargets(
+	data: AgentPanelData,
+	fg: ThemeFg,
+	width: number,
+	now: number,
+	maxAgentRows = MAX_AGENT_ROWS,
+): { lines: string[]; targets: ReadonlyMap<number, string> } {
+	const targets = new Map<number, string>();
 	const agents = data.view.rows;
-	if (agents.length === 0 || width < 8) return [];
+	if (agents.length === 0 || width < 8 || maxAgentRows < 1) return { lines: [], targets };
 	const index = selectionIndex(data.selection, agents) ?? 0;
 
 	const lines: string[] = [];
@@ -120,11 +132,12 @@ export function renderAgentPanel(data: AgentPanelData, fg: ThemeFg, width: numbe
 	const mainSelected = data.selection === null || index === 0;
 	const mainBullet = mainSelected ? fg("accent", "⏺") : fg("dim", "◯");
 	const mainLabel = mainSelected ? fg("text", "main") : fg("dim", "main");
+	targets.set(0, "main");
 	lines.push(truncateToWidth(`  ${mainBullet} ${mainLabel}`, width));
 
 	// Window the agent rows so the selected one stays visible.
 	const selAgent = Math.max(0, index - 1);
-	const visibleCount = Math.min(MAX_AGENT_ROWS, agents.length);
+	const visibleCount = Math.min(Math.floor(maxAgentRows), agents.length);
 	const start = selAgent < visibleCount ? 0 : selAgent - visibleCount + 1;
 	const hiddenAbove = start;
 	const hiddenBelow = agents.length - (start + visibleCount);
@@ -133,11 +146,12 @@ export function renderAgentPanel(data: AgentPanelData, fg: ThemeFg, width: numbe
 	for (let i = start; i < start + visibleCount; i++) {
 		const row = agents[i];
 		if (!row) continue;
+		targets.set(lines.length, row.id);
 		lines.push(renderRunRow(row, i + 1 === index, data.stopArmedFor === row.id, fg, width, now));
 	}
 	if (hiddenBelow > 0) lines.push(truncateToWidth(rightAlign("", fg("dim", `↓ ${hiddenBelow} more`), width), width));
 
-	return lines;
+	return { lines, targets };
 }
 
 /**
@@ -155,10 +169,23 @@ export function createAgentListComponent(
 	theme: Theme,
 	getData: () => AgentPanelData | null,
 	getNow: () => number = () => Date.now(),
+	onSelect?: (id: string) => void,
 ): Component {
 	const fg = bindThemeFg(theme);
+	let renderedWidth = 0;
 	return {
+		handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+			if (!onSelect || event.type !== "click" || event.button !== "left") return undefined;
+			if (event.x < 0 || event.x >= renderedWidth) return undefined;
+			const data = getData();
+			if (!data) return undefined;
+			const target = renderAgentPanelWithTargets(data, fg, renderedWidth, getNow()).targets.get(event.y);
+			if (!target) return undefined;
+			onSelect(target);
+			return { handled: true, render: true };
+		},
 		render(width: number): string[] {
+			renderedWidth = width;
 			const data = getData();
 			if (!data) return [];
 			try {

@@ -105,11 +105,40 @@ export interface AgentTranscriptView {
 	generatedAt: number;
 }
 
+/** Native cumulative usage for the child's entire session, not one assignment. */
+export interface AgentSessionUsage {
+	scope: "session";
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	/** Native reported cost only; absent when unavailable, never inferred. */
+	cost?: number;
+}
+
+/** Optional viewer-side Git enrichment, read outside render for the child's cwd. */
+export interface AgentGitSnapshot {
+	available: boolean;
+	branch: string | null;
+	staged: number;
+	unstaged: number;
+	untracked: number;
+	ahead?: number;
+	behind?: number;
+	refreshing: boolean;
+	error?: string;
+}
+
 /** Native child state shown by the focused transcript; absent data is explicit. */
 export interface AgentFocusSnapshot {
 	runId: string;
 	currentRunId: string | null;
 	model: string | null;
+	provider?: string;
+	modelName?: string;
+	reasoning?: boolean;
+	sessionUsage?: AgentSessionUsage;
+	git?: AgentGitSnapshot;
 	thinking: string | null;
 	cwd: string | null;
 	context: { usedTokens: number | null; windowTokens: number | null } | null;

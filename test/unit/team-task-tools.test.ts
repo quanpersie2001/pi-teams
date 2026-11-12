@@ -26,7 +26,12 @@ afterEach(() => {
 });
 function board(team = "team", self = "lead") {
 	root ??= mkdtempSync(join(tmpdir(), "unified-tasks-"));
-	return new TaskBoardService({ teamDir: join(root, team), self, now: () => 42 });
+	return new TaskBoardService({
+		teamDir: join(root, team),
+		self,
+		...(self !== "lead" ? { selfMembershipId: `membership-${self}` } : {}),
+		now: () => 42,
+	});
 }
 const resultObject = (result: { content: { text?: string }[] }) => JSON.parse(result.content[0]?.text ?? "null");
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

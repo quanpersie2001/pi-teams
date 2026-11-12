@@ -32,6 +32,7 @@ import {
 } from "./child-bridge.js";
 import { type ChildMailboxHandle, createChildMailboxTool, watchChildMailbox } from "./child-mailbox.js";
 import { deriveViewerToken } from "./child-rpc-auth.js";
+import { childSessionMetadata } from "./child-session-stats.js";
 import { createTeamTaskTools } from "./team-task-tools.js";
 import { supportsTeammateStyleColor, syncTeammateStyleColor } from "./teammate-style-color.js";
 
@@ -242,7 +243,11 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 			: undefined;
 	const taskBoard =
 		bootstrap.teamDir && bootstrap.teammateName
-			? new TaskBoardService({ teamDir: bootstrap.teamDir, self: bootstrap.teammateName })
+			? new TaskBoardService({
+					teamDir: bootstrap.teamDir,
+					self: bootstrap.teammateName,
+					...(bootstrap.membershipId !== undefined ? { selfMembershipId: bootstrap.membershipId } : {}),
+				})
 			: undefined;
 	const customTools =
 		mailboxService && taskBoard
@@ -398,7 +403,7 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 			}),
 		getFocus: () => {
 			const context = session.getContextUsage();
-			const stats = session.getSessionStats();
+			const metadata = childSessionMetadata(session.sessionManager.getEntries());
 			const selected = session.model;
 			const models = modelRuntime.getAvailableSnapshot().map((entry) => ({
 				provider: entry.provider,
@@ -407,7 +412,16 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 			}));
 			return {
 				cwd: bootstrap.cwd,
-				...(selected ? { model: { provider: selected.provider, id: selected.id, name: selected.name } } : {}),
+				...(selected
+					? {
+							model: {
+								provider: selected.provider,
+								id: selected.id,
+								name: selected.name,
+								reasoning: selected.reasoning,
+							},
+						}
+					: {}),
 				thinking: session.thinkingLevel,
 				...(context && context.tokens !== null
 					? {
@@ -418,15 +432,7 @@ async function createRuntime(bootstrap: ChildBootstrap, options: HeadlessChildOp
 							},
 						}
 					: {}),
-				stats: {
-					userMessages: stats.userMessages,
-					assistantMessages: stats.assistantMessages,
-					toolCalls: stats.toolCalls,
-					toolResults: stats.toolResults,
-					totalMessages: stats.totalMessages,
-					tokens: { ...stats.tokens },
-					cost: stats.cost,
-				},
+				...metadata,
 				capabilities: {
 					models,
 					thinking: session.getAvailableThinkingLevels(),

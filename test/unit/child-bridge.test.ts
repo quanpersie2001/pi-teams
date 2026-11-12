@@ -283,7 +283,10 @@ describe("child bridge over an owner-only Unix socket", () => {
 		let hasConfiguredAuth = false;
 		let providerAuth: object | undefined;
 		let dispatched = 0;
-		const model = { provider: "anthropic", id: "claude-test", name: "claude-test" };
+		const model = { provider: "anthropic", id: "claude-test", name: "Native selected", reasoning: true };
+		const entries = [
+			{ type: "usage", usage: { input: 7, output: 3, cacheRead: 2, cacheWrite: 1, cost: { total: 0.125 } } },
+		];
 		const context = {
 			model,
 			cwd: tempDir,
@@ -298,6 +301,7 @@ describe("child bridge over an owner-only Unix socket", () => {
 			sessionManager: {
 				getSessionFile: () => bootstrap.sessionFile,
 				buildContextEntries: () => [],
+				getEntries: () => entries,
 			},
 			abort: () => {},
 			shutdown: () => {},
@@ -327,6 +331,10 @@ describe("child bridge over an owner-only Unix socket", () => {
 		await expect(client.prompt("missing-auth", "start work")).rejects.toMatchObject({ code: "prompt_failed" });
 		const failed = await client.state();
 		expect(failed.execution).toBe("idle");
+		expect(failed.focus).toMatchObject({
+			model: { provider: "anthropic", id: "claude-test", name: "Native selected", reasoning: true },
+			stats: { tokens: { input: 7, output: 3, cacheRead: 2, cacheWrite: 1, total: 13 }, cost: 0.125 },
+		});
 		expect(failed.lastOutcome).toMatchObject({
 			runId: "missing-auth",
 			status: "failed",
@@ -343,8 +351,24 @@ describe("child bridge over an owner-only Unix socket", () => {
 		await expect(client.prompt("configured-auth", "start work")).resolves.toBeUndefined();
 		expect(dispatched).toBe(2);
 		expect((await client.state()).execution).toBe("running");
+		entries.push({
+			type: "compaction",
+			usage: { input: 7, output: 3, cacheRead: 2, cacheWrite: 1, cost: { total: 0.25 } },
+		});
+		expect((await client.state()).focus?.stats?.cost).toBe(0.375);
+		context.model = { ...model, id: "new-model", name: "New native model", reasoning: false };
+		expect((await client.state()).focus?.model).toMatchObject({ id: "new-model", reasoning: false });
 		await handlers.get("agent_settled")?.({ type: "agent_settled" }, context);
 		expect((await client.state()).execution).toBe("idle");
+		expect((await client.state()).focus?.stats?.cost).toBe(0.375);
+		entries.push({
+			type: "usage",
+			usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: Number.NaN } },
+		});
+		const unbilled = await client.state();
+		expect(unbilled.focus).not.toHaveProperty("stats");
+		expect(unbilled.focus?.sessionUsage).not.toHaveProperty("cost");
+		expect(unbilled.focus?.sessionUsage?.inputTokens).toBe(15);
 	});
 
 	it("fails at the readiness deadline when no child opens its socket", async () => {

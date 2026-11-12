@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../../extension-src/pi-teams/app/agent-manager.js";
 import { AgentRegistry } from "../../extension-src/pi-teams/app/agent-registry.js";
+import { createAgentFocusPort } from "../../extension-src/pi-teams/app/focus-service.js";
 import type { SerializableBackendHandle, SubagentRunStore } from "../../extension-src/pi-teams/app/run-registry.js";
 import { TaskBoardService } from "../../extension-src/pi-teams/app/task-board-service.js";
 import { TeamService } from "../../extension-src/pi-teams/app/team-service.js";
@@ -19,7 +20,11 @@ import type {
 	BackendStatus,
 } from "../../extension-src/pi-teams/domain/backend.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
-import type { LauncherHandle, ProcessLauncher } from "../../extension-src/pi-teams/domain/process-launcher.js";
+import {
+	type LauncherHandle,
+	ProcessLaunchCleanupPendingError,
+	type ProcessLauncher,
+} from "../../extension-src/pi-teams/domain/process-launcher.js";
 import { deriveViewerToken } from "../../extension-src/pi-teams/pi/child-rpc-auth.js";
 import { ChildRpcClient } from "../../extension-src/pi-teams/pi/child-rpc-client.js";
 import { ProcessAgentExecutionBackend } from "../../extension-src/pi-teams/pi/process-backend.js";
@@ -986,6 +991,116 @@ describe("real process runtime", () => {
 		}
 	}, 60_000);
 
+	it("recovers an allocated native child after launcher cleanup was unverified without dropping its receipt", async () => {
+		const provider = await localProvider();
+		const { launcher, exited } = observedHeadlessLauncher();
+		let allocated: LauncherHandle | undefined;
+		let cleanupAllowed = false;
+		const refusing: ProcessLauncher = {
+			...launcher,
+			async launch(spec) {
+				allocated = await launcher.launch(spec);
+				throw new ProcessLaunchCleanupPendingError("allocated child exit unverified", undefined, allocated);
+			},
+			async terminate(handle) {
+				if (!cleanupAllowed) throw new Error("cleanup verification unavailable");
+				await launcher.terminate(handle);
+			},
+			async cleanupExited(handle) {
+				return cleanupAllowed && launcher.cleanupExited(handle);
+			},
+		};
+		const backend = new ProcessAgentExecutionBackend({ launchers: [refusing], connectTimeoutMs: 15_000 });
+		const recovery = new ProcessAgentExecutionBackend({ launchers: [refusing], connectTimeoutMs: 15_000 });
+		try {
+			const failure = await backend
+				.launch(launchInput("uncertain-native-launch", provider.cwd))
+				.catch((error: unknown) => error);
+			if (!(failure instanceof Error) || !("handle" in failure)) throw new Error("missing failed-launch ownership");
+			const handle = failure.handle as AgentBackendHandle;
+			const receipt = backend.serializeHandle(handle);
+			if (!receipt) throw new Error("missing durable launch receipt");
+			expect(receipt.launcher).toEqual(allocated);
+			await expect(recovery.disposePersisted(receipt)).resolves.toBe(false);
+			expect(backend.serializeHandle(handle)).toEqual(receipt);
+			cleanupAllowed = true;
+			await expect(recovery.disposePersisted(receipt)).resolves.toBe(true);
+			await exited;
+			await backend.dispose(handle);
+			expect(backend.serializeHandle(handle)).toBeUndefined();
+		} finally {
+			if (allocated) await launcher.terminate(allocated);
+		}
+	}, 60_000);
+	it.each([
+		{ method: "dispose", named: true },
+		{ method: "shutdownSession", named: true },
+		{ method: "dispose", named: false },
+		{ method: "shutdownSession", named: false },
+	] as const)(
+		"retries pending launch cleanup through manager.$method (named: $named) without fabricating a native outcome",
+		async ({ method, named }) => {
+			const provider = await localProvider();
+			const { launcher, exited } = observedHeadlessLauncher();
+			let allocated: LauncherHandle | undefined;
+			let cleanupAllowed = false;
+			const refusing: ProcessLauncher = {
+				...launcher,
+				async launch(spec) {
+					allocated = await launcher.launch(spec);
+					throw new ProcessLaunchCleanupPendingError("allocated exit unverified", undefined, allocated);
+				},
+				async terminate(handle) {
+					if (!cleanupAllowed) throw new Error("exit unverified");
+					await launcher.terminate(handle);
+				},
+				cleanupExited: async (handle) => cleanupAllowed && launcher.cleanupExited(handle),
+			};
+			const backend = new ProcessAgentExecutionBackend({ launchers: [refusing], connectTimeoutMs: 2_000 });
+			const settings = sanitizeSettings({ backgroundByDefault: true, worktreeIsolation: false });
+			const registry = new AgentRegistry({ sources: [], loader: async () => [], settings });
+			await registry.load();
+			const store = createSubagentRunStore(provider.cwd);
+			const manager = new AgentManager({
+				registry,
+				settings,
+				backends: [backend],
+				cwd: provider.cwd,
+				configCwd: provider.cwd,
+				registryStore: store,
+				teardownGraceMs: 0,
+			});
+			try {
+				const run = await manager.spawn({
+					type: "general-purpose",
+					...(named ? { name: "pending" } : {}),
+					model: "local-test/local-model",
+					prompt: "uncertain launch",
+					run_in_background: true,
+				});
+				await vi.waitFor(() => expect(manager.get(run.id)?.recoveryError).toContain("unverified"), { timeout: 20_000 });
+				await expect(manager[method]()).rejects.toThrow(/shutdown incomplete/i);
+				expect(manager.get(run.id)?.status).toBe("starting");
+				if (named) expect(manager.teammateStatus("pending")?.availability).toBe("unavailable");
+				expect(store.readRegistry()[0]?.handle).toBeDefined();
+				expect(store.readHistory()).toEqual([]);
+				cleanupAllowed = true;
+				await manager[method]();
+				await exited;
+				expect(store.readRegistry()).toEqual([]);
+				expect(store.readHistory()[0]).toMatchObject({
+					id: run.id,
+					status: "error",
+					error: expect.stringContaining("without a recovered execution outcome"),
+				});
+			} finally {
+				if (allocated) await launcher.terminate(allocated);
+				cleanupAllowed = true;
+				await manager.dispose();
+			}
+		},
+		60_000,
+	);
 	it("refuses stale disposal when the authenticated child PID disagrees with the launcher identity", async () => {
 		const provider = await localProvider({ holdFirst: true });
 		const { launcher, exited } = observedHeadlessLauncher();
@@ -1113,6 +1228,14 @@ describe("real process runtime", () => {
 				firstTranscript.items.some((item) => item.kind === "assistant" && item.text?.includes("process-child-ok")),
 			).toBe(true);
 			if (!firstStatus.sessionFile) throw new Error("Native completion omitted its session JSONL path");
+			const firstFocus = await backend.readFocusState(first);
+			expect(firstFocus?.focus?.model).toMatchObject({
+				provider: "local-test",
+				id: "local-model",
+				name: "Local deterministic model",
+				reasoning: false,
+			});
+			expect(firstFocus?.focus?.stats?.tokens).toMatchObject({ input: 5, output: 1 });
 
 			await backend.dispose(first);
 			activeHandle = undefined;
@@ -1132,6 +1255,7 @@ describe("real process runtime", () => {
 			expect(resumedSerialized.childId).not.toBe(firstSerialized.childId);
 			const resumedStatus = await waitForTerminal(backend, resumed);
 			expect(resumedStatus.state).toBe("completed");
+			expect((await backend.readFocusState(resumed))?.focus?.stats?.tokens).toMatchObject({ input: 10, output: 2 });
 			const continuation = JSON.parse(provider.requests[1] ?? "{}");
 			expect(
 				continuation.messages.some(
@@ -1405,6 +1529,7 @@ describe("real process runtime", () => {
 			configCwd: provider.cwd,
 		});
 		manager.setTeamService(team);
+		const focus = createAgentFocusPort({ manager, transcripts: { getTranscript: async () => [] } });
 		const prompts = [
 			"First assignment: retain context marker IRIS-21.",
 			"Continue the IRIS-21 work.",
@@ -1421,6 +1546,15 @@ describe("real process runtime", () => {
 			expect(firstPid).toBeGreaterThan(0);
 			expect(firstPid).not.toBe(process.pid);
 			expect(manager.teammateStatus("native-worker")).toMatchObject({ state: "idle", availability: "available" });
+			expect(await focus.read(first.id)).toMatchObject({
+				closed: false,
+				currentRunId: first.id,
+				modelName: "Local deterministic model",
+				provider: "local-test",
+				reasoning: false,
+				sessionUsage: { scope: "session", inputTokens: 5, outputTokens: 1, cost: 0 },
+				capabilities: [],
+			});
 
 			const continued = await manager.spawn({
 				type: "worker",
@@ -1433,6 +1567,13 @@ describe("real process runtime", () => {
 			expect(firstChild.handle.pid).toBe(firstPid);
 			process.kill(firstPid, 0);
 			expect(manager.get(continued.id)?.sessionFile).toBe(firstSession);
+			expect((await focus.read(continued.id)).sessionUsage).toMatchObject({
+				scope: "session",
+				inputTokens: 10,
+				outputTokens: 2,
+			});
+			expect((await focus.read(first.id)).closed).toBe(true);
+			expect((await focus.read(first.id)).sessionUsage?.inputTokens).toBe(5);
 			const continuation = JSON.parse(provider.requests[1] ?? "{}") as {
 				messages?: Array<{ role: string; content: unknown }>;
 			};
@@ -1458,6 +1599,12 @@ describe("real process runtime", () => {
 			expect(freshPid).not.toBe(firstPid);
 			expect(freshChild.handle.childId).not.toBe(firstChild.handle.childId);
 			expect(freshSession).not.toBe(firstSession);
+			expect((await focus.read(fresh.id)).sessionUsage).toMatchObject({
+				scope: "session",
+				inputTokens: 5,
+				outputTokens: 1,
+			});
+			expect((await focus.read(continued.id)).closed).toBe(true);
 			await firstChild.exited;
 			const freshRequest = JSON.parse(provider.requests[2] ?? "{}") as {
 				messages?: Array<{ role: string; content: unknown }>;
@@ -1937,7 +2084,7 @@ describe("native time budgets", () => {
 
 	it("hard-kills a SIGSTOP-frozen child at the idle deadline and settles with the budget outcome", async () => {
 		const harness = await budgetHarness({
-			behaviors: [{ kind: "hold" }],
+			behaviors: [{ kind: "hold" }, { kind: "complete", content: "fresh-child-ok" }],
 			definitions: [{ frontmatter: { name: "budgeted-frozen" } }],
 			settings: { defaultIdleTimeout: 8 },
 		});
@@ -1946,6 +2093,7 @@ describe("native time budgets", () => {
 		try {
 			const run = await manager.spawn({
 				type: "budgeted-frozen",
+				name: "frozen-worker",
 				prompt: "Get frozen mid-run.",
 				run_in_background: true,
 			});
@@ -1988,6 +2136,11 @@ describe("native time budgets", () => {
 				budgetSeconds: 8,
 			});
 			expect(store.readHistory()[0]?.sessionFile).toBeTruthy();
+			expect(manager.teammateStatus("frozen-worker")?.state).toBe("released");
+			const next = await manager.spawn({ type: "budgeted-frozen", name: "frozen-worker", prompt: "fresh assignment" });
+			expect((await manager.whenSettled(next.id)).result).toBe("fresh-child-ok");
+			expect(launch.launched).toHaveLength(2);
+			expect(launch.launched[1]?.handle.childId).not.toBe(child.handle.childId);
 		} finally {
 			// Safety net only: on success enforcement already killed the group.
 			if (frozenPid !== undefined) {

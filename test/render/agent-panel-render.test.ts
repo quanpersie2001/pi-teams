@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentListRow, AgentListView } from "../../extension-src/pi-teams/domain/ui-view.js";
 import {
 	createAgentHubComponent,
+	createAgentListComponent,
 	HUB_ROSTER_RATIO,
 	HUB_SPLIT_MIN_WIDTH,
 	hubRosterCapacity,
@@ -553,5 +554,28 @@ describe("agent panel rendering", () => {
 		expect(agentRows.length).toBeLessThanOrEqual(6); // MAX_AGENT_ROWS
 		expect(lines.join("\n")).toContain("more");
 		assertWidthSafe(lines, 80);
+	});
+});
+
+describe("inline roster mouse navigation", () => {
+	it("maps windowed clickable rows and ignores hints/narrow renders", () => {
+		const rows = Array.from({ length: 9 }, (_, i) => row({ id: `mouse-${i}`, teammateName: `mouse-${i}` }));
+		const selected: string[] = [];
+		const component = createAgentListComponent(
+			{} as never,
+			renderTheme(),
+			() => ({ view: view(rows), selection: rows[8].id, stopArmedFor: null }),
+			() => NOW,
+			(id) => selected.push(id),
+		);
+		const lines = component.render(100);
+		const click = (y: number) => component.handleMouse?.({ type: "click", button: "left", x: 4, y });
+		click(0);
+		click(1); // more hint, not a teammate
+		click(lines.findIndex((line) => line.includes("@mouse-8")));
+		expect(selected).toEqual(["main", "mouse-8"]);
+		component.render(4);
+		click(0);
+		expect(selected).toEqual(["main", "mouse-8"]);
 	});
 });

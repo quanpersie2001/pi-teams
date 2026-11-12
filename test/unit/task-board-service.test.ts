@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { TaskBoardService } from "../../extension-src/pi-teams/app/task-board-service.js";
+import { parseBoardTask } from "../../extension-src/pi-teams/domain/task-board.js";
 import { createTeamTaskTools } from "../../extension-src/pi-teams/pi/team-task-tools.js";
 
 let root: string | undefined;
@@ -14,7 +15,12 @@ afterEach(() => {
 });
 function board(team: string, self: string) {
 	if (!root) throw new Error("Board fixture root is not initialized");
-	return new TaskBoardService({ teamDir: join(root, team), self, now: () => 42 });
+	return new TaskBoardService({
+		teamDir: join(root, team),
+		self,
+		...(self !== "lead" ? { selfMembershipId: `membership-${self}` } : {}),
+		now: () => 42,
+	});
 }
 
 describe("TaskBoardService", () => {
@@ -203,5 +209,43 @@ describe("TaskBoardService", () => {
 		await expect(
 			update.execute("call", { id: task.id, status: "completed" }, undefined, undefined, undefined as never),
 		).rejects.toThrow();
+	});
+	it("persists and validates optional reservation-to-claim association without requiring it in legacy files", () => {
+		root = mkdtempSync(join(tmpdir(), "task-board-claim-association-"));
+		const lead = board("association", "lead");
+		const task = lead.create({ title: "Associated" });
+		lead.reserveExecution(task.id, "reservation-1", "worker", true);
+		const persisted = JSON.parse(readFileSync(join(lead.taskDir, `${task.id}.json`), "utf8"));
+		expect(lead.get(task.id)?.ownerReservationId).toBe("reservation-1");
+		expect(parseBoardTask(persisted)?.ownerReservationId).toBe("reservation-1");
+		for (const ownerReservationId of ["", 1, "missing-reservation"])
+			expect(parseBoardTask({ ...persisted, ownerReservationId })).toBeUndefined();
+		expect(parseBoardTask({ ...persisted, owner: "different-owner" })).toBeUndefined();
+		delete persisted.ownerReservationId;
+		expect(parseBoardTask(persisted)?.ownerReservationId).toBeUndefined();
+		expect(parseBoardTask(persisted)?.id).toBe(task.id);
+	});
+	it("restores prior claim association on reservation rollback and clears it on release and completion", () => {
+		root = mkdtempSync(join(tmpdir(), "task-board-claim-rollback-"));
+		const lead = board("association", "lead");
+		const task = lead.create({ title: "Associated" });
+		lead.reserveExecution(task.id, "reservation-1", "lead", true, undefined, undefined, "lead-member");
+		lead.settleAttempt(task.id, "reservation-1", { status: "completed", settledAt: 42 });
+		const next = lead.reserveExecution(task.id, "reservation-2", "worker", true, undefined, undefined, "worker-member");
+		expect(lead.get(task.id)?.ownerReservationId).toBe("reservation-2");
+		lead.rollbackReservation(task.id, "reservation-2", "spawn rejected", next.previous);
+		expect(lead.get(task.id)).toMatchObject({
+			owner: "lead",
+			ownerMembershipId: "lead-member",
+			ownerReservationId: "reservation-1",
+		});
+		lead.update({ id: task.id, status: "pending" });
+		expect(lead.get(task.id)?.ownerReservationId).toBeUndefined();
+		lead.update({ id: task.id, status: "in_progress" });
+		expect(lead.get(task.id)?.ownerReservationId).toBeUndefined();
+		lead.reserveAttempt(task.id, "reservation-3");
+		lead.settleAttempt(task.id, "reservation-3", { status: "completed", settledAt: 42 });
+		lead.update({ id: task.id, status: "completed" });
+		expect(lead.get(task.id)?.ownerReservationId).toBeUndefined();
 	});
 });

@@ -3,7 +3,7 @@
 // defaults and result-consumption semantics. All runs use the deterministic
 // process FakeBackend — no external model calls.
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,6 +18,8 @@ import type {
 import { TaskBoardService } from "../../extension-src/pi-teams/app/task-board-service.js";
 import { TaskExecutionService } from "../../extension-src/pi-teams/app/task-execution-service.js";
 import { TeamService, type TeamStore } from "../../extension-src/pi-teams/app/team-service.js";
+import { WorktreeService } from "../../extension-src/pi-teams/app/worktree-service.js";
+import { AgentLaunchCleanupPendingError } from "../../extension-src/pi-teams/domain/backend.js";
 import type { SubagentsSettings } from "../../extension-src/pi-teams/domain/config.js";
 import { sanitizeSettings } from "../../extension-src/pi-teams/domain/config.js";
 import type { AgentLifecycleEvent } from "../../extension-src/pi-teams/domain/integration-protocol.js";
@@ -63,6 +65,7 @@ function makeManager(
 		now?: () => number;
 		store?: MemoryRunStore;
 		teardownGraceMs?: number;
+		worktreeService?: WorktreeService;
 	} = {},
 ): ManagerFixture {
 	const store = options.store ?? new MemoryRunStore();
@@ -87,6 +90,7 @@ function makeManager(
 		},
 		...(options.now !== undefined ? { now: options.now } : {}),
 		...(options.teardownGraceMs !== undefined ? { teardownGraceMs: options.teardownGraceMs } : {}),
+		...(options.worktreeService !== undefined ? { worktreeService: options.worktreeService } : {}),
 	});
 	const events: AgentLifecycleEvent[] = [];
 	manager.subscribe((event) => events.push(event));
@@ -107,6 +111,63 @@ async function settle(_manager?: AgentManager, _ms?: number): Promise<void> {
 }
 
 describe("AgentManager concurrency", () => {
+	it("fences failed-launch ownership, named admission and capacity while retaining the registry receipt", async () => {
+		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 1 } });
+		await load(fixture);
+		const launch = fixture.backend.launch.bind(fixture.backend);
+		vi.spyOn(fixture.backend, "launch").mockImplementation(async (input) => {
+			const handle = await launch(input);
+			throw new AgentLaunchCleanupPendingError([new Error("exit unverified")], "launch cleanup unverified", handle);
+		});
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "uncertain",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await settle();
+		expect(fixture.manager.get(run.id)).toMatchObject({
+			status: "starting",
+			handle: { kind: "process" },
+			recoveryError: "launch cleanup unverified",
+		});
+		expect(fixture.manager.teammateStatus("uncertain")).toMatchObject({ state: "busy", availability: "unavailable" });
+		expect(fixture.store.registry).toMatchObject([
+			{ id: run.id, handle: { childId: "child-run-1" }, recoveryError: "launch cleanup unverified" },
+		]);
+		expect(fixture.store.history).toEqual([]);
+		await expect(
+			fixture.manager.spawn({ type: "general-purpose", name: "uncertain", prompt: "reuse", run_in_background: true }),
+		).rejects.toThrow();
+		const next = await spawnBg(fixture.manager);
+		await settle();
+		expect(fixture.manager.get(next.id)?.status).toBe("queued");
+		expect(fixture.backend.launches).toHaveLength(1);
+	});
+
+	it("settles a launch failure normally when cleanup was verified", async () => {
+		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 1 } });
+		await load(fixture);
+		vi.spyOn(fixture.backend, "launch").mockRejectedValueOnce(new Error("startup failed after verified cleanup"));
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "retry",
+			prompt: "work",
+			run_in_background: true,
+		});
+		await fixture.manager.whenSettled(run.id);
+		expect(fixture.manager.get(run.id)?.status).toBe("error");
+		expect(fixture.store.registry).toEqual([]);
+		const retry = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "retry",
+			prompt: "retry",
+			run_in_background: true,
+		});
+		await settle();
+		expect(fixture.manager.get(retry.id)?.status).toBe("running");
+	});
+
 	it("enforces maxConcurrent on background runs and drains FIFO on settle", async () => {
 		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 2 } });
 		await load(fixture);
@@ -1596,10 +1657,9 @@ describe("teammate names (ADR 0007 §2)", () => {
 		fixture.manager.setTeamService(team);
 		const dir = mkdtempSync(join(tmpdir(), "shutdown-task-board-"));
 		const leadBoard = new TaskBoardService({ teamDir: dir, self: "lead" });
-		const workerBoard = new TaskBoardService({ teamDir: dir, self: "worker" });
 		const task = leadBoard.create({ title: "Shutdown task" });
 		leadBoard.update({ id: task.id, executionPlan: { type: "general-purpose", name: "worker" } });
-		workerBoard.update({ id: task.id, status: "in_progress" });
+		leadBoard.update({ id: task.id, status: "in_progress" });
 		const completed = leadBoard.create({
 			title: "Completed planned task",
 			executionPlan: { type: "general-purpose", name: "worker" },
@@ -1651,13 +1711,22 @@ describe("teammate names (ADR 0007 §2)", () => {
 			team.ensureIdentity({ name: "worker", type: "general-purpose" });
 			const dir = mkdtempSync(join(tmpdir(), `legacy-task-claim-${status}-`));
 			const leadBoard = new TaskBoardService({ teamDir: dir, self: "lead" });
-			const workerBoard = new TaskBoardService({ teamDir: dir, self: "worker" });
+			const workerBoard = new TaskBoardService({
+				teamDir: dir,
+				self: "worker",
+				selfMembershipId: team.current?.members[0]?.membershipId,
+			});
 			const task = leadBoard.create({
 				title: `Legacy ${status} claim`,
 				...(status === "in_review" ? { reviewRequested: true } : {}),
 			});
 			workerBoard.update({ id: task.id, status: "in_progress" });
 			if (status === "in_review") workerBoard.update({ id: task.id, status: "in_review" });
+			// Simulate an unverifiable legacy claim after legitimate membership-scoped setup.
+			const taskFile = join(dir, "tasks", `${task.id}.json`);
+			const legacy = JSON.parse(readFileSync(taskFile, "utf8"));
+			delete legacy.ownerMembershipId;
+			writeFileSync(taskFile, JSON.stringify(legacy));
 			const execution = new TaskExecutionService({ board: leadBoard, manager: fixture.manager });
 			fixture.manager.setTeamService(team);
 			await expect(fixture.manager.shutdownTeammate("worker")).rejects.toThrow(/no verifiable membership owner/);
@@ -1694,7 +1763,7 @@ describe("teammate names (ADR 0007 §2)", () => {
 			const membershipId = team.current?.members[0]?.membershipId;
 			const dir = mkdtempSync(join(tmpdir(), "legacy-task-verified-"));
 			const leadBoard = new TaskBoardService({ teamDir: dir, self: "lead" });
-			const workerBoard = new TaskBoardService({ teamDir: dir, self: "worker" });
+			const workerBoard = new TaskBoardService({ teamDir: dir, self: "worker", selfMembershipId: membershipId });
 			const task = leadBoard.create({
 				title: "Legacy verified claim",
 				...(status === "in_review" ? { reviewRequested: true } : {}),
@@ -1704,6 +1773,11 @@ describe("teammate names (ADR 0007 §2)", () => {
 			workerBoard.bindAttempt(task.id, attempt.reservationId ?? attempt.runId, attempt.runId, membershipId);
 			workerBoard.settleAttempt(task.id, attempt.runId, { status: "completed", settledAt: Date.now() });
 			if (status === "in_review") workerBoard.update({ id: task.id, status: "in_review" });
+			// Simulate a legacy persisted claim only after legitimate membership-scoped setup.
+			const taskFile = join(dir, "tasks", `${task.id}.json`);
+			const legacy = JSON.parse(readFileSync(taskFile, "utf8"));
+			delete legacy.ownerMembershipId;
+			writeFileSync(taskFile, JSON.stringify(legacy));
 			const execution = new TaskExecutionService({ board: leadBoard, manager: fixture.manager });
 			fixture.manager.setTeamService(team);
 			await fixture.manager.shutdownTeammate("worker");
@@ -2218,6 +2292,101 @@ describe("AgentManager model admission input", () => {
 });
 
 describe("AgentManager dispose", () => {
+	it("enforces disposal once a gated launch supplies its handle despite a hung abort acknowledgement", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		const gate = Promise.withResolvers<void>();
+		fixture.backend.launchGate = gate.promise;
+		fixture.backend.stop = async () => new Promise<boolean>(() => {});
+		await spawnBg(fixture.manager);
+		await settle();
+		const disposing = fixture.manager.dispose();
+		await settle();
+		gate.resolve();
+		await disposing;
+		expect(fixture.backend.enforced).toHaveLength(1);
+	});
+
+	it("keeps resource-loss observation when a rejected assignment restores the settled context", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		const run = await fixture.manager.spawn({ type: "general-purpose", name: "restored-loss", prompt: "work" });
+		await settle();
+		fixture.backend.complete(run.id, "native result");
+		await fixture.manager.whenSettled(run.id);
+		fixture.backend.assign = async () => {
+			throw new Error("assignment rejected");
+		};
+		const rejected = await fixture.manager.spawn({ type: "general-purpose", name: "restored-loss", prompt: "reject" });
+		await fixture.manager.whenSettled(rejected.id);
+		fixture.backend.setStatus(run.id, { state: "completed", result: "native result", childExited: true });
+		await settle();
+		expect(fixture.manager.teammateStatus("restored-loss")?.state).toBe("released");
+	});
+
+	it("observes verified child loss after a named native outcome already settled", async () => {
+		const fixture = makeManager();
+		await load(fixture);
+		const run = await fixture.manager.spawn({ type: "general-purpose", name: "late-loss", prompt: "work" });
+		await settle();
+		fixture.backend.complete(run.id, "native result");
+		await fixture.manager.whenSettled(run.id);
+		fixture.backend.setStatus(run.id, { state: "completed", result: "native result", childExited: true });
+		await settle();
+		expect(fixture.manager.get(run.id)).toMatchObject({ status: "completed", result: "native result" });
+		expect(fixture.manager.teammateStatus("late-loss")?.state).toBe("released");
+	});
+
+	it("bounds direct disposal even when cooperative stop hangs", async () => {
+		const fixture = makeManager({ teardownGraceMs: 0 });
+		await load(fixture);
+		await spawnBg(fixture.manager);
+		await settle();
+		fixture.backend.stop = async () => new Promise<boolean>(() => {});
+		await fixture.manager.dispose();
+		expect(fixture.backend.enforced).toHaveLength(1);
+		expect(fixture.backend.disposedHandles).toHaveLength(1);
+	});
+
+	it.each(["unavailable", "failed"])(
+		"retains unsettled receipts when direct disposal enforcement is %s",
+		async (mode) => {
+			const fixture = makeManager({ teardownGraceMs: 0 });
+			await load(fixture);
+			const run = await spawnBg(fixture.manager);
+			await settle();
+			fixture.backend.stop = async () => new Promise<boolean>(() => {});
+			if (mode === "unavailable") fixture.backend.enforceTerminate = undefined;
+			else fixture.backend.enforceTerminateError = new Error("exit unverified");
+			await expect(fixture.manager.dispose()).rejects.toThrow(/shutdown incomplete/i);
+			expect(fixture.manager.get(run.id)?.status).toBe("running");
+			expect(fixture.store.registry[0]?.handle).toBeDefined();
+			expect(fixture.store.history).toEqual([]);
+			expect(fixture.backend.disposeAttempts).toEqual([]);
+		},
+	);
+
+	it.each(["stopped", "failed"] as const)(
+		"releases a verified dead named context (%s) and defaults the next assignment to a fresh launch",
+		async (state) => {
+			const fixture = makeManager({ teardownGraceMs: 0 });
+			await load(fixture);
+			const run = await fixture.manager.spawn({ type: "general-purpose", name: "dead", prompt: "work" });
+			await settle();
+			fixture.backend.setStatus(run.id, {
+				state,
+				childExited: true,
+				...(state === "failed" ? { outcomeUnavailable: true } : {}),
+			});
+			await fixture.manager.whenSettled(run.id);
+			expect(fixture.manager.teammateStatus("dead")).toMatchObject({ state: "released" });
+			expect(fixture.store.registry).toEqual([]);
+			await fixture.manager.spawn({ type: "general-purpose", name: "dead", prompt: "fresh" });
+			await settle();
+			expect(fixture.backend.launches).toHaveLength(2);
+		},
+	);
+
 	it("stops everything and disposes backend handles", async () => {
 		const fixture = makeManager({ settingsOverrides: { maxConcurrent: 2 } });
 		await load(fixture);
@@ -2249,7 +2418,7 @@ describe("AgentManager dispose", () => {
 		fixture.backend.complete(run.id, "done");
 		await fixture.manager.whenSettled(run.id);
 		fixture.backend.disposeError = new Error("shutdown could not verify child");
-		await fixture.manager.dispose();
+		await expect(fixture.manager.dispose()).rejects.toThrow(/shutdown incomplete/i);
 		expect(fixture.store.registry).toMatchObject([
 			{
 				id: run.id,
@@ -2285,6 +2454,132 @@ describe("AgentManager hard time budgets", () => {
 	function item(kind: "assistant" | "toolResult" | "user" | "toolCall" | "system", at: number) {
 		return { kind, timestamp: at, text: kind };
 	}
+
+	it.each([false, true])(
+		"enforces a deferred budget when pending launch ownership arrives (verification fails: %s)",
+		async (fails) => {
+			const fixture = timedManager();
+			await load(fixture);
+			const gate = Promise.withResolvers<void>();
+			const launch = fixture.backend.launch.bind(fixture.backend);
+			fixture.backend.launch = async (input) => {
+				await gate.promise;
+				throw new AgentLaunchCleanupPendingError([], "pending launch cleanup", await launch(input));
+			};
+			if (fails) fixture.backend.enforceTerminateError = new Error("exit unverified");
+			const run = await fixture.manager.spawn({ type: "general-purpose", prompt: "work", timeout: 1 });
+			await settle();
+			await advance(1_000);
+			gate.resolve();
+			await settle();
+			await advance(2_000);
+			expect(fixture.backend.enforced).toHaveLength(1);
+			if (fails) {
+				expect(fixture.manager.get(run.id)?.status).toBe("starting");
+				expect(fixture.store.registry[0]?.handle).toBeDefined();
+				expect(fixture.store.history).toEqual([]);
+			} else expect(fixture.manager.get(run.id)?.status).toBe("stopped");
+		},
+	);
+
+	it("preserves the enforcement fence when delayed worktree preservation finishes native settlement", async () => {
+		const preservation = Promise.withResolvers<void>();
+		const preserving = Promise.withResolvers<void>();
+		const worktreeService = new WorktreeService({
+			settings: settings({ worktreeIsolation: true }),
+			tmpRoot: "/tmp",
+			runGit: async () => {
+				throw new Error("unexpected git call");
+			},
+		});
+		vi.spyOn(worktreeService, "createForRun").mockResolvedValue({ baseRepo: "/tmp/project", path: "/tmp/isolated" });
+		vi.spyOn(worktreeService, "preserveForRun").mockImplementation(async () => {
+			preserving.resolve();
+			await preservation.promise;
+			return {
+				branch: "preserved",
+				hasChanges: false,
+				baseSha: "base",
+				commitSha: "base",
+				commits: [],
+				path: "/tmp/isolated",
+			};
+		});
+		const fixture = timedManager({
+			worktreeService,
+			settingsOverrides: { worktreeIsolation: true },
+			files: [
+				{
+					sourcePath: "/fake/isolated.md",
+					filenameStem: "isolated",
+					body: "",
+					frontmatter: { name: "isolated", description: "test", isolation: "worktree" },
+				},
+			],
+		});
+		await load(fixture);
+		const run = await fixture.manager.spawn({ type: "isolated", name: "delayed-loss", prompt: "work", timeout: 1 });
+		await settle();
+		fixture.backend.enforceTerminate = async () => {
+			fixture.backend.complete(run.id, "native result");
+			await preserving.promise;
+			throw new Error("termination unverified");
+		};
+		await advance(3_000);
+		expect(fixture.manager.teammateStatus("delayed-loss")?.availability).toBe("unavailable");
+		preservation.resolve();
+		await fixture.manager.whenSettled(run.id);
+		expect(fixture.manager.get(run.id)).toMatchObject({ status: "completed", result: "native result" });
+		expect(fixture.store.registry[0]?.handle).toBeDefined();
+		expect(fixture.manager.teammateStatus("delayed-loss")).toMatchObject({
+			availability: "unavailable",
+			recoveryError: expect.stringContaining("termination unverified"),
+		});
+		await expect(fixture.manager.spawn({ type: "isolated", name: "delayed-loss", prompt: "reuse" })).rejects.toThrow(
+			/unavailable/,
+		);
+	});
+
+	it("fences a settled named context when racing enforcement cannot verify resource cleanup", async () => {
+		const fixture = timedManager();
+		await load(fixture);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "uncertain-loss",
+			prompt: "work",
+			timeout: 1,
+		});
+		await settle();
+		fixture.backend.enforceTerminate = async () => {
+			fixture.backend.complete(run.id, "native result");
+			await fixture.manager.whenSettled(run.id);
+			throw new Error("termination unverified");
+		};
+		await advance(3_000);
+		expect(fixture.manager.get(run.id)).toMatchObject({ status: "completed", result: "native result" });
+		expect(fixture.manager.teammateStatus("uncertain-loss")?.availability).toBe("unavailable");
+		expect(fixture.store.registry[0]?.handle).toBeDefined();
+	});
+
+	it("reconciles enforcement resource loss even when native settlement wins during termination", async () => {
+		const fixture = timedManager();
+		await load(fixture);
+		const run = await fixture.manager.spawn({
+			type: "general-purpose",
+			name: "racing-loss",
+			prompt: "work",
+			timeout: 1,
+		});
+		await settle();
+		fixture.backend.enforceTerminate = async () => {
+			fixture.backend.complete(run.id, "racing native result");
+			await fixture.manager.whenSettled(run.id);
+			return { state: "completed", result: "racing native result", childExited: true };
+		};
+		await advance(3_000);
+		expect(fixture.manager.get(run.id)).toMatchObject({ status: "completed", result: "racing native result" });
+		expect(fixture.manager.teammateStatus("racing-loss")?.state).toBe("released");
+	});
 
 	it("freezes effective budgets at admission: invocation > definition > settings", async () => {
 		const fixture = timedManager({

@@ -72,3 +72,13 @@ describe("settled process JSONL transcript reader", () => {
 		]);
 	});
 });
+
+it("retains bounded native renderer details and complete small images in durable history", async () => {
+	const content = [
+		{ type: "text", text: "ok" },
+		{ type: "image", data: "AAAA", mimeType: "image/png" },
+	];
+	const details = { diff: "+new", truncation: { truncated: true } };
+	const dir = await makeSession(row("toolResult", content, { details, toolCallId: "c" }));
+	expect(readTranscriptItems(dir)[0]).toMatchObject({ result: content, details });
+});

@@ -3,7 +3,10 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { LauncherCommandRunner } from "../../extension-src/pi-teams/domain/process-launcher.js";
+import {
+	type LauncherCommandRunner,
+	ProcessLaunchCleanupPendingError,
+} from "../../extension-src/pi-teams/domain/process-launcher.js";
 import { createProcessLaunchers } from "../../extension-src/pi-teams/pi/process-launchers.js";
 
 function harness() {
@@ -11,6 +14,7 @@ function harness() {
 	let terminalId = "term-owned";
 	let closed = false;
 	let split = false;
+	let startProbeUnavailable = false;
 	let foregroundPids: number[] = [];
 	const paneId = "w9:p1";
 	const stop = async () => {
@@ -23,7 +27,10 @@ function harness() {
 	};
 	const runner: LauncherCommandRunner = {
 		async run(command, args, options) {
-			if (command === "ps") return { stdout: execFileSync(command, [...args], { encoding: "utf8" }), stderr: "" };
+			if (command === "ps") {
+				if (startProbeUnavailable && args.includes("lstart=")) throw new Error("temporary start-time probe failure");
+				return { stdout: execFileSync(command, [...args], { encoding: "utf8" }), stderr: "" };
+			}
 			if (command !== "herdr") throw new Error(`Unexpected command ${command}`);
 			if (options?.env?.HERDR_SOCKET_PATH !== "/tmp/herdr-test.sock") throw new Error("HerdR socket unavailable");
 			const reply = (result: unknown) => ({ stdout: JSON.stringify({ result }), stderr: "" });
@@ -97,6 +104,9 @@ function harness() {
 	return {
 		launcher,
 		stop,
+		setStartProbeUnavailable(unavailable: boolean) {
+			startProbeUnavailable = unavailable;
+		},
 		setForegroundProcesses(pids: number[]) {
 			foregroundPids = pids;
 		},
@@ -112,10 +122,10 @@ function harness() {
 	};
 }
 
-function invocation(directory: string) {
+function invocation(directory: string, rewriteTitle = true) {
 	const report = join(directory, "report.json");
 	const socket = join(directory, "idle.sock");
-	const script = `process.title='pi';require('node:fs').writeFileSync(${JSON.stringify(report)},JSON.stringify({argv:process.argv.slice(1),message:process.env.MESSAGE}));require('node:net').createServer().listen(${JSON.stringify(socket)},()=>process.stdout.write('ready'))`;
+	const script = `${rewriteTitle ? "process.title='pi';" : ""}require('node:fs').writeFileSync(${JSON.stringify(report)},JSON.stringify({argv:process.argv.slice(1),message:process.env.MESSAGE}));require('node:net').createServer().listen(${JSON.stringify(socket)},()=>process.stdout.write('ready'))`;
 	return {
 		childId: "owned-child",
 		runDir: directory,
@@ -147,6 +157,33 @@ describe("HerdR native shell and process identity", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+
+	it("recovers a serialized partial HerdR receipt after its original start probe returns", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-herdr-partial-"));
+		const fixture = harness();
+		try {
+			fixture.setStartProbeUnavailable(true);
+			const failure = await fixture.launcher.launch(invocation(directory, false)).catch((error: unknown) => error);
+			if (!(failure instanceof ProcessLaunchCleanupPendingError) || !failure.handle)
+				throw new Error("missing allocated HerdR receipt");
+			const partial = JSON.parse(JSON.stringify(failure.handle));
+			expect(partial.pid).toBeGreaterThan(0);
+			expect(partial.identity.foregroundProcessGroupId).toBe(String(partial.pid));
+			expect(partial.identity.startTime).toBeUndefined();
+			expect(partial.identity.ownerToken).toEqual(expect.any(String));
+			fixture.setStartProbeUnavailable(false);
+			await expect(fixture.launcher.terminate(partial)).rejects.toThrow("Incomplete HerdR launcher handle");
+			const recovered = await fixture.launcher.recoverForCleanup?.(partial);
+			expect(recovered).toMatchObject({ pid: partial.pid, identity: { startTime: expect.any(String) } });
+			if (!recovered) throw new Error("original process ownership could not recover");
+			await fixture.launcher.terminate(recovered);
+			expect(fixture.isClosed()).toBe(true);
+			expect(partial.identity.startTime).toBeUndefined();
+		} finally {
+			await fixture.stop();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	}, 25_000);
 
 	it("refuses to close a pane whose terminal identity was replaced", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "pi-herdr-reuse-"));

@@ -3,6 +3,7 @@ import type { Component, TUI, TuiMouseEvent, TuiMouseEventResult } from "@earend
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { TranscriptItem } from "../../domain/transcript.js";
 import {
+	detachedRendererPort,
 	renderTranscriptItems,
 	type TranscriptHitRegion,
 	type TranscriptRenderContext,
@@ -59,9 +60,18 @@ export function createAgentTranscriptPane(
 		toolsExpanded,
 		toolExpansion,
 	};
+	let rendererRevision = detachedRendererPort()?.revision;
 	const border = new DynamicBorder((line: string) => theme.fg("border", line));
 
 	function ensureBody(width: number): string[] {
+		const revision = detachedRendererPort()?.revision;
+		if (revision !== rendererRevision) {
+			rendererRevision = revision;
+			context.toolDefinitions = toolRenderDefinitions(options.cwd);
+			itemCache = new WeakMap();
+			toolComponents.clear();
+			cachedBody = undefined;
+		}
 		const signature = options.signature();
 		if (signature !== lastSignature) {
 			lastSignature = signature;

@@ -56,6 +56,20 @@ export interface AgentBackendHandle {
 	handle: string;
 }
 
+/** Failed launch with allocated resources whose cleanup could not be verified.
+ * The handle remains owned and serializable; callers must retain admission until verified cleanup.
+ */
+export class AgentLaunchCleanupPendingError extends AggregateError {
+	constructor(
+		errors: unknown[],
+		message: string,
+		readonly handle: AgentBackendHandle,
+	) {
+		super(errors, message);
+		this.name = "AgentLaunchCleanupPendingError";
+	}
+}
+
 /** Native execution observation or verified child loss; launcher liveness never means completion. */
 export interface BackendStatus {
 	state: "starting" | "running" | "completed" | "failed" | "stopped" | "timeout" | "disconnected";
@@ -70,6 +84,8 @@ export interface BackendStatus {
 	error?: string;
 	/** Verified child loss without a recovered RPC outcome; must not replace a persisted terminal outcome. */
 	outcomeUnavailable?: true;
+	/** Verified owned-child exit, including after native settlement; preserve its execution outcome. */
+	childExited?: true;
 	/** Persisted session path, once available for future cold resume. */
 	sessionFile?: string;
 	usage?: UsageSummary;
@@ -116,6 +132,7 @@ export interface AgentExecutionBackend {
 	kind: "process";
 	available(): Promise<boolean>;
 	prepareModel(input: ModelAdmissionInput): Promise<ModelAdmission>;
+	/** On unverified allocation cleanup, throws AgentLaunchCleanupPendingError with a recoverable owned handle. */
 	launch(input: AgentLaunchInput): Promise<AgentBackendHandle>;
 	status(handle: AgentBackendHandle): Promise<BackendStatus>;
 	steer(handle: AgentBackendHandle, message: string): Promise<boolean>;
@@ -142,9 +159,11 @@ export interface AgentExecutionBackend {
 	dispose(handle: AgentBackendHandle): Promise<void>;
 	detach(handle: AgentBackendHandle): void;
 	/**
-	 * Hard time-budget enforcement (roadmap 1.1): verified termination of an
-	 * OWNED child that ignored the cooperative abort. Budget-only — ordinary
-	 * user stop semantics never call this. Implementation must verify the
+	 * Hard time-budget/session-teardown enforcement: verified termination of an
+	 * OWNED child that ignored the cooperative abort. Ordinary user stop
+	 * semantics never call this. Pending launch cleanup may return verified
+	 * child loss with outcomeUnavailable, never a recovered native outcome.
+	 * Implementation must verify the
 	 * cached/authenticated child identity and launcher ownership without RPC
 	 * (a frozen child cannot answer), terminate the owned process group,
 	 * escalate to a forced kill when the group survives the graceful signal,

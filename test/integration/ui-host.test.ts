@@ -3,7 +3,7 @@
 // §5 keyboard table, composer routing, stop/dismiss, and settings/ownership.
 // Child-process execution and model requests are outside this host test.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EditorFactory } from "@earendil-works/pi-coding-agent";
@@ -17,6 +17,7 @@ import type { AgentFocusPort } from "../../extension-src/pi-teams/domain/ui-view
 import { hubRosterCapacity } from "../../extension-src/pi-teams/features/agent-panel/index.js";
 import { PANEL_PAGE_SIZE } from "../../extension-src/pi-teams/features/agent-panel/panel-keys.js";
 import type { AgentViewOverlay } from "../../extension-src/pi-teams/features/agent-view/index.js";
+import type { agentStatusSnapshot } from "../../extension-src/pi-teams/features/agent-view/status.js";
 import { registerAgentsCommand } from "../../extension-src/pi-teams/pi/commands.js";
 import { createPiTeamStore } from "../../extension-src/pi-teams/pi/teams-host.js";
 import { createPiTranscriptSource } from "../../extension-src/pi-teams/pi/transcript-host.js";
@@ -1332,13 +1333,193 @@ describe("composer routing in the transcript view", () => {
 		return overlay.component as AgentViewOverlay;
 	}
 
+	it("opens a teammate by clicking the Main roster without treating its spacer as a row", async () => {
+		const fx = await makeFixture();
+		const ids: string[] = [];
+		try {
+			ids.push(await fx.spawn("CLICK_TARGET"));
+			fx.host.currentEditorText = "MAIN_DRAFT";
+			const factory = fx.host.componentFactories.get("teams-agents");
+			if (!factory) throw new Error("Missing Main roster");
+			const panel = factory({ requestRender() {} }, fx.host.theme) as Component;
+			const rows = panel.render(100).map(stripTerminalSequences);
+			panel.handleMouse?.({ type: "click", button: "left", x: 4, y: 0 });
+			expect(fx.host.overlays).toHaveLength(0);
+			panel.handleMouse?.({
+				type: "click",
+				button: "left",
+				x: 4,
+				y: rows.findIndex((line) => line.includes("CLICK_TARGET")),
+			});
+			const opened = await fx.host.waitForOverlayOpen();
+			expect(opened.component?.render(100).join("\n")).toContain("CLICK_TARGET");
+			expect(fx.host.currentEditorText).toBe("MAIN_DRAFT");
+			fx.host.emitTerminalInput(ESC);
+		} finally {
+			for (const id of ids) fx.backend.complete(id, "done");
+			await fx.app.manager.waitForAll();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("switches teammates from the child roster, retaining drafts and returning to Main", async () => {
+		const fx = await makeFixture();
+		const ids: string[] = [];
+		try {
+			const first = await fx.spawn("first teammate");
+			ids.push(first, await fx.spawn("second teammate"));
+			fx.host.currentEditorText = "MAIN_DRAFT";
+			fx.ui.openView(first);
+			const opened = await fx.host.waitForOverlayOpen();
+			const firstView = opened.component as AgentViewOverlay;
+			firstView.editor.setText("FIRST_DRAFT");
+			const rows = firstView.render(100).map(stripTerminalSequences);
+			const secondY = rows.findIndex((line) => line.includes("second teammate"));
+			expect(secondY).toBeGreaterThan(0);
+			firstView.handleMouse?.({ type: "click", button: "left", x: 4, y: secondY });
+			const secondOverlay = await fx.host.waitForOverlayOpen();
+			expect(opened.handle.hidden).toBe(true);
+			const secondView = secondOverlay.component as AgentViewOverlay;
+			expect(secondView.editor.getText()).toBe("");
+			secondView.editor.setText("SECOND_DRAFT");
+			const secondRows = secondView.render(100).map(stripTerminalSequences);
+			secondView.handleMouse?.({
+				type: "click",
+				button: "left",
+				x: 4,
+				y: secondRows.findIndex((line) => line.includes("first teammate")),
+			});
+			const restored = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+			expect(restored.editor.getText()).toBe("FIRST_DRAFT");
+			const restoredRows = restored.render(100).map(stripTerminalSequences);
+			restored.handleMouse?.({
+				type: "click",
+				button: "left",
+				x: 4,
+				y: restoredRows.findIndex((line) => line.trim() === "◯ main"),
+			});
+			expect(fx.host.overlays.every((overlay) => overlay.handle.hidden)).toBe(true);
+			expect(fx.host.currentEditorText).toBe("MAIN_DRAFT");
+		} finally {
+			for (const id of ids) fx.backend.complete(id, "done");
+			await fx.app.manager.waitForAll();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it.each([false, true])("tracks pending submissions across view replacement (new draft=%s)", async (newDraft) => {
+		const response = Promise.withResolvers<void>();
+		let steers = 0;
+		const fx = await makeFixture({
+			focus: (base) => ({
+				...base,
+				steer: async (...args) => {
+					steers++;
+					await response.promise;
+					return base.steer(...args);
+				},
+			}),
+		});
+		const ids: string[] = [];
+		const clickRow = (view: AgentViewOverlay, description: string) => {
+			const rows = view.render(100).map(stripTerminalSequences);
+			view.handleMouse?.({
+				type: "click",
+				button: "left",
+				x: 4,
+				y: rows.findIndex((line) => line.includes(description)),
+			});
+		};
+		try {
+			ids.push(await fx.spawn("PENDING_FIRST"), await fx.spawn("PENDING_SECOND"));
+			fx.ui.openView(ids[0]);
+			const first = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+			first.editor.setText("pending request");
+			fx.host.emitTerminalInput(ENTER);
+			expect(steers).toBe(1);
+			if (newDraft) first.editor.setText("newer draft");
+			clickRow(first, "PENDING_SECOND");
+			const second = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+			clickRow(second, "PENDING_FIRST");
+			const restored = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+			if (!newDraft) {
+				fx.host.emitTerminalInput(ENTER);
+				expect(steers).toBe(1);
+			}
+			response.resolve();
+			await vi.waitFor(() => expect(fx.backend.steers).toHaveLength(1));
+			await vi.waitFor(() => expect(restored.editor.getText()).toBe(newDraft ? "newer draft" : ""));
+			clickRow(restored, "PENDING_SECOND");
+			const again = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+			clickRow(again, "PENDING_FIRST");
+			const saved = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+			expect(saved.editor.getText()).toBe(newDraft ? "newer draft" : "");
+		} finally {
+			response.resolve();
+			for (const id of ids) fx.backend.complete(id, "done");
+			await fx.app.manager.waitForAll();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
+	it("acknowledges an accepted native command after switching away and back", async () => {
+		const response = Promise.withResolvers<void>();
+		let controls = 0;
+		const fx = await makeFixture({
+			focus: (base) => ({
+				...base,
+				read: async (id) => ({ ...(await base.read(id)), capabilities: ["model"] }),
+				control: async (id) => {
+					controls++;
+					await response.promise;
+					return { ...(await base.read(id)), model: "changed-model" };
+				},
+			}),
+		});
+		const ids: string[] = [];
+		const click = (view: AgentViewOverlay, description: string) => {
+			const rows = view.render(100).map(stripTerminalSequences);
+			view.handleMouse?.({
+				type: "click",
+				button: "left",
+				x: 4,
+				y: rows.findIndex((line) => line.includes(description)),
+			});
+		};
+		try {
+			ids.push(await fx.spawn("CONTROL_FIRST"), await fx.spawn("CONTROL_SECOND"));
+			fx.ui.openView(ids[0]);
+			const first = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+			first.editor.setText("/model changed-model");
+			fx.host.emitTerminalInput(ENTER);
+			expect(controls).toBe(1);
+			click(first, "CONTROL_SECOND");
+			const second = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+			click(second, "CONTROL_FIRST");
+			const restored = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+			fx.host.emitTerminalInput(ENTER);
+			expect(controls).toBe(1);
+			response.resolve();
+			await vi.waitFor(() => expect(restored.editor.getText()).toBe(""));
+		} finally {
+			response.resolve();
+			for (const id of ids) fx.backend.complete(id, "done");
+			await fx.app.manager.waitForAll();
+			fx.ui.dispose();
+			await fx.app.sessionShutdown();
+		}
+	});
+
 	it("routes typed text + Enter to manager.steer and clears the view editor", async () => {
 		const fx = await makeFixture();
 		const overlay = await openView(fx);
 
 		overlay.editor.setText("also check middleware");
 		expect(fx.host.emitTerminalInput(ENTER)).toBe(true);
-		expect(overlay.editor.getText()).toBe("");
+		await vi.waitFor(() => expect(overlay.editor.getText()).toBe(""));
 		expect(fx.backend.steers.some((steer) => steer.message === "also check middleware")).toBe(true);
 	});
 
@@ -1388,6 +1569,9 @@ describe("composer routing in the transcript view", () => {
 
 		expect(fx.app.manager.list().some((record) => record.id !== runId && record.status !== "completed")).toBe(true);
 		expect(fx.backend.resumes.length).toBeGreaterThan(0);
+		fx.ui.openView(runId);
+		const source = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+		await vi.waitFor(() => expect(source.editor.getText()).toBe(""));
 	}, 10_000);
 });
 
@@ -1453,4 +1637,272 @@ describe("foreign editor that preserves Editor semantics (e.g. pi-style)", () =>
 		await opening;
 		fx.host.emitTerminalInput(ESC);
 	});
+});
+
+describe("optional status ordering bridge", () => {
+	// Test-only cross-repository load when the optional sibling checkout exists.
+	// Production integration is symbol-only; standalone teams tests still run.
+	const styleRoot = new URL("../../../pi-style/extension-src/pi-style/", import.meta.url);
+	it.skipIf(!existsSync(styleRoot)).each([true, false])(
+		"orders real style rows after roster with style first=%s",
+		async (styleFirst) => {
+			const { installStatusLine } = await import(new URL("features/status-line/index.ts", styleRoot).href);
+			const { normalizeConfig } = await import(new URL("domain/config-normalization.ts", styleRoot).href);
+			const fixture = await makeFixture();
+			const order = new Map<string, string>();
+			const nativeSetWidget = fixture.host.extensionContext.ui.setWidget.bind(fixture.host.extensionContext.ui);
+			const setWidget = vi
+				.spyOn(fixture.host.extensionContext.ui, "setWidget")
+				.mockImplementation((key, content, options) => {
+					order.delete(key);
+					if (content) order.set(key, options?.placement ?? "aboveEditor");
+					nativeSetWidget(key, content, options);
+				});
+			const install = () =>
+				installStatusLine({
+					host: { setWidget: fixture.host.extensionContext.ui.setWidget, setFooter() {} },
+					generation: 1,
+					config: normalizeConfig({ placement: "below" }),
+					initialSnapshot: {},
+				});
+			let style: ReturnType<typeof install> | undefined;
+			try {
+				if (styleFirst) style = install();
+				await fixture.spawn();
+				if (!styleFirst) style = install();
+				const expected = ["teams-agents", "pi-style.status.primary", "pi-style.status.secondary"];
+				const below = () => [...order].filter(([, placement]) => placement === "belowEditor").map(([key]) => key);
+				expect(below()).toEqual(expected);
+				fixture.app.updateSettings(sanitizeSettings({ agentInlinePanel: false }));
+				fixture.ui.refresh();
+				await vi.waitFor(() => expect(below()).not.toContain("teams-agents"));
+				fixture.app.updateSettings(sanitizeSettings({ agentInlinePanel: true }));
+				fixture.ui.refresh();
+				await vi.waitFor(() => expect(below()).toEqual(expected));
+				fixture.backend.complete("run-1", "done");
+				await vi.waitFor(() => expect(fixture.app.manager.get("run-1")?.status).toBe("completed"));
+				fixture.ui.refresh();
+				await fixture.spawn();
+				expect(below()).toEqual(expected);
+			} finally {
+				fixture.backend.complete("run-1", "done");
+				fixture.backend.complete("run-2", "done");
+				style?.dispose();
+				setWidget.mockRestore();
+				fixture.ui.dispose();
+				await fixture.app.sessionShutdown();
+			}
+		},
+	);
+	it("notifies after every roster insertion and tolerates absence", async () => {
+		const key = Symbol.for("@quandev104/pi-style:status-widget-order");
+		const globals = globalThis as Record<symbol, unknown>;
+		const previous = globals[key];
+		const fixture = await makeFixture();
+		const reflow = vi.fn(() => {
+			expect(fixture.host.componentFactories.has("teams-agents")).toBe(true);
+		});
+		globals[key] = { reflow };
+		try {
+			await fixture.spawn();
+			expect(reflow).toHaveBeenCalled();
+			const calls = reflow.mock.calls.length;
+			fixture.ui.refresh();
+			expect(reflow).toHaveBeenCalledTimes(calls);
+			delete globals[key];
+			expect(() => fixture.ui.refresh()).not.toThrow();
+		} finally {
+			fixture.backend.complete("run-1", "done");
+			fixture.ui.dispose();
+			await fixture.app.sessionShutdown();
+			if (previous === undefined) delete globals[key];
+			else globals[key] = previous;
+		}
+	});
+});
+
+describe("child footer Git scheduling with actual optional pi-style", () => {
+	const providerFile = new URL("../../../pi-style/extension-src/pi-style/pi/detached-editor.ts", import.meta.url);
+	const configFile = new URL(
+		"../../../pi-style/extension-src/pi-style/domain/config-normalization.ts",
+		import.meta.url,
+	);
+	it.skipIf(!existsSync(providerFile))(
+		"fences switching, merges into latest native state, clears cwd and refreshes idle only while open",
+		async () => {
+			const { registerDetachedEditor, DETACHED_EDITOR_KEY } = await import(providerFile.href);
+			const { DEFAULT_CONFIG } = await import(configFile.href);
+			const pendingA = Promise.withResolvers<{ code: number; stdout: string; stderr: string }>();
+			const pendingB = Promise.withResolvers<{ code: number; stdout: string; stderr: string }>();
+			const runner = {
+				run: vi.fn((_args: unknown, cwd: string) =>
+					cwd === "/A"
+						? pendingA.promise
+						: cwd === "/B"
+							? pendingB.promise
+							: Promise.resolve({ code: 0, stderr: "", stdout: "## branch-C\n?? new\n" }),
+				),
+			};
+			const installation = registerDetachedEditor(
+				() => ({
+					...DEFAULT_CONFIG,
+					statusLine: {
+						...DEFAULT_CONFIG.statusLine,
+						layout: { left: ["model_effort", "git", "token_in", "cost"], right: [], secondary: [] },
+					},
+				}),
+				{ gitRunner: runner },
+			);
+			const registry = (
+				globalThis as Record<
+					symbol,
+					{ renderStatus(theme: unknown, width: number, snapshot: ReturnType<typeof agentStatusSnapshot>): string[] }
+				>
+			)[DETACHED_EDITOR_KEY];
+			if (!registry) throw new Error("Missing provider");
+			const status = vi.spyOn(registry, "renderStatus");
+			let tokens = 10;
+			let cwdB: string | null = "/B";
+			let currentRunId: string | undefined;
+			let closed = false;
+			let reads = 0;
+			const listeners = new Map<string, () => void>();
+			const root = mkdtempSync(join(tmpdir(), "pi-footer-git-"));
+			const fx = await makeFixture({
+				teamCwd: root,
+				focus: (base) => ({
+					...base,
+					read: async (id) => {
+						reads++;
+						return {
+							...(await base.read(id)),
+							closed,
+							currentRunId: currentRunId ?? id,
+							model: "id",
+							modelName: id === "run-1" ? "Alpha" : `Beta-${tokens}`,
+							provider: "child",
+							reasoning: true,
+							thinking: "high",
+							cwd: id === "run-1" ? "/A" : cwdB,
+							sessionUsage: {
+								scope: "session",
+								inputTokens: tokens,
+								outputTokens: 2,
+								cacheReadTokens: 0,
+								cacheWriteTokens: 0,
+								cost: tokens / 100,
+							},
+						};
+					},
+					subscribe: (id, listener) => {
+						listeners.set(id, listener);
+						return () => {
+							listeners.delete(id);
+						};
+					},
+				}),
+			});
+			const ids: string[] = [];
+			const latest = () => status.mock.calls.at(-1)?.[2];
+			try {
+				ids.push(await fx.spawn("FIRST"));
+				const named = await fx.app.manager.spawn({
+					type: "explore",
+					name: "footer-peer",
+					description: "SECOND",
+					prompt: "read only",
+					run_in_background: true,
+				});
+				ids.push(named.id);
+				await vi.waitFor(() => expect(fx.app.manager.get(named.id)?.status).toBe("running"));
+				fx.ui.openView(ids[0]);
+				const a = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+				await vi.waitFor(() =>
+					expect(runner.run).toHaveBeenCalledWith(expect.anything(), "/A", expect.anything(), expect.anything()),
+				);
+				a.render(200);
+				fx.ui.openView(ids[1]);
+				const b = (await fx.host.waitForOverlayOpen()).component as AgentViewOverlay;
+				await vi.waitFor(() =>
+					expect(runner.run).toHaveBeenCalledWith(expect.anything(), "/B", expect.anything(), expect.anything()),
+				);
+				tokens = 25;
+				listeners.get(named.id)?.();
+				await vi.waitFor(() => {
+					b.render(200);
+					expect(latest()?.model).toBe("Beta-25");
+				});
+				pendingB.resolve({ code: 0, stderr: "", stdout: "## branch-B\n M dirty\n" });
+				await vi.waitFor(() => {
+					b.render(200);
+					expect(latest()?.git?.branch).toBe("branch-B");
+				});
+				expect(latest()?.usage).toMatchObject({ inputTokens: 25, cost: 0.25 });
+				pendingA.resolve({ code: 0, stderr: "", stdout: "## branch-A\n" });
+				await Promise.resolve();
+				await Promise.resolve();
+				b.render(200);
+				expect(latest()?.git?.branch).toBe("branch-B");
+				const calls = runner.run.mock.calls.length;
+				for (let i = 0; i < 5; i++) b.render(200);
+				expect(runner.run).toHaveBeenCalledTimes(calls);
+				cwdB = null;
+				listeners.get(named.id)?.();
+				await vi.waitFor(() => {
+					b.render(200);
+					expect(latest()?.cwd).toBeUndefined();
+					expect(latest()?.git).toBeUndefined();
+				});
+				cwdB = "/C";
+				listeners.get(named.id)?.();
+				await vi.waitFor(() => {
+					b.render(200);
+					expect(latest()?.git?.branch).toBe("branch-C");
+				});
+				for (const mismatch of [true, false]) {
+					currentRunId = mismatch ? "another-assignment" : named.id;
+					closed = !mismatch;
+					listeners.get(named.id)?.();
+					await vi.waitFor(() => {
+						b.render(200);
+						expect(latest()?.model).toBeUndefined();
+						expect(latest()?.usage).toBeUndefined();
+						expect(latest()?.git).toBeUndefined();
+					});
+				}
+				closed = false;
+				listeners.get(named.id)?.();
+				await vi.waitFor(() => {
+					b.render(200);
+					expect(latest()?.model).toBe("Beta-25");
+				});
+				for (const id of ids) fx.backend.complete(id, "done");
+				await fx.app.manager.waitForAll();
+				const before = reads;
+				tokens = 40;
+				await vi.waitFor(
+					() => {
+						b.render(200);
+						expect(reads).toBeGreaterThan(before);
+						expect(latest()?.usage?.inputTokens).toBe(40);
+					},
+					{ timeout: 2500 },
+				);
+				fx.ui.closeView();
+				const closedReads = reads;
+				await new Promise((resolve) => setTimeout(resolve, 1100));
+				expect(reads).toBe(closedReads);
+			} finally {
+				pendingA.resolve({ code: 0, stderr: "", stdout: "## A\n" });
+				pendingB.resolve({ code: 0, stderr: "", stdout: "## B\n" });
+				status.mockRestore();
+				fx.ui.dispose();
+				installation.dispose();
+				for (const id of ids) fx.backend.complete(id, "done");
+				await fx.app.manager.waitForAll();
+				await fx.app.sessionShutdown();
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 });

@@ -14,11 +14,12 @@ import {
 	createWriteToolDefinition,
 	getMarkdownTheme,
 	ToolExecutionComponent,
+	type ToolRenderers,
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, MarkdownTheme, TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import type { TranscriptItem } from "../../domain/transcript.js";
+import { boundedToolResult, type TranscriptItem } from "../../domain/transcript.js";
 import type { ThemeFg } from "../../shared/theme.js";
 
 export interface TranscriptRenderContext {
@@ -62,8 +63,26 @@ export function resolveMarkdownTheme(): MarkdownTheme {
 	}
 }
 
+/** Optional pi-style public display port. No dependency on its execution API. */
+export function detachedRendererPort():
+	| { revision: unknown; resolve(name: string): ToolRenderers | undefined }
+	| undefined {
+	const port = (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("pi-style.detached-tool-renderers.v1")];
+	return port && typeof port === "object" && "resolve" in port && typeof port.resolve === "function"
+		? (port as { revision: unknown; resolve(name: string): ToolRenderers | undefined })
+		: undefined;
+}
+
+function detachedToolDefinition(name: string): ToolRenderers | undefined {
+	try {
+		return detachedRendererPort()?.resolve(name);
+	} catch {
+		return undefined;
+	} // Optional styling must not hide native tool output.
+}
+
 export function toolRenderDefinitions(cwd: string): ReadonlyMap<string, unknown> {
-	return new Map<string, unknown>([
+	const native = new Map<string, unknown>([
 		["bash", createBashToolDefinition(cwd)],
 		["read", createReadToolDefinition(cwd)],
 		["edit", createEditToolDefinition(cwd)],
@@ -72,6 +91,8 @@ export function toolRenderDefinitions(cwd: string): ReadonlyMap<string, unknown>
 		["find", createFindToolDefinition(cwd)],
 		["ls", createLsToolDefinition(cwd)],
 	]);
+	for (const [name, fallback] of native) native.set(name, detachedToolDefinition(name) ?? fallback);
+	return native;
 }
 
 function resultText(item: TranscriptItem): string {
@@ -94,8 +115,10 @@ function resultText(item: TranscriptItem): string {
 const renderedResults = new WeakMap<ToolExecutionComponent, TranscriptItem>();
 
 function updateToolResult(tool: ToolExecutionComponent, payload: TranscriptItem): void {
+	const projected = boundedToolResult(payload.result ?? resultText(payload), payload.details);
 	tool.updateResult({
-		content: [{ type: "text", text: resultText(payload) }],
+		content: projected.result,
+		...(projected.details === undefined ? {} : { details: projected.details }),
 		isError: payload.isError === true,
 	});
 	renderedResults.set(tool, payload);
@@ -203,7 +226,7 @@ function componentFor(
 			callId,
 			item.args ?? {},
 			{},
-			ctx.toolDefinitions?.get(toolName) as never,
+			(ctx.toolDefinitions?.get(toolName) ?? detachedToolDefinition(toolName)) as never,
 			ctx.tui,
 			ctx.cwd,
 		);

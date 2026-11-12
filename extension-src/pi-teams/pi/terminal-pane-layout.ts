@@ -323,6 +323,7 @@ export function withTerminalPaneLayout(
 						throw new ProcessLaunchCleanupPendingError(
 							"Pane layout failed and owned split cleanup remains unconfirmed",
 							{ cause: cleanupError },
+							handle,
 						);
 					}
 					throw error;

@@ -19,21 +19,45 @@ export function createAgentFocusPort(options: AgentFocusServiceOptions): AgentFo
 	async function project(runId: string, state?: ChildState): Promise<AgentFocusSnapshot> {
 		const run = manager.get(runId);
 		if (!run) throw new Error(`Unknown agent: "${runId}".`);
-		if (state?.currentRunId && state.currentRunId !== runId) {
+		const currentRunId = state?.currentRunId ?? (state?.execution === "idle" ? state.lastOutcome?.runId : undefined);
+		if (currentRunId && currentRunId !== runId) {
 			throw new Error("Child state belongs to a different run.");
 		}
-		const closed = isTerminalStatus(run.status);
+		const closed = !manager.hasLiveFocus(runId) || currentRunId !== runId;
 		const items = !closed && state ? state.transcript.items : await transcripts.getTranscript(run);
 		const focus = state?.focus;
+		const stats = focus?.stats;
+		const sessionUsage =
+			focus?.sessionUsage ??
+			(stats
+				? {
+						scope: "session" as const,
+						inputTokens: stats.tokens.input,
+						outputTokens: stats.tokens.output,
+						cacheReadTokens: stats.tokens.cacheRead,
+						cacheWriteTokens: stats.tokens.cacheWrite,
+						...(typeof stats.cost === "number" && Number.isFinite(stats.cost) && stats.cost >= 0
+							? { cost: stats.cost }
+							: {}),
+					}
+				: undefined);
 		return {
 			runId,
-			currentRunId: closed ? null : (state?.currentRunId ?? null),
+			currentRunId: closed ? null : (currentRunId ?? null),
 			model: focus?.model ? `${focus.model.provider}/${focus.model.id}` : (run.model ?? null),
+			...(focus?.model
+				? {
+						provider: focus.model.provider,
+						modelName: focus.model.name,
+						...(focus.model.reasoning !== undefined ? { reasoning: focus.model.reasoning } : {}),
+					}
+				: {}),
+			...(sessionUsage ? { sessionUsage } : {}),
 			thinking: focus?.thinking ?? null,
 			cwd: focus?.cwd ?? null,
 			context: focus?.context ? { usedTokens: focus.context.tokens, windowTokens: focus.context.contextWindow } : null,
 			capabilities:
-				closed || !focus
+				closed || isTerminalStatus(run.status) || !focus
 					? []
 					: [
 							...focus.capabilities.commands,
