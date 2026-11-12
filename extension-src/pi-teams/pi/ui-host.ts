@@ -164,6 +164,13 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 	let leftArmed: { editor: Editor | undefined; sessionId: string; text: string; pressedAt: number } | undefined;
 
 	let panelRegistered = false;
+	const orderingKey = Symbol.for("@quandev104/pi-teams:agent-widget-order");
+	const orderingGlobals = globalThis as Record<symbol, unknown>;
+	const orderingBridge = {
+		reflow(): void {
+			if (!disposed && panelRegistered && orderingGlobals[orderingKey] === orderingBridge) installPanel();
+		},
+	};
 	let taskWidgetRegistered = false;
 	let inlineAgentsOverride: boolean | undefined;
 	let tui: TUI | undefined;
@@ -274,16 +281,9 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 			{ placement: "belowEditor" },
 		);
 		panelRegistered = true;
-		// Pi reinserts widgets in insertion order. Let an optional status owner
-		// move only its own rows behind the newly mounted roster.
-		const ordering = (globalThis as Record<symbol, unknown>)[Symbol.for("@quandev104/pi-style:status-widget-order")] as
-			| { reflow?: () => void }
-			| undefined;
-		try {
-			ordering?.reflow?.();
-		} catch {
-			// Optional styling must not prevent the roster from mounting.
-		}
+		// Status owners notify after mounting their rows; reinsert only our own
+		// roster so the status stays adjacent to the editor regardless of load order.
+		orderingGlobals[orderingKey] = orderingBridge;
 	}
 
 	function syncInlineAgentWidget(): void {
@@ -1051,7 +1051,10 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 
 	function removeWidgets(...keys: string[]): void {
 		for (const key of keys) ctx.ui.setWidget(key, undefined);
-		if (keys.includes(PANEL_WIDGET_KEY)) panelRegistered = false;
+		if (keys.includes(PANEL_WIDGET_KEY)) {
+			panelRegistered = false;
+			if (orderingGlobals[orderingKey] === orderingBridge) delete orderingGlobals[orderingKey];
+		}
 		if (keys.includes(TASK_WIDGET_KEY)) taskWidgetRegistered = false;
 	}
 

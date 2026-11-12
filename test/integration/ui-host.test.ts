@@ -1644,7 +1644,7 @@ describe("optional status ordering bridge", () => {
 	// Production integration is symbol-only; standalone teams tests still run.
 	const styleRoot = new URL("../../../pi-style/extension-src/pi-style/", import.meta.url);
 	it.skipIf(!existsSync(styleRoot)).each([true, false])(
-		"orders real style rows after roster with style first=%s",
+		"orders real style rows before roster with style first=%s",
 		async (styleFirst) => {
 			const { installStatusLine } = await import(new URL("features/status-line/index.ts", styleRoot).href);
 			const { normalizeConfig } = await import(new URL("domain/config-normalization.ts", styleRoot).href);
@@ -1670,8 +1670,18 @@ describe("optional status ordering bridge", () => {
 				if (styleFirst) style = install();
 				await fixture.spawn();
 				if (!styleFirst) style = install();
-				const expected = ["teams-agents", "pi-style.status.primary", "pi-style.status.secondary"];
+				const expected = ["pi-style.status.primary", "pi-style.status.secondary", "teams-agents"];
 				const below = () => [...order].filter(([, placement]) => placement === "belowEditor").map(([key]) => key);
+				expect(below()).toEqual(expected);
+				style?.configure(normalizeConfig({ placement: "above" }));
+				expect(order.get("pi-style.status.primary")).toBe("aboveEditor");
+				expect(below()).toEqual(["pi-style.status.secondary", "teams-agents"]);
+				style?.configure(normalizeConfig({ statusLine: { enabled: false } }));
+				expect(below()).toEqual(["teams-agents"]);
+				style?.configure(normalizeConfig({ placement: "below" }));
+				expect(below()).toEqual(expected);
+				style?.dispose();
+				style = install();
 				expect(below()).toEqual(expected);
 				fixture.app.updateSettings(sanitizeSettings({ agentInlinePanel: false }));
 				fixture.ui.refresh();
@@ -1694,29 +1704,38 @@ describe("optional status ordering bridge", () => {
 			}
 		},
 	);
-	it("notifies after every roster insertion and tolerates absence", async () => {
-		const key = Symbol.for("@quandev104/pi-style:status-widget-order");
+	it("fences stale roster ordering callbacks and releases ownership on hide/dispose", async () => {
+		const key = Symbol.for("@quandev104/pi-teams:agent-widget-order");
 		const globals = globalThis as Record<symbol, unknown>;
-		const previous = globals[key];
 		const fixture = await makeFixture();
-		const reflow = vi.fn(() => {
-			expect(fixture.host.componentFactories.has("teams-agents")).toBe(true);
-		});
-		globals[key] = { reflow };
 		try {
 			await fixture.spawn();
-			expect(reflow).toHaveBeenCalled();
-			const calls = reflow.mock.calls.length;
-			fixture.ui.refresh();
-			expect(reflow).toHaveBeenCalledTimes(calls);
+			const bridge = globals[key] as { reflow(): void };
+			const setWidget = vi.spyOn(fixture.host.extensionContext.ui, "setWidget");
+			bridge.reflow();
+			expect(setWidget).toHaveBeenCalledWith("teams-agents", expect.any(Function), { placement: "belowEditor" });
+			fixture.ui.setInlineAgentsVisible(false);
+			expect(globals[key]).toBeUndefined();
+			setWidget.mockClear();
+			bridge.reflow();
+			expect(setWidget).not.toHaveBeenCalled();
+			fixture.ui.setInlineAgentsVisible(true);
+			const replacement = { reflow: vi.fn() };
+			globals[key] = replacement;
+			setWidget.mockClear();
+			bridge.reflow();
+			expect(setWidget).not.toHaveBeenCalled();
+			fixture.ui.dispose();
+			expect(globals[key]).toBe(replacement);
 			delete globals[key];
-			expect(() => fixture.ui.refresh()).not.toThrow();
+			setWidget.mockClear();
+			bridge.reflow();
+			expect(setWidget).not.toHaveBeenCalled();
+			setWidget.mockRestore();
 		} finally {
 			fixture.backend.complete("run-1", "done");
 			fixture.ui.dispose();
 			await fixture.app.sessionShutdown();
-			if (previous === undefined) delete globals[key];
-			else globals[key] = previous;
 		}
 	});
 });
