@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.17] - 2026-11-13
+
+### Bug Fixes
+
+- *(ui)* Move teammate run metadata into header
+
 ## [0.1.16] - 2026-11-13
 
 ### Bug Fixes
