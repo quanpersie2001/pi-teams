@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.16] - 2026-11-13
+
+### Bug Fixes
+
+- *(ui)* Place teammate status above agent navigation
+
 ## [0.1.15] - 2026-11-12
 
 ### Bug Fixes
