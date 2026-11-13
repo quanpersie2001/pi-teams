@@ -201,6 +201,29 @@ function fixtureItems(count = 6): TranscriptItem[] {
 }
 
 describe("fullscreen agent transcript", () => {
+	it("puts run metadata in the header without a separate footer summary", () => {
+		const fixture = makeOverlay([], { teammateName: "renderer-state" });
+		try {
+			const lines = fixture.overlay.render(100).map(stripTerminalSequences);
+			expect(lines[0]).toContain("@renderer-state · Find auth files · 1.0s · 2 tools · 3 turns");
+			expect(lines.slice(1).join("\n")).not.toContain("Find auth files");
+			expect(lines.join("\n")).not.toContain("run ·");
+		} finally {
+			fixture.overlay.dispose();
+		}
+	});
+
+	it("truncates the task description before header statistics on narrow screens", () => {
+		const fixture = makeOverlay([], { description: "A very long task description ".repeat(10) });
+		try {
+			const header = stripTerminalSequences(fixture.overlay.render(60)[0]);
+			expect(header).toContain("1.0s · 2 tools · 3 turns");
+			expect(visibleWidth(header)).toBeLessThanOrEqual(60);
+		} finally {
+			fixture.overlay.dispose();
+		}
+	});
+
 	it("shows the runtime failure when auth rejection produced no native transcript", () => {
 		const diagnostic = "Authentication rejected. Login to the selected provider.";
 		const view = buildAgentTranscriptView(
@@ -293,7 +316,7 @@ describe("fullscreen agent transcript", () => {
 		fixture.overlay.dispose();
 	});
 
-	it("places run and child metadata below the editor without command hints", () => {
+	it("places run metadata in the header and child metadata below the editor without command hints", () => {
 		const fixture = makeOverlay(fixtureItems(), {
 			usage: { ...EMPTY_USAGE, inputTokens: 12400, outputTokens: 3200 },
 		});
@@ -301,8 +324,8 @@ describe("fullscreen agent transcript", () => {
 			const lines = fixture.overlay.render(160).map(stripTerminalSequences);
 			const editorEnd = lines.findIndex((line) => line.includes("╰"));
 			expect(lines[0]).not.toContain("12400");
-			expect(lines[0]).not.toContain("Find auth files");
-			expect(lines[editorEnd + 1]).toContain("12400 in / 3200 out — Find auth files · 1.0s · 2 tools · 3 turns");
+			expect(lines[0]).toContain("Find auth files · 1.0s · 2 tools · 3 turns");
+			expect(lines[editorEnd + 1]).toContain("12400 in / 3200 out");
 			expect(lines[editorEnd + 2]).toContain(
 				"model unavailable · thinking unavailable · context ?/? · cwd unavailable",
 			);
@@ -384,7 +407,7 @@ describe("fullscreen agent transcript", () => {
 			const mainY = lines.findIndex((line) => line.trim() === "◯ main");
 			const editorEnd = lines.findIndex((line) => line.includes("╰"));
 			const statusY = lines.findIndex((line) => line.includes(styled ? "CHILD STATUS" : "model unavailable"));
-			expect(statusY).toBe(editorEnd + 2);
+			expect(statusY).toBe(editorEnd + (styled ? 1 : 2));
 			expect(mainY).toBeGreaterThan(statusY);
 			click(statusY);
 			expect(fixture.state.selected).toEqual([]);

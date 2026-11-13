@@ -144,21 +144,26 @@ export function createAgentViewOverlay(options: {
 						: "";
 		const name = view.teammateName ? identityColor(theme, view.teammateColor, `@${view.teammateName}`) : view.type;
 		const truncation = focus?.truncatedHead || view.truncatedHead ? " · transcript is a bounded tail" : "";
-		return truncateToWidth(` ${color(badge.color, badge.icon)} ${name}${state}${truncation}`, width);
+		const elapsed = Math.max(0, (view.completedAt ?? view.generatedAt) - view.startedAt);
+		const stats = [formatElapsedMs(elapsed)];
+		if (view.toolUses > 0) stats.push(`${view.toolUses} tool${view.toolUses === 1 ? "" : "s"}`);
+		if (view.turns > 0) stats.push(`${view.turns} turn${view.turns === 1 ? "" : "s"}`);
+		const prefix = ` ${color(badge.color, badge.icon)} ${name}${state}${truncation} · `;
+		const suffix = color("dim", ` · ${stats.join(" · ")}`);
+		const description = truncateToWidth(
+			view.description,
+			Math.max(0, width - visibleWidth(prefix) - visibleWidth(suffix)),
+		);
+		return truncateToWidth(`${prefix}${color("dim", description)}${suffix}`, width);
 	}
 
 	function statusLines(view: AgentTranscriptView, focus: AgentFocusSnapshot | undefined, width: number): string[] {
-		const elapsed = Math.max(0, (view.completedAt ?? view.generatedAt) - view.startedAt);
-		const stats = [view.description, formatElapsedMs(elapsed)];
-		if (view.toolUses > 0) stats.push(`${view.toolUses} tool${view.toolUses === 1 ? "" : "s"}`);
-		if (view.turns > 0) stats.push(`${view.turns} turn${view.turns === 1 ? "" : "s"}`);
 		const native = agentStatusSnapshot(view, focus);
 		const styled = renderAgentStatus(theme, width, view, focus);
-		const summary = stats.join(" · ");
 		const lines = styled
-			? [color("dim", `run · ${summary}`), ...styled]
+			? styled
 			: [
-					color("dim", `${view.usage.inputTokens} in / ${view.usage.outputTokens} out — ${summary}`),
+					color("dim", `${view.usage.inputTokens} in / ${view.usage.outputTokens} out`),
 					color(
 						"dim",
 						`${native.model ?? "model unavailable"} · thinking ${native.thinkingLevel ?? "unavailable"} · context ${native.context.currentTokens ?? "?"}/${native.context.windowTokens ?? "?"} · ${native.cwd ?? "cwd unavailable"}`,
