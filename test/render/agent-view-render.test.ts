@@ -355,7 +355,7 @@ describe("fullscreen agent transcript", () => {
 		}
 	});
 
-	it("shows the shared roster below the composer and navigates clicked rows without losing its draft", () => {
+	it.each([false, true])("keeps the roster below child status and click targets aligned with pi-style=%s", (styled) => {
 		const navigationRows: AgentListRow[] = Array.from({ length: 9 }, (_, i) => ({
 			id: `run-${i + 1}`,
 			type: "explore",
@@ -371,13 +371,24 @@ describe("fullscreen agent transcript", () => {
 			isBackground: true,
 			capabilities: { attachable: true, viewable: true, steerable: true, stoppable: true, resumable: false },
 		}));
+		const key = Symbol.for("@quandev104/pi-style:detached-editor");
+		const globals = globalThis as Record<symbol, unknown>;
+		const previous = globals[key];
+		if (styled) globals[key] = { renderStatus: () => ["CHILD STATUS"] };
+		else delete globals[key];
 		const fixture = makeOverlay(fixtureItems(), { agentId: "run-9" }, undefined, navigationRows);
 		const click = (y: number) => fixture.overlay.handleMouse({ type: "click", button: "left", x: 4, y });
 		try {
 			fixture.editor.setText("unfinished draft");
 			const lines = fixture.overlay.render(80).map(stripTerminalSequences);
 			const mainY = lines.findIndex((line) => line.trim() === "◯ main");
-			expect(mainY).toBeGreaterThan(lines.findIndex((line) => line.includes("unfinished draft")));
+			const editorEnd = lines.findIndex((line) => line.includes("╰"));
+			const statusY = lines.findIndex((line) => line.includes(styled ? "CHILD STATUS" : "model unavailable"));
+			expect(statusY).toBe(editorEnd + 2);
+			expect(mainY).toBeGreaterThan(statusY);
+			click(statusY);
+			expect(fixture.state.selected).toEqual([]);
+			expect(fixture.state.returnedMain).toBe(0);
 			expect(lines.findIndex((line) => line.includes("⏺ @peer-9"))).toBeGreaterThan(mainY);
 			expect(lines[mainY + 1]).toContain("↑ 3 more");
 			click(mainY + 1);
@@ -392,10 +403,17 @@ describe("fullscreen agent transcript", () => {
 				const resized = fixture.overlay.render(40);
 				expect(resized).toHaveLength(height);
 				expect(resized.every((line) => visibleWidth(line) === 40)).toBe(true);
-				if (height === 12) expect(stripTerminalSequences(resized.join("\n"))).toContain("@peer-9");
+				if (height === 12) {
+					const visible = resized.map(stripTerminalSequences);
+					expect(visible.join("\n")).toContain("@peer-9");
+					click(visible.findIndex((line) => line.includes("@peer-9")));
+					expect(fixture.state.selected).toEqual(["run-8", "run-9"]);
+				}
 			}
 		} finally {
 			fixture.overlay.dispose();
+			if (previous === undefined) delete globals[key];
+			else globals[key] = previous;
 		}
 	});
 

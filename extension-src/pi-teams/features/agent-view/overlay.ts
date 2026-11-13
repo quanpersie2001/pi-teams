@@ -352,9 +352,9 @@ export function createAgentViewOverlay(options: {
 			const paneRows = Math.max(0, available - editorLines.length);
 			lines.push(...pane.render(width, paneRows));
 			lines.push(...editorLines);
+			lines.push(...footer);
 			panelTargets = new Map([...panel.targets].map(([y, id]) => [lines.length + y, id]));
 			lines.push(...panel.lines);
-			lines.push(...footer);
 			while (lines.length < rows) lines.push("");
 			return lines.slice(0, rows).map((line) => maskLine(line, width));
 		},
