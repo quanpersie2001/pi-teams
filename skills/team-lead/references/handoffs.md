@@ -10,10 +10,12 @@ Slice: this worker's independently verifiable deliverable.
 Inputs and decisions: relevant facts, stable contracts, readable source/artifact paths.
 Write boundary: allowed paths, shared interfaces owned elsewhere, exclusions.
 Acceptance criteria: observable conditions for this slice, not the entire program.
-Verification: commands/procedure and expected behavior; disclose unavailable tools.
-Expected output: artifact paths, criteria covered, checks/evidence, remaining issues.
+Steps and verification: ordered actions, exact commands/procedure and expected behavior; disclose unavailable tools.
 Escalate/stop: missing contract, overlapping writes, expanding scope, or permission boundary.
+Expected output and evidence: artifact paths, criteria covered, actual checks/results, remaining issues.
 ```
+
+Use normal prose, spaces, and one actionable requirement per bullet or numbered step. For example, write “Read both target files in full” rather than “Readentire54linetarget”; identifiers and commands retain their original spelling. Reduce length by removing duplicate warnings and linking background evidence, not by removing word boundaries. State safety-critical scope, permissions, and stop conditions inline; do not make the worker reconstruct them from historical reports. A readability pass checks clarity, not just prompt length, and does not expand the user's authorization.
 
 Put mandatory behavioral requirements in the assignment itself or Tasks `acceptanceCriteria`/`constraints`. Supply just the contract facts this worker needs. Summarize decisions, not entire transcripts; link large evidence as readable artifacts. A pointer must include why it matters, and the worker needs access from its execution workspace. Do not assume a worktree contains uncommitted files from the lead checkout.
 
