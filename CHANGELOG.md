@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.19] - 2026-11-15
+
+### Bug Fixes
+
+- *(skills)* Keep team lead handoffs readable
+
 ## [0.1.18] - 2026-11-15
 
 ### Bug Fixes
