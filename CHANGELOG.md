@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.18] - 2026-11-15
+
+### Bug Fixes
+
+- *(ui)* Hide settled teammates from transcript navigation
+
 ## [0.1.17] - 2026-11-13
 
 ### Bug Fixes
