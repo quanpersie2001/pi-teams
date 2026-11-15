@@ -361,7 +361,7 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 								listView
 									? renderAgentPanelWithTargets(
 											{
-												view: { ...listView, rows: listView.rows.filter((row) => row.capabilities.viewable) },
+												view: { ...listView, rows: viewedRunRows(runId) },
 												selection: runId,
 												stopArmedFor: null,
 											},
@@ -1134,8 +1134,17 @@ export function installSubagentsUi(ctx: ExtensionContext, options: SubagentsUiOp
 		void refresh();
 		void loadFocus(target, focusGeneration);
 	}
+	function viewedRunRows(runId: string): AgentListView["rows"] {
+		return (
+			listView?.rows.filter(
+				(row) =>
+					row.capabilities.viewable &&
+					(row.id === runId || isActiveStatus(row.status) || row.resourceState === "cleanup-unconfirmed"),
+			) ?? []
+		);
+	}
 	function navigateViewedRun(runId: string, delta: number): void {
-		const rows = listView?.rows.filter((row) => row.capabilities.viewable) ?? [];
+		const rows = viewedRunRows(runId);
 		const index = rows.findIndex((row) => row.id === runId);
 		if (index < 0 || rows.length < 2) return;
 		const next = rows[(index + delta + rows.length) % rows.length];

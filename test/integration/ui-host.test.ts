@@ -1181,7 +1181,18 @@ describe("keyboard table via onTerminalInput", () => {
 		fx.host.emitTerminalInput(ENTER);
 		const overlay = await opening;
 		expect(overlay.component?.render(100).join("\n")).toContain("VISIBLE_ACTIVE");
+		expect(overlay.component?.render(100).join("\n")).not.toContain("HIDDEN_HISTORY");
 		expect(fx.app.manager.get(active)?.status).toBe("running");
+
+		// Keep the viewed run in navigation even after it settles.
+		fx.backend.complete(active, "settled");
+		await vi.waitFor(() => expect(fx.app.manager.get(active)?.status).toBe("completed"));
+		fx.ui.refresh();
+		await vi.waitFor(() => {
+			const text = overlay.component?.render(100).join("\n") ?? "";
+			expect(text).toContain("VISIBLE_ACTIVE");
+			expect(text).not.toContain("HIDDEN_HISTORY");
+		});
 	});
 
 	it("isolates batched input from the Main editor while the native Hub owns focus", async () => {
